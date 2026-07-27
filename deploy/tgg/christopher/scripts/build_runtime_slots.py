@@ -45,6 +45,31 @@ SLOTS: dict[str, dict] = {
 }
 
 MEMORY_OFF_BLOCK = "memory:\n  memory_enabled: false\n  user_profile_enabled: false\n"
+PYTHON_SANDBOX_BLOCK = (
+    "python_sandbox:\n"
+    "  enabled: true\n"
+    "  datasets:\n"
+    "    cases:\n"
+    "      type: sqlite\n"
+    "      path: /home/pclaw/.systems-pcl/data/tenants/tgg.db\n"
+    '      description: "Operational case/work-costing database (read-only snapshot; sqlite)"\n'
+    "    media:\n"
+    "      type: path\n"
+    "      path: /home/pclaw/.systems-pcl/data/media/tgg/hermes\n"
+    '      description: "Retained WhatsApp media/attachments (read-only; spreadsheets land here)"\n'
+    "  limits:\n"
+    "    wall_seconds: 120\n"
+    "    max_wall_seconds: 300\n"
+    "    cpu_seconds: 60\n"
+    "    memory_mb: 1024\n"
+    "    file_size_mb: 64\n"
+    "    scratch_mb: 64\n"
+    "    max_processes: 64\n"
+    "    max_open_files: 256\n"
+    "    max_snapshot_mb: 512\n"
+    "  artifact_ttl_days: 7\n"
+    "  max_runs_kept: 40\n"
+)
 MEDIA_RETENTION_BLOCK = (
     "  media_retention:\n"
     "    enabled: true\n"
@@ -163,7 +188,7 @@ EVENT_LABELS_NEW = (
 
 NEW_OPERATIONS = ("tgg_clarification_raise", "tgg_attention_raise", "tgg_case_wc_attach")
 NEW_INSTRUCTION_COUNT = 14
-MGMT_NEW_INSTRUCTION_COUNT = 13
+MGMT_NEW_INSTRUCTION_COUNT = 14
 
 # The ingest brief is unscoped (no `business_operations` block at all), which
 # grants it the full registry — that is exactly what makes it reachable for
@@ -357,7 +382,7 @@ def _safe_config(source: str, slot: dict) -> str:
     )
     if not rendered.endswith("group_sessions_per_user: false\n"):
         raise RuntimeError("config baseline no longer ends at group_sessions_per_user")
-    rendered += MEMORY_OFF_BLOCK
+    rendered += MEMORY_OFF_BLOCK + PYTHON_SANDBOX_BLOCK
     if effort is not None:
         rendered = _replace_once(
             rendered,
@@ -414,10 +439,13 @@ def _constitution(source: str, slot: dict) -> str:
     mgmt_behavior_snippet = (PATCHES_ROOT / "mgmt-chat-behavior.snippet.yaml").read_text(
         encoding="utf-8"
     )
+    python_sandbox_snippet = (
+        PATCHES_ROOT / "python-sandbox-management.snippet.yaml"
+    ).read_text(encoding="utf-8")
     rendered = _replace_once(
         rendered,
         MGMT_OBSERVABILITY_ANCHOR,
-        mgmt_behavior_snippet + MGMT_OBSERVABILITY_ANCHOR,
+        mgmt_behavior_snippet + python_sandbox_snippet + MGMT_OBSERVABILITY_ANCHOR,
         label="management observability instruction",
     )
     mgmt_operations_snippet = (
@@ -426,7 +454,11 @@ def _constitution(source: str, slot: dict) -> str:
     rendered = _replace_once(
         rendered,
         MGMT_TOOLSETS_ANCHOR,
-        MGMT_TOOLSETS_ANCHOR + mgmt_operations_snippet,
+        MGMT_TOOLSETS_ANCHOR.replace(
+            "    disabled_toolsets:\n",
+            "    - python-sandbox\n    disabled_toolsets:\n",
+        )
+        + mgmt_operations_snippet,
         label="management toolsets block",
     )
     rendered = _replace_once(
@@ -484,6 +516,34 @@ def _validate(
     assert config["memory"] == {
         "memory_enabled": False,
         "user_profile_enabled": False,
+    }
+    assert config["python_sandbox"] == {
+        "enabled": True,
+        "datasets": {
+            "cases": {
+                "type": "sqlite",
+                "path": "/home/pclaw/.systems-pcl/data/tenants/tgg.db",
+                "description": "Operational case/work-costing database (read-only snapshot; sqlite)",
+            },
+            "media": {
+                "type": "path",
+                "path": "/home/pclaw/.systems-pcl/data/media/tgg/hermes",
+                "description": "Retained WhatsApp media/attachments (read-only; spreadsheets land here)",
+            },
+        },
+        "limits": {
+            "wall_seconds": 120,
+            "max_wall_seconds": 300,
+            "cpu_seconds": 60,
+            "memory_mb": 1024,
+            "file_size_mb": 64,
+            "scratch_mb": 64,
+            "max_processes": 64,
+            "max_open_files": 256,
+            "max_snapshot_mb": 512,
+        },
+        "artifact_ttl_days": 7,
+        "max_runs_kept": 40,
     }
 
     # Chat-scoped inbound allowlist, staged in BOTH blocks (the top-level block
@@ -651,6 +711,10 @@ def _validate(
         == baseline_mgmt_instruction_count + MGMT_NEW_INSTRUCTION_COUNT
     ), len(mgmt_instructions)
     mgmt_joined = "\n".join(mgmt_instructions)
+    assert "python_sandbox is your batch-computation tool" in mgmt_joined
+    assert "more than ~50 items" in mgmt_joined
+    assert "never hand-simulate a batch computation" in mgmt_joined
+    assert "python-sandbox" in mgmt_brief["enabled_toolsets"]
     # Register + grounded answers.
     assert "you are TGG's operations coordinator" in mgmt_joined
     assert "carries that case's job number" in mgmt_joined

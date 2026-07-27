@@ -118,5 +118,71 @@ cat /home/pclaw/.hermes-christopher-tgg/runtime/engine-slot-receipt.json
 cat /home/pclaw/.hermes-christopher-tgg/runtime/capture-consumer-status.json' \
   >"$receipt_root/live-state.txt"
 
-printf '{"ok":true,"target":"%s","source_commit":"%s","bundle_path":"%s","receipt_root":"%s"}\n' \
-  "$target" "$head_sha" "$bundle_path" "$receipt_root"
+evaluator_stdout="$receipt_root/output-quality-eval.stdout.json"
+evaluator_stderr="$receipt_root/output-quality-eval.stderr.txt"
+set +e
+python3 - \
+  "$APP_ROOT/deploy/tgg/christopher/scripts/output_quality_eval.py" \
+  "$head_sha" "$evaluator_stdout" "$evaluator_stderr" <<'PY'
+import pathlib
+import subprocess
+import sys
+
+evaluator, head_sha, stdout_name, stderr_name = sys.argv[1:]
+try:
+    result = subprocess.run(
+        [
+            evaluator,
+            "run",
+            "--trigger",
+            "deploy",
+            "--maker-session-id",
+            f"deploy:{head_sha}",
+        ],
+        text=True,
+        capture_output=True,
+        timeout=1500,
+        check=False,
+    )
+    pathlib.Path(stdout_name).write_text(result.stdout)
+    pathlib.Path(stderr_name).write_text(result.stderr)
+    raise SystemExit(result.returncode)
+except subprocess.TimeoutExpired as exc:
+    stdout = exc.stdout.decode(errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+    stderr = exc.stderr.decode(errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+    pathlib.Path(stdout_name).write_text(stdout)
+    pathlib.Path(stderr_name).write_text(stderr + "\nevaluator timed out after 1500 seconds\n")
+    raise SystemExit(124)
+PY
+evaluator_rc=$?
+set -e
+evaluator_ok="$(python3 - "$evaluator_stdout" "$evaluator_stderr" \
+  "$receipt_root/output-quality-eval.json" "$evaluator_rc" <<'PY'
+import json
+import pathlib
+import sys
+
+stdout_path, stderr_path, receipt_path = map(pathlib.Path, sys.argv[1:4])
+returncode = int(sys.argv[4])
+try:
+    stdout_text = stdout_path.read_text()
+except OSError as exc:
+    stdout_text = f"<unreadable evaluator stdout: {exc}>"
+try:
+    output = json.loads(stdout_text)
+except json.JSONDecodeError:
+    output = {"ok": False, "raw_stdout": stdout_text}
+evaluator_ok = returncode == 0 and output.get("ok") is True
+receipt = {
+    "evaluator_ok": evaluator_ok,
+    "returncode": returncode,
+    "output": output,
+    "stderr": stderr_path.read_text(errors="replace"),
+}
+receipt_path.write_text(json.dumps(receipt, sort_keys=True) + "\n")
+print("true" if evaluator_ok else "false")
+PY
+)"
+
+printf '{"ok":true,"target":"%s","source_commit":"%s","bundle_path":"%s","receipt_root":"%s","evaluator_ok":%s}\n' \
+  "$target" "$head_sha" "$bundle_path" "$receipt_root" "$evaluator_ok"

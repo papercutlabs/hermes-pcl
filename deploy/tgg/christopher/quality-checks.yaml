@@ -1,0 +1,24 @@
+version: 1
+scope: tgg/christopher
+checks:
+  - id: sender-shows-real-name-not-site-worker
+    scope: case
+    statement: Every rendered message identifies the real sender name from source; a site or worker label is not substituted for the person.
+  - id: no-contact-emoji-leak
+    scope: case
+    statement: Contact and message text contains no leaked contact-card or implementation emoji that is absent from source.
+  - id: message-text-displayed-as-bubble-photos-underneath
+    scope: case
+    statement: Source message text is rendered as a message bubble, with its photos directly underneath rather than replacing or separating the text.
+  - id: explicit-done-statement-moves-item-completed
+    scope: case
+    statement: An explicit source statement that the work is done is represented by the relevant item being completed.
+  - id: cant-do-statement-surfaced-not-generic-pending
+    scope: case
+    statement: A source statement that work cannot be done is surfaced explicitly and is not collapsed into a generic pending state.
+  - id: photos-bound-to-correct-work-item
+    scope: case
+    statement: Every rendered photo is attached to the work item supported by its source-message context; ambiguity is marked unsure.
+  - id: filter-covers-badge-states
+    scope: portal
+    statement: Every case-list badge state visible in the portal has a corresponding selectable status filter.

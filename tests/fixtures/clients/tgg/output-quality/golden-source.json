@@ -1,0 +1,23 @@
+{
+  "case": {
+    "job_no": "AM/JOB/2607/0001",
+    "state": "in_progress",
+    "contact_name": "Mdm Lee"
+  },
+  "messages": [
+    {
+      "message_id": "wa-1",
+      "sender": "Ali",
+      "text": "Kitchen tap done",
+      "media_paths": [
+        "fixture://photo-a.jpg",
+        "fixture://photo-b.jpg"
+      ],
+      "work_item": "Kitchen tap"
+    }
+  ],
+  "negative_facts": {
+    "cant_do_statement_present": false,
+    "tenant_approved_variation_present": false
+  }
+}

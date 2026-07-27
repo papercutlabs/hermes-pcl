@@ -1,0 +1,1 @@
+"""TGG rendered output evaluator."""

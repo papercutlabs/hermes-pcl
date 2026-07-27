@@ -1,0 +1,16 @@
+{
+  "obligation": true,
+  "review_surface": {
+    "checks": [
+      {
+        "logical_key": "loop.pa.tgg.output_eval",
+        "why": "The loop must go red when fresh TGG output is no longer evaluated or its coverage falls behind."
+      }
+    ]
+  },
+  "rollback": {
+    "reversibility_class": "revertible",
+    "blast_bound": "Studio-only evaluator and internal defect queue",
+    "data_loss": "none"
+  }
+}

@@ -1,0 +1,11 @@
+TGG Cases
+Case AM/JOB/2607/0001
+Case status: New
+Work item: Kitchen tap — DONE
+Sender: Site worker
+Message bubble: Kitchen tap done
+Photos underneath the message: PHOTO A Kitchen tap; PHOTO B Kitchen tap
+Contact: Mdm Lee 😘
+Portal-only claim: Tenant approved variation
+Filters: All / Completed / In-progress
+Visible badge states: New / Completed

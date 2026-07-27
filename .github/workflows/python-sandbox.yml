@@ -1,0 +1,46 @@
+name: Python sandbox
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/python-sandbox.yml"
+      - "tools/python_sandbox_tool.py"
+      - "toolsets.py"
+      - "pyproject.toml"
+      - "uv.lock"
+      - "tests/test_python_sandbox_tool.py"
+      - "tests/fixtures/python_sandbox/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  jailed-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+      - name: Enable unprivileged user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - name: Install test and sandbox dependencies
+        run: uv sync --extra dev --extra sandbox
+      - name: Run sandbox unit battery
+        run: uv run pytest -q -m "not sandbox_e2e" tests/test_python_sandbox_tool.py
+      - name: Run jailed E2E battery without skips
+        shell: bash
+        env:
+          PYTHON_SANDBOX_ACCEPTANCE_DIR: /tmp/python-sandbox-acceptance
+        run: |
+          set -euo pipefail
+          uv run pytest -q -m sandbox_e2e tests/test_python_sandbox_tool.py | tee /tmp/sandbox-e2e.txt
+          grep -Eq '^9 passed in ' /tmp/sandbox-e2e.txt
+          ! grep -q skipped /tmp/sandbox-e2e.txt
+          test -s /tmp/python-sandbox-acceptance/open-cases.xlsx
+      - name: Upload jailed XLSX acceptance artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: python-sandbox-open-cases
+          path: /tmp/python-sandbox-acceptance/open-cases.xlsx
+          if-no-files-found: error

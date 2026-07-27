@@ -135,6 +135,12 @@ TOOLSETS = {
         "tools": ["terminal", "process"],
         "includes": []
     },
+
+    "python-sandbox": {
+        "description": "Offline sandboxed Python for batch computation over whitelisted local datasets",
+        "tools": ["python_sandbox"],
+        "includes": []
+    },
     
     "moa": {
         "description": "Advanced reasoning and problem-solving tools",

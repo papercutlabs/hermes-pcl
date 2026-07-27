@@ -63,6 +63,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+sandbox = ["numpy==2.4.3", "pandas==3.0.5", "openpyxl==3.1.5"]
 # Native Anthropic provider — only needed when provider=anthropic (not via
 # OpenRouter or other aggregators).
 anthropic = ["anthropic==0.86.0"]
@@ -221,6 +222,7 @@ include = ["agent", "agent.*", "tools", "tools.*", "hermes_cli", "gateway", "gat
 testpaths = ["tests"]
 markers = [
     "integration: marks tests requiring external services (API keys, Modal, etc.)",
+    "sandbox_e2e: marks tests requiring Linux user and mount namespaces",
 ]
 addopts = "-m 'not integration' -n auto"
 

@@ -645,6 +645,19 @@ job_briefs:
       could not do a thing, the answer says so.
 
       '
+    - 'python_sandbox is your batch-computation tool. Reach for it — instead of
+      reasoning item by item — whenever a task means computing over many records:
+      comparing or reconciling lists between sources (spreadsheet vs system),
+      counting, deduplicating, or summing more than ~50 items, spreadsheet/CSV
+      parsing, totals and statistics. One sandbox run that prints counts plus a
+      few examples beats hundreds of per-item lookups. Attach only the datasets
+      you need; the cases dataset is a read-only snapshot of the system database,
+      so cite it as "as of this run". Do NOT use it for: single-record lookups
+      (use your business tools), anything that must WRITE to the system (sandbox
+      is read-only — compute first, then apply changes through business
+      operations), or judgment calls on individual messages. If the sandbox
+      reports unavailable, say so and fall back — never hand-simulate a batch
+      computation over more than ~50 items without flagging the degradation.'
     - 'Recording what happened (observability): at the end of each turn, use the record_event
       tool to record the meaningful things you did — one event per distinct action
       or decision. This is part of finishing a turn, not optional. Record an event
@@ -664,6 +677,7 @@ job_briefs:
     - web
     - custom
     - pa-observability
+    - python-sandbox
     disabled_toolsets:
     - terminal
     business_operations:

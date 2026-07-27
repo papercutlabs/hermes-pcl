@@ -1,0 +1,359 @@
+jailed-e2e	Set up job	﻿2026-07-27T04:36:49.3367289Z Current runner version: '2.335.1'
+jailed-e2e	Set up job	2026-07-27T04:36:49.3392959Z ##[group]Runner Image Provisioner
+jailed-e2e	Set up job	2026-07-27T04:36:49.3393942Z Hosted Compute Agent
+jailed-e2e	Set up job	2026-07-27T04:36:49.3394564Z Version: 20260707.563
+jailed-e2e	Set up job	2026-07-27T04:36:49.3395168Z Commit: 02667638d2b423fbc733a8e32a88b44996a3ba6e
+jailed-e2e	Set up job	2026-07-27T04:36:49.3395992Z Build Date: 2026-07-07T19:33:50Z
+jailed-e2e	Set up job	2026-07-27T04:36:49.3396664Z Worker ID: {2dfaaeaa-6367-4eba-b423-3044f814777f}
+jailed-e2e	Set up job	2026-07-27T04:36:49.3397397Z Azure Region: westus
+jailed-e2e	Set up job	2026-07-27T04:36:49.3398235Z ##[endgroup]
+jailed-e2e	Set up job	2026-07-27T04:36:49.3399715Z ##[group]Operating System
+jailed-e2e	Set up job	2026-07-27T04:36:49.3400425Z Ubuntu
+jailed-e2e	Set up job	2026-07-27T04:36:49.3400938Z 24.04.4
+jailed-e2e	Set up job	2026-07-27T04:36:49.3401423Z LTS
+jailed-e2e	Set up job	2026-07-27T04:36:49.3402029Z ##[endgroup]
+jailed-e2e	Set up job	2026-07-27T04:36:49.3402611Z ##[group]Runner Image
+jailed-e2e	Set up job	2026-07-27T04:36:49.3403293Z Image: ubuntu-24.04
+jailed-e2e	Set up job	2026-07-27T04:36:49.3403913Z Version: 20260720.247.2
+jailed-e2e	Set up job	2026-07-27T04:36:49.3404972Z Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260720.247/images/ubuntu/Ubuntu2404-Readme.md
+jailed-e2e	Set up job	2026-07-27T04:36:49.3406776Z Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260720.247
+jailed-e2e	Set up job	2026-07-27T04:36:49.3407996Z ##[endgroup]
+jailed-e2e	Set up job	2026-07-27T04:36:49.3409114Z ##[group]GITHUB_TOKEN Permissions
+jailed-e2e	Set up job	2026-07-27T04:36:49.3411080Z Contents: read
+jailed-e2e	Set up job	2026-07-27T04:36:49.3411726Z Metadata: read
+jailed-e2e	Set up job	2026-07-27T04:36:49.3412273Z ##[endgroup]
+jailed-e2e	Set up job	2026-07-27T04:36:49.3414390Z Secret source: Actions
+jailed-e2e	Set up job	2026-07-27T04:36:49.3415182Z Prepare workflow directory
+jailed-e2e	Set up job	2026-07-27T04:36:49.3778364Z Prepare all required actions
+jailed-e2e	Set up job	2026-07-27T04:36:49.3837692Z Getting action download info
+jailed-e2e	Set up job	2026-07-27T04:36:49.7252856Z Download action repository 'actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5' (SHA:34e114876b0b11c390a56381ad16ebd13914f8d5)
+jailed-e2e	Set up job	2026-07-27T04:36:50.3595655Z Download action repository 'astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e' (SHA:d0cc045d04ccac9d8b7881df0226f9e82c39688e)
+jailed-e2e	Set up job	2026-07-27T04:36:50.8820221Z Download action repository 'actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02' (SHA:ea165f8d65b6e75b540449e92b4886f43607fa02)
+jailed-e2e	Set up job	2026-07-27T04:36:51.1786902Z Complete job name: jailed-e2e
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	﻿2026-07-27T04:36:51.2727142Z Node 20 is being deprecated. This workflow is running with Node 24 by default. If you need to temporarily use Node 20, you can set the ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION=true environment variable. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:51.2738982Z ##[group]Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:51.2740736Z with:
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:51.2741696Z   repository: teren-papercutlabs/hermes-pcl
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:51.2751393Z   token: ***
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:51.2752306Z   ssh-strict: true
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:51.2753195Z   ssh-user: git
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:51.2754098Z   persist-credentials: true
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:51.2755091Z   clean: true
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:51.2755998Z   sparse-checkout-cone-mode: true
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:51.2757072Z   fetch-depth: 1
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:51.2758113Z   fetch-tags: false
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:51.2759047Z   show-progress: true
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:51.2759961Z   lfs: false
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:51.2760847Z   submodules: false
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:51.2761761Z   set-safe-directory: true
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:51.2763038Z ##[endgroup]
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:51.3786472Z Syncing repository: teren-papercutlabs/hermes-pcl
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:51.3789616Z ##[group]Getting Git version info
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:51.3791087Z Working directory is '/home/runner/work/hermes-pcl/hermes-pcl'
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:51.3793189Z [command]/usr/bin/git version
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:51.5210686Z git version 2.54.0
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:51.5266732Z ##[endgroup]
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:51.5281650Z Temporarily overriding HOME='/home/runner/work/_temp/c1bca553-e2b3-4f0e-bb67-40cea9c0614b' before making global git config changes
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:51.5285325Z Adding repository directory to the temporary git global config as a safe directory
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:51.5289416Z [command]/usr/bin/git config --global --add safe.directory /home/runner/work/hermes-pcl/hermes-pcl
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:51.5711954Z Deleting the contents of '/home/runner/work/hermes-pcl/hermes-pcl'
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:51.5716823Z ##[group]Initializing the repository
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:51.5721800Z [command]/usr/bin/git init /home/runner/work/hermes-pcl/hermes-pcl
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:51.6204815Z hint: Using 'master' as the name for the initial branch. This default branch name
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:51.6209774Z hint: will change to "main" in Git 3.0. To configure the initial branch name
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:51.6213962Z hint: to use in all of your new repositories, which will suppress this warning,
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:51.6215808Z hint: call:
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:51.6216760Z hint:
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:51.6218467Z hint: 	git config --global init.defaultBranch <name>
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:51.6219950Z hint:
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:51.6221298Z hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:51.6224162Z hint: 'development'. The just-created branch can be renamed via this command:
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:51.6226779Z hint:
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:51.6228073Z hint: 	git branch -m <name>
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:51.6229080Z hint:
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:51.6230414Z hint: Disable this message with "git config set advice.defaultBranchName false"
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:51.6232759Z Initialized empty Git repository in /home/runner/work/hermes-pcl/hermes-pcl/.git/
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:51.6236356Z [command]/usr/bin/git remote add origin https://github.com/teren-papercutlabs/hermes-pcl
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:51.6451761Z ##[endgroup]
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:51.6454847Z ##[group]Disabling automatic garbage collection
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:51.6456752Z [command]/usr/bin/git config --local gc.auto 0
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:51.6491908Z ##[endgroup]
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:51.6493366Z ##[group]Setting up auth
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:51.6501028Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:51.6551759Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:51.8508488Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:51.8541831Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:51.8758303Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:51.8789647Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:51.9008673Z [command]/usr/bin/git config --local http.https://github.com/.extraheader AUTHORIZATION: basic ***
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:51.9043795Z ##[endgroup]
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:51.9045454Z ##[group]Fetching the repository
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:51.9053992Z [command]/usr/bin/git -c protocol.version=2 fetch --no-tags --prune --no-recurse-submodules --depth=1 origin +fba5109918fd8bad53bb50d06658bf89d55674ec:refs/remotes/pull/4/merge
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:53.7618080Z From https://github.com/teren-papercutlabs/hermes-pcl
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:53.7620198Z  * [new ref]         fba5109918fd8bad53bb50d06658bf89d55674ec -> pull/4/merge
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:53.7787276Z ##[endgroup]
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:53.7788283Z ##[group]Determining the checkout info
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:53.7789558Z ##[endgroup]
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:53.7794849Z [command]/usr/bin/git sparse-checkout disable
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:53.7886312Z [command]/usr/bin/git config --local --unset-all extensions.worktreeConfig
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:53.7914124Z ##[group]Checking out the ref
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:53.7918834Z [command]/usr/bin/git checkout --progress --force refs/remotes/pull/4/merge
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:54.1871568Z Note: switching to 'refs/remotes/pull/4/merge'.
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:54.1873227Z 
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:54.1873590Z You are in 'detached HEAD' state. You can look around, make experimental
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:54.1874860Z changes and commit them, and you can discard any commits you make in this
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:54.1875696Z state without impacting any branches by switching back to a branch.
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:54.1876221Z 
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:54.1876599Z If you want to create a new branch to retain commits you create, you may
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:54.1877366Z do so (now or later) by using -c with the switch command. Example:
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:54.1878138Z 
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:54.1878339Z   git switch -c <new-branch-name>
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:54.1878665Z 
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:54.1878860Z Or undo this operation with:
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:54.1879151Z 
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:54.1879313Z   git switch -
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:54.1879555Z 
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:54.1879923Z Turn off this advice by setting config variable advice.detachedHead to false
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:54.1880506Z 
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:54.1881095Z HEAD is now at fba5109 Merge 4d999fa71d2abc982bc66248021425a1a885056d into 895588632a4948fcb2c24f0c5818155be530ddf3
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:54.1894535Z ##[endgroup]
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:54.1938032Z [command]/usr/bin/git log -1 --format=%H
+jailed-e2e	Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:36:54.1961795Z fba5109918fd8bad53bb50d06658bf89d55674ec
+jailed-e2e	Run astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e	﻿2026-07-27T04:36:54.2285549Z Node 20 is being deprecated. This workflow is running with Node 24 by default. If you need to temporarily use Node 20, you can set the ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION=true environment variable. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/
+jailed-e2e	Run astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e	2026-07-27T04:36:54.2287414Z ##[group]Run astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e
+jailed-e2e	Run astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e	2026-07-27T04:36:54.2288028Z with:
+jailed-e2e	Run astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e	2026-07-27T04:36:54.2288256Z   activate-environment: false
+jailed-e2e	Run astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e	2026-07-27T04:36:54.2288585Z   working-directory: /home/runner/work/hermes-pcl/hermes-pcl
+jailed-e2e	Run astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e	2026-07-27T04:36:54.2288945Z   server-url: https://github.com
+jailed-e2e	Run astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e	2026-07-27T04:36:54.2291574Z   github-token: ***
+jailed-e2e	Run astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e	2026-07-27T04:36:54.2291833Z   enable-cache: auto
+jailed-e2e	Run astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e	2026-07-27T04:36:54.2292393Z   cache-dependency-glob: **/*requirements*.txt
+jailed-e2e	Run astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e	**/*requirements*.in
+jailed-e2e	Run astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e	**/*constraints*.txt
+jailed-e2e	Run astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e	**/*constraints*.in
+jailed-e2e	Run astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e	**/pyproject.toml
+jailed-e2e	Run astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e	**/uv.lock
+jailed-e2e	Run astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e	**/*.py.lock
+jailed-e2e	Run astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e	
+jailed-e2e	Run astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e	2026-07-27T04:36:54.2293036Z   restore-cache: true
+jailed-e2e	Run astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e	2026-07-27T04:36:54.2293294Z   save-cache: true
+jailed-e2e	Run astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e	2026-07-27T04:36:54.2293503Z   prune-cache: true
+jailed-e2e	Run astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e	2026-07-27T04:36:54.2293729Z   ignore-nothing-to-cache: false
+jailed-e2e	Run astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e	2026-07-27T04:36:54.2293995Z   ignore-empty-workdir: false
+jailed-e2e	Run astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e	2026-07-27T04:36:54.2294254Z   add-problem-matchers: true
+jailed-e2e	Run astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e	2026-07-27T04:36:54.2294491Z ##[endgroup]
+jailed-e2e	Run astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e	2026-07-27T04:36:54.4041196Z (node:2271) [DEP0040] DeprecationWarning: The `punycode` module is deprecated. Please use a userland alternative instead.
+jailed-e2e	Run astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e	2026-07-27T04:36:54.4042585Z (Use `node --trace-deprecation ...` to show where the warning was created)
+jailed-e2e	Run astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e	2026-07-27T04:36:54.4202938Z Trying to find version for uv in: /home/runner/work/hermes-pcl/hermes-pcl/uv.toml
+jailed-e2e	Run astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e	2026-07-27T04:36:54.4204435Z Could not find file: /home/runner/work/hermes-pcl/hermes-pcl/uv.toml
+jailed-e2e	Run astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e	2026-07-27T04:36:54.4205951Z Trying to find version for uv in: /home/runner/work/hermes-pcl/hermes-pcl/pyproject.toml
+jailed-e2e	Run astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e	2026-07-27T04:36:54.4241877Z Could not determine uv version from uv.toml or pyproject.toml. Falling back to latest.
+jailed-e2e	Run astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e	2026-07-27T04:36:54.4243967Z Getting latest version from GitHub API...
+jailed-e2e	Run astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e	2026-07-27T04:36:54.8078529Z manifest-file not provided, reading from local file.
+jailed-e2e	Run astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e	2026-07-27T04:36:54.8135995Z manifest-file does not contain version 0.11.32, arch x86_64, platform unknown-linux-gnu. Falling back to GitHub releases.
+jailed-e2e	Run astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e	2026-07-27T04:36:54.8137629Z Downloading uv from "https://github.com/astral-sh/uv/releases/download/0.11.32/uv-x86_64-unknown-linux-gnu.tar.gz" ...
+jailed-e2e	Run astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e	2026-07-27T04:36:55.1758016Z [command]/usr/bin/tar xz --warning=no-unknown-keyword --overwrite -C /home/runner/work/_temp/0e289ff6-5145-4429-b2ef-e2763023ae5d -f /home/runner/work/_temp/d98c79c5-0d86-4f02-a73b-315aab8ed8e0
+jailed-e2e	Run astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e	2026-07-27T04:36:55.6862852Z Added /home/runner/.local/bin to the path
+jailed-e2e	Run astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e	2026-07-27T04:36:55.6865745Z Added /opt/hostedtoolcache/uv/0.11.32/x86_64 to the path
+jailed-e2e	Run astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e	2026-07-27T04:36:55.6889537Z Set UV_CACHE_DIR to /home/runner/work/_temp/setup-uv-cache
+jailed-e2e	Run astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e	2026-07-27T04:36:55.6890235Z Successfully installed uv version 0.11.32
+jailed-e2e	Run astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e	2026-07-27T04:36:55.6892145Z Searching files using cache dependency glob: /home/runner/work/hermes-pcl/hermes-pcl/**/*requirements*.txt,/home/runner/work/hermes-pcl/hermes-pcl/**/*requirements*.in,/home/runner/work/hermes-pcl/hermes-pcl/**/*constraints*.txt,/home/runner/work/hermes-pcl/hermes-pcl/**/*constraints*.in,/home/runner/work/hermes-pcl/hermes-pcl/**/pyproject.toml,/home/runner/work/hermes-pcl/hermes-pcl/**/uv.lock,/home/runner/work/hermes-pcl/hermes-pcl/**/*.py.lock
+jailed-e2e	Run astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e	2026-07-27T04:36:55.7214637Z /home/runner/work/hermes-pcl/hermes-pcl/constraints-termux.txt
+jailed-e2e	Run astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e	2026-07-27T04:36:55.7857328Z /home/runner/work/hermes-pcl/hermes-pcl/optional-skills/finance/dcf-model/requirements.txt
+jailed-e2e	Run astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e	2026-07-27T04:36:55.8714345Z /home/runner/work/hermes-pcl/hermes-pcl/pyproject.toml
+jailed-e2e	Run astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e	2026-07-27T04:36:56.1373628Z /home/runner/work/hermes-pcl/hermes-pcl/uv.lock
+jailed-e2e	Run astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e	2026-07-27T04:36:56.1984857Z Found 4 files to hash.
+jailed-e2e	Run astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e	2026-07-27T04:36:56.2760795Z Trying to restore uv cache from GitHub Actions cache with key: setup-uv-1-x86_64-unknown-linux-gnu-3.12.3-pruned-1a0462e549cc4a762fc1d639244619ec8b6704fd394823c46c62e7d002523b6f
+jailed-e2e	Run astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e	2026-07-27T04:36:56.5510249Z Cache hit for: setup-uv-1-x86_64-unknown-linux-gnu-3.12.3-pruned-1a0462e549cc4a762fc1d639244619ec8b6704fd394823c46c62e7d002523b6f
+jailed-e2e	Run astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e	2026-07-27T04:36:56.5639782Z (node:2271) [DEP0169] DeprecationWarning: `url.parse()` behavior is not standardized and prone to errors that have security implications. Use the WHATWG URL API instead. CVEs are not issued for `url.parse()` vulnerabilities.
+jailed-e2e	Run astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e	2026-07-27T04:36:57.1955217Z Received 159508 of 159508 (100.0%), 0.4 MBs/sec
+jailed-e2e	Run astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e	2026-07-27T04:36:57.1956313Z Cache Size: ~0 MB (159508 B)
+jailed-e2e	Run astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e	2026-07-27T04:36:57.1984218Z [command]/usr/bin/tar -xf /home/runner/work/_temp/d46caa55-a738-4249-88f9-157edf1553de/cache.tzst -P -C /home/runner/work/hermes-pcl/hermes-pcl --use-compress-program unzstd
+jailed-e2e	Run astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e	2026-07-27T04:36:57.2272402Z Cache restored successfully
+jailed-e2e	Run astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e	2026-07-27T04:36:57.2278632Z uv cache restored from GitHub Actions cache with key: setup-uv-1-x86_64-unknown-linux-gnu-3.12.3-pruned-1a0462e549cc4a762fc1d639244619ec8b6704fd394823c46c62e7d002523b6f
+jailed-e2e	Enable unprivileged user namespaces	﻿2026-07-27T04:36:57.2446020Z ##[group]Run sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+jailed-e2e	Enable unprivileged user namespaces	2026-07-27T04:36:57.2446619Z ^[[36;1msudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0^[[0m
+jailed-e2e	Enable unprivileged user namespaces	2026-07-27T04:36:57.2495360Z shell: /usr/bin/bash -e {0}
+jailed-e2e	Enable unprivileged user namespaces	2026-07-27T04:36:57.2495634Z env:
+jailed-e2e	Enable unprivileged user namespaces	2026-07-27T04:36:57.2495890Z   UV_CACHE_DIR: /home/runner/work/_temp/setup-uv-cache
+jailed-e2e	Enable unprivileged user namespaces	2026-07-27T04:36:57.2496206Z ##[endgroup]
+jailed-e2e	Enable unprivileged user namespaces	2026-07-27T04:36:57.2646641Z kernel.apparmor_restrict_unprivileged_userns = 0
+jailed-e2e	Install test and sandbox dependencies	﻿2026-07-27T04:36:57.2689895Z ##[group]Run uv sync --extra dev --extra sandbox
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:57.2690299Z ^[[36;1muv sync --extra dev --extra sandbox^[[0m
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:57.2732077Z shell: /usr/bin/bash -e {0}
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:57.2732339Z env:
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:57.2732596Z   UV_CACHE_DIR: /home/runner/work/_temp/setup-uv-cache
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:57.2732938Z ##[endgroup]
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:57.2961096Z Using CPython 3.12.3 interpreter at: /usr/bin/python3
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:57.2961687Z Creating virtual environment at: .venv
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:57.3094554Z Resolved 216 packages in 1ms
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:57.3233743Z    Building hermes-agent @ file:///home/runner/work/hermes-pcl/hermes-pcl
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:57.4274126Z Downloading numpy (15.9MiB)
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:57.4277414Z Downloading pydantic-core (2.0MiB)
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:57.4282543Z Downloading pygments (1.2MiB)
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:57.4284033Z Downloading openai (1.1MiB)
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:57.4293923Z Downloading debugpy (4.1MiB)
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:57.4314515Z Downloading ruff (10.7MiB)
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:57.4318412Z Downloading cryptography (4.3MiB)
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:57.4322310Z Downloading pandas (10.5MiB)
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:57.4324808Z Downloading ty (10.2MiB)
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:57.9878973Z  Downloaded pydantic-core
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:58.2082904Z  Downloaded pygments
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:58.2152407Z  Downloaded cryptography
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:58.2919948Z  Downloaded debugpy
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:58.3665718Z  Downloaded ty
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:58.3750854Z  Downloaded ruff
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:58.5005287Z  Downloaded openai
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:58.6240110Z  Downloaded numpy
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:58.7280263Z  Downloaded pandas
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:59.4076460Z       Built hermes-agent @ file:///home/runner/work/hermes-pcl/hermes-pcl
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:59.4089558Z Prepared 73 packages in 2.09s
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:59.4820222Z Installed 73 packages in 72ms
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:59.4820861Z  + annotated-types==0.7.0
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:59.4821305Z  + anyio==4.12.1
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:59.4821681Z  + attrs==25.4.0
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:59.4822038Z  + certifi==2026.2.25
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:59.4822447Z  + cffi==2.0.0
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:59.4822826Z  + charset-normalizer==3.4.4
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:59.4823253Z  + click==8.3.1
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:59.4823602Z  + croniter==6.0.0
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:59.4824006Z  + cryptography==46.0.5
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:59.4824410Z  + debugpy==1.8.20
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:59.4824766Z  + distro==1.9.0
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:59.4825284Z  + et-xmlfile==2.0.0
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:59.4825651Z  + execnet==2.1.2
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:59.4826231Z  + fire==0.7.1
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:59.4826809Z  + h11==0.16.0
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:59.4828487Z  + hermes-agent==0.13.0 (from file:///home/runner/work/hermes-pcl/hermes-pcl)
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:59.4829597Z  + httpcore==1.0.9
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:59.4830166Z  + httpx==0.28.1
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:59.4830732Z  + httpx-sse==0.4.3
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:59.4831298Z  + idna==3.11
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:59.4831837Z  + iniconfig==2.3.0
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:59.4832206Z  + jinja2==3.1.6
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:59.4832576Z  + jiter==0.13.0
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:59.4832949Z  + jsonschema==4.26.0
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:59.4833408Z  + jsonschema-specifications==2025.9.1
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:59.4833938Z  + markdown-it-py==4.0.0
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:59.4834369Z  + markupsafe==3.0.3
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:59.4834749Z  + mcp==1.26.0
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:59.4835099Z  + mdurl==0.1.2
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:59.4835460Z  + numpy==2.4.3
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:59.4835820Z  + openai==2.24.0
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:59.4836203Z  + openpyxl==3.1.5
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:59.4836883Z  + packaging==26.0
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:59.4837316Z  + pandas==3.0.5
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:59.4837678Z  + pluggy==1.6.0
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:59.4838242Z  + prompt-toolkit==3.0.52
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:59.4838681Z  + psutil==7.2.2
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:59.4839051Z  + pycparser==3.0
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:59.4839444Z  + pydantic==2.12.5
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:59.4839842Z  + pydantic-core==2.41.5
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:59.4840278Z  + pydantic-settings==2.13.1
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:59.4840730Z  + pygments==2.19.2
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:59.4841104Z  + pyjwt==2.12.1
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:59.4841468Z  + pytest==9.0.2
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:59.4841853Z  + pytest-asyncio==1.3.0
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:59.4842612Z  + pytest-split==0.11.0
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:59.4842993Z  + pytest-xdist==3.8.0
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:59.4843404Z  + python-dateutil==2.9.0.post0
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:59.4843826Z  + python-dotenv==1.2.1
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:59.4844217Z  + python-multipart==0.0.22
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:59.4844603Z  + pytz==2025.2
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:59.4844943Z  + pyyaml==6.0.3
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:59.4845296Z  + referencing==0.37.0
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:59.4845661Z  + requests==2.33.0
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:59.4846003Z  + rich==14.3.3
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:59.4846340Z  + rpds-py==0.30.0
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:59.4846692Z  + ruamel-yaml==0.18.17
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:59.4847071Z  + ruamel-yaml-clib==0.2.15
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:59.4847457Z  + ruff==0.15.10
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:59.4848103Z  + six==1.17.0
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:59.4848448Z  + sniffio==1.3.1
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:59.4848795Z  + socksio==1.0.0
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:59.4849150Z  + sse-starlette==3.3.2
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:59.4849532Z  + starlette==0.52.1
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:59.4849891Z  + tenacity==9.1.4
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:59.4850249Z  + termcolor==3.3.0
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:59.4850606Z  + tqdm==4.67.3
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:59.4850928Z  + ty==0.0.21
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:59.4851291Z  + typing-extensions==4.15.0
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:59.4851721Z  + typing-inspection==0.4.2
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:59.4852100Z  + urllib3==2.6.3
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:59.4852392Z  + uvicorn==0.41.0
+jailed-e2e	Install test and sandbox dependencies	2026-07-27T04:36:59.4852945Z  + wcwidth==0.6.0
+jailed-e2e	Run sandbox unit battery	﻿2026-07-27T04:36:59.5021691Z ##[group]Run uv run pytest -q -m "not sandbox_e2e" tests/test_python_sandbox_tool.py
+jailed-e2e	Run sandbox unit battery	2026-07-27T04:36:59.5022333Z ^[[36;1muv run pytest -q -m "not sandbox_e2e" tests/test_python_sandbox_tool.py^[[0m
+jailed-e2e	Run sandbox unit battery	2026-07-27T04:36:59.5066514Z shell: /usr/bin/bash -e {0}
+jailed-e2e	Run sandbox unit battery	2026-07-27T04:36:59.5066786Z env:
+jailed-e2e	Run sandbox unit battery	2026-07-27T04:36:59.5067050Z   UV_CACHE_DIR: /home/runner/work/_temp/setup-uv-cache
+jailed-e2e	Run sandbox unit battery	2026-07-27T04:36:59.5067383Z ##[endgroup]
+jailed-e2e	Run sandbox unit battery	2026-07-27T04:37:02.5546949Z bringing up nodes...
+jailed-e2e	Run sandbox unit battery	2026-07-27T04:37:02.5547512Z bringing up nodes...
+jailed-e2e	Run sandbox unit battery	2026-07-27T04:37:02.5555393Z 
+jailed-e2e	Run sandbox unit battery	2026-07-27T04:37:02.8955085Z ..................                                                       [100%]
+jailed-e2e	Run sandbox unit battery	2026-07-27T04:37:02.8956140Z 18 passed in 2.34s
+jailed-e2e	Run jailed E2E battery without skips	﻿2026-07-27T04:37:02.9378535Z ##[group]Run set -euo pipefail
+jailed-e2e	Run jailed E2E battery without skips	2026-07-27T04:37:02.9378931Z ^[[36;1mset -euo pipefail^[[0m
+jailed-e2e	Run jailed E2E battery without skips	2026-07-27T04:37:02.9379412Z ^[[36;1muv run pytest -q -m sandbox_e2e tests/test_python_sandbox_tool.py | tee /tmp/sandbox-e2e.txt^[[0m
+jailed-e2e	Run jailed E2E battery without skips	2026-07-27T04:37:02.9379978Z ^[[36;1mgrep -Eq '^9 passed in ' /tmp/sandbox-e2e.txt^[[0m
+jailed-e2e	Run jailed E2E battery without skips	2026-07-27T04:37:02.9380332Z ^[[36;1m! grep -q skipped /tmp/sandbox-e2e.txt^[[0m
+jailed-e2e	Run jailed E2E battery without skips	2026-07-27T04:37:02.9380713Z ^[[36;1mtest -s /tmp/python-sandbox-acceptance/open-cases.xlsx^[[0m
+jailed-e2e	Run jailed E2E battery without skips	2026-07-27T04:37:02.9425582Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+jailed-e2e	Run jailed E2E battery without skips	2026-07-27T04:37:02.9425935Z env:
+jailed-e2e	Run jailed E2E battery without skips	2026-07-27T04:37:02.9426193Z   UV_CACHE_DIR: /home/runner/work/_temp/setup-uv-cache
+jailed-e2e	Run jailed E2E battery without skips	2026-07-27T04:37:02.9426603Z   PYTHON_SANDBOX_ACCEPTANCE_DIR: /tmp/python-sandbox-acceptance
+jailed-e2e	Run jailed E2E battery without skips	2026-07-27T04:37:02.9426955Z ##[endgroup]
+jailed-e2e	Run jailed E2E battery without skips	2026-07-27T04:37:04.5023433Z bringing up nodes...
+jailed-e2e	Run jailed E2E battery without skips	2026-07-27T04:37:04.5023952Z bringing up nodes...
+jailed-e2e	Run jailed E2E battery without skips	2026-07-27T04:37:04.5024174Z 
+jailed-e2e	Run jailed E2E battery without skips	2026-07-27T04:37:11.4875800Z .........                                                                [100%]
+jailed-e2e	Run jailed E2E battery without skips	2026-07-27T04:37:11.4877069Z 9 passed in 8.22s
+jailed-e2e	Upload jailed XLSX acceptance artifact	﻿2026-07-27T04:37:11.5337623Z Node 20 is being deprecated. This workflow is running with Node 24 by default. If you need to temporarily use Node 20, you can set the ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION=true environment variable. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/
+jailed-e2e	Upload jailed XLSX acceptance artifact	2026-07-27T04:37:11.5339459Z ##[group]Run actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+jailed-e2e	Upload jailed XLSX acceptance artifact	2026-07-27T04:37:11.5339886Z with:
+jailed-e2e	Upload jailed XLSX acceptance artifact	2026-07-27T04:37:11.5340125Z   name: python-sandbox-open-cases
+jailed-e2e	Upload jailed XLSX acceptance artifact	2026-07-27T04:37:11.5340459Z   path: /tmp/python-sandbox-acceptance/open-cases.xlsx
+jailed-e2e	Upload jailed XLSX acceptance artifact	2026-07-27T04:37:11.5340796Z   if-no-files-found: error
+jailed-e2e	Upload jailed XLSX acceptance artifact	2026-07-27T04:37:11.5341039Z   compression-level: 6
+jailed-e2e	Upload jailed XLSX acceptance artifact	2026-07-27T04:37:11.5341261Z   overwrite: false
+jailed-e2e	Upload jailed XLSX acceptance artifact	2026-07-27T04:37:11.5341484Z   include-hidden-files: false
+jailed-e2e	Upload jailed XLSX acceptance artifact	2026-07-27T04:37:11.5341726Z env:
+jailed-e2e	Upload jailed XLSX acceptance artifact	2026-07-27T04:37:11.5341957Z   UV_CACHE_DIR: /home/runner/work/_temp/setup-uv-cache
+jailed-e2e	Upload jailed XLSX acceptance artifact	2026-07-27T04:37:11.5342259Z ##[endgroup]
+jailed-e2e	Upload jailed XLSX acceptance artifact	2026-07-27T04:37:11.7043266Z (node:3269) [DEP0040] DeprecationWarning: The `punycode` module is deprecated. Please use a userland alternative instead.
+jailed-e2e	Upload jailed XLSX acceptance artifact	2026-07-27T04:37:11.7044411Z (Use `node --trace-deprecation ...` to show where the warning was created)
+jailed-e2e	Upload jailed XLSX acceptance artifact	2026-07-27T04:37:11.7089407Z With the provided path, there will be 1 file uploaded
+jailed-e2e	Upload jailed XLSX acceptance artifact	2026-07-27T04:37:11.7094468Z Artifact name is valid!
+jailed-e2e	Upload jailed XLSX acceptance artifact	2026-07-27T04:37:11.7095372Z Root directory input is valid!
+jailed-e2e	Upload jailed XLSX acceptance artifact	2026-07-27T04:37:12.0199754Z Beginning upload of artifact content to blob storage
+jailed-e2e	Upload jailed XLSX acceptance artifact	2026-07-27T04:37:12.0391839Z (node:3269) [DEP0169] DeprecationWarning: `url.parse()` behavior is not standardized and prone to errors that have security implications. Use the WHATWG URL API instead. CVEs are not issued for `url.parse()` vulnerabilities.
+jailed-e2e	Upload jailed XLSX acceptance artifact	2026-07-27T04:37:12.3244680Z Uploaded bytes 6386
+jailed-e2e	Upload jailed XLSX acceptance artifact	2026-07-27T04:37:12.4034098Z Finished uploading artifact content to blob storage!
+jailed-e2e	Upload jailed XLSX acceptance artifact	2026-07-27T04:37:12.4035299Z SHA256 digest of uploaded artifact zip is 547834aa954f714791afeec1991b5fc72a5e1a94d6cb5e555347f5b85d01d7d7
+jailed-e2e	Upload jailed XLSX acceptance artifact	2026-07-27T04:37:12.4036979Z Finalizing artifact upload
+jailed-e2e	Upload jailed XLSX acceptance artifact	2026-07-27T04:37:12.6091146Z Artifact python-sandbox-open-cases.zip successfully finalized. Artifact ID 8642133344
+jailed-e2e	Upload jailed XLSX acceptance artifact	2026-07-27T04:37:12.6093029Z Artifact python-sandbox-open-cases has been successfully uploaded! Final size is 6386 bytes. Artifact ID is 8642133344
+jailed-e2e	Upload jailed XLSX acceptance artifact	2026-07-27T04:37:12.6098748Z Artifact download URL: https://github.com/teren-papercutlabs/hermes-pcl/actions/runs/30237584638/artifacts/8642133344
+jailed-e2e	Post Run astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e	﻿2026-07-27T04:37:12.6281757Z Node 20 is being deprecated. This workflow is running with Node 24 by default. If you need to temporarily use Node 20, you can set the ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION=true environment variable. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/
+jailed-e2e	Post Run astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e	2026-07-27T04:37:12.6283010Z Post job cleanup.
+jailed-e2e	Post Run astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e	2026-07-27T04:37:12.7561744Z Cache hit occurred on key setup-uv-1-x86_64-unknown-linux-gnu-3.12.3-pruned-1a0462e549cc4a762fc1d639244619ec8b6704fd394823c46c62e7d002523b6f, not saving cache.
+jailed-e2e	Post Run astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e	2026-07-27T04:37:12.7563742Z (node:3281) [DEP0040] DeprecationWarning: The `punycode` module is deprecated. Please use a userland alternative instead.
+jailed-e2e	Post Run astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e	2026-07-27T04:37:12.7565179Z (Use `node --trace-deprecation ...` to show where the warning was created)
+jailed-e2e	Post Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	﻿2026-07-27T04:37:12.7699502Z Node 20 is being deprecated. This workflow is running with Node 24 by default. If you need to temporarily use Node 20, you can set the ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION=true environment variable. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/
+jailed-e2e	Post Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:37:12.7700768Z Post job cleanup.
+jailed-e2e	Post Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:37:12.8579406Z [command]/usr/bin/git version
+jailed-e2e	Post Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:37:12.8620452Z git version 2.54.0
+jailed-e2e	Post Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:37:12.8660438Z Temporarily overriding HOME='/home/runner/work/_temp/79b40cbd-4642-4976-8e53-9c8a577898d8' before making global git config changes
+jailed-e2e	Post Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:37:12.8661769Z Adding repository directory to the temporary git global config as a safe directory
+jailed-e2e	Post Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:37:12.8666117Z [command]/usr/bin/git config --global --add safe.directory /home/runner/work/hermes-pcl/hermes-pcl
+jailed-e2e	Post Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:37:12.8704036Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+jailed-e2e	Post Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:37:12.8738788Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+jailed-e2e	Post Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:37:12.8969207Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+jailed-e2e	Post Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:37:12.8996557Z http.https://github.com/.extraheader
+jailed-e2e	Post Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:37:12.9015765Z [command]/usr/bin/git config --local --unset-all http.https://github.com/.extraheader
+jailed-e2e	Post Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:37:12.9041985Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+jailed-e2e	Post Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:37:12.9306204Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+jailed-e2e	Post Run actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5	2026-07-27T04:37:12.9340680Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+jailed-e2e	Complete job	﻿2026-07-27T04:37:12.9705209Z Cleaning up orphan processes
+jailed-e2e	Complete job	2026-07-27T04:37:12.9950984Z ##[warning]Node.js 20 is deprecated. The following actions target Node.js 20 but are being forced to run on Node.js 24: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5, actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02, astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/

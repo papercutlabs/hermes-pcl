@@ -1,0 +1,6 @@
+{
+  "version": 1,
+  "reversibility_class": "revertible",
+  "blast_bound": "Studio-only evaluator files, local evaluator audit state, and one pcl check definition; TGG VPS access is read-only",
+  "acceptable_worst_case": "One evaluation batch fails closed or files duplicate internal defects; no client runtime, portal, or production data mutation"
+}

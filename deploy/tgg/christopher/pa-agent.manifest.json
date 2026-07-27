@@ -84,6 +84,12 @@
       "owner": "pclaw:pclaw"
     },
     {
+      "sourcePath": "tools/python_sandbox_tool.py",
+      "targetPath": "home/pclaw/apps/hermes-pcl/tools/python_sandbox_tool.py",
+      "mode": "644",
+      "owner": "pclaw:pclaw"
+    },
+    {
       "sourcePath": "toolsets.py",
       "targetPath": "home/pclaw/apps/hermes-pcl/toolsets.py",
       "owner": "pclaw:pclaw"

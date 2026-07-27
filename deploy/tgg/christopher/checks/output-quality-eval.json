@@ -1,0 +1,23 @@
+{
+  "origin_wb": "47c0aa00-51bb-42c4-9f80-f5972c1b79e9",
+  "checks": [
+    {
+      "logical_key": "loop.pa.tgg.output_eval",
+      "proof_kind": "state",
+      "result_statement": "Fresh Christopher-affected TGG cases are judged at the authenticated rendered portal against their raw WhatsApp source in both directions",
+      "why": "Runtime and database checks cannot detect client-visible misattribution, missing facts, incorrect status, or media binding",
+      "subject": {"type": "client_agent", "ref": "tgg/christopher", "display_name": "TGG Christopher rendered output", "owner": "edna"},
+      "attachment": {"kind": "deploy", "ref": "deploy/tgg/christopher/client-agent-deployment.yaml"},
+      "activation": {"kind": "state_change", "interval_seconds": 3600, "events": ["pa_agent_deployed:tgg/christopher"], "daily_backstop": true},
+      "evaluator": {"kind": "deterministic", "runner": {"kind": "shell", "ref": "tgg-christopher-output-quality-eval", "params": {"command": ["/Users/pcloffice/pcl-dev/hermes-pcl/deploy/tgg/christopher/scripts/output_quality_eval.py", "run", "--trigger", "interval", "--maker-session-id", "tgg-output-eval-check-runner"], "timeout_ms": 1200000, "output_cap_bytes": 65536}}},
+      "pass_condition": {"type": "json_field", "field": "ok", "equals": true},
+      "red_owner_agent_override": "edna",
+      "severity": "blocker",
+      "enforcement_mode": "alert",
+      "checker_error_direction": "fail_closed",
+      "freshness_sla_seconds": 93600,
+      "active": true,
+      "metrics": ["batches_evaluated", "batches_occurred", "coverage_ratio", "defect_trend", "human_caught", "loop_caught"]
+    }
+  ]
+}

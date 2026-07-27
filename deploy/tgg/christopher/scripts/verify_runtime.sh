@@ -73,6 +73,26 @@ test -x "$APP_ROOT/.venv/bin/python"
 test -s "$HERMES_HOME/.env"
 test -s "$HERMES_HOME/config.yaml"
 test -s "$HERMES_HOME/christopher_tgg_constitution.yaml"
+
+sandbox_enabled="$("$APP_ROOT/.venv/bin/python" - "$HERMES_HOME/config.yaml" <<'PY2'
+import sys, yaml
+config = yaml.safe_load(open(sys.argv[1])) or {}
+print("true" if (config.get("python_sandbox") or {}).get("enabled") is True else "false")
+PY2
+)"
+if [[ "$sandbox_enabled" == "true" ]]; then
+  runuser -u pclaw -- unshare --user --map-root-user --net --mount --pid --fork --kill-child \
+    /bin/sh -c 'unshare --user --map-user=65534 --map-group=65534 true'
+  "$APP_ROOT/.venv/bin/python" - "$HERMES_HOME/config.yaml" <<'PY2'
+import pathlib, sys, yaml
+config = yaml.safe_load(open(sys.argv[1])) or {}
+datasets = (config.get("python_sandbox") or {}).get("datasets") or {}
+assert set(datasets) == {"cases", "media"}, sorted(datasets)
+for name in ("cases", "media"):
+    path = pathlib.Path(datasets[name]["path"])
+    assert path.exists(), (name, str(path))
+PY2
+fi
 test -s "$RUNTIME_ROOT/engine-slot"
 test -s "$RUNTIME_ROOT/processing-gate.json"
 test -s "$RUNTIME_ROOT/capture-cursor.json"

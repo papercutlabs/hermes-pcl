@@ -1,0 +1,44 @@
+{
+  "checker_session_id": "golden-checker",
+  "source_to_page": "fail",
+  "page_to_source": "fail",
+  "manager_readability": "unsure",
+  "summary": "The synthetic page intentionally contains traceability defects while retaining clear message and photo placement.",
+  "checks": [
+    {
+      "id": "sender-shows-real-name-not-site-worker",
+      "result": "fail",
+      "evidence": "Source sender Ali is rendered as Site worker."
+    },
+    {
+      "id": "no-contact-emoji-leak",
+      "result": "fail",
+      "evidence": "The page adds an emoji after Mdm Lee that is absent from source."
+    },
+    {
+      "id": "message-text-displayed-as-bubble-photos-underneath",
+      "result": "pass",
+      "evidence": "Kitchen tap done is a bubble with both photos directly underneath."
+    },
+    {
+      "id": "explicit-done-statement-moves-item-completed",
+      "result": "pass",
+      "evidence": "The explicit done message is represented by the Kitchen tap item marked DONE."
+    },
+    {
+      "id": "cant-do-statement-surfaced-not-generic-pending",
+      "result": "unsure",
+      "evidence": "The fixture contains no cannot-do statement, so this check is not evidenced."
+    },
+    {
+      "id": "photos-bound-to-correct-work-item",
+      "result": "pass",
+      "evidence": "Both photos are explicitly labelled Kitchen tap under that message."
+    },
+    {
+      "id": "filter-covers-badge-states",
+      "result": "fail",
+      "evidence": "New is visible but has no corresponding filter."
+    }
+  ]
+}

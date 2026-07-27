@@ -383,3 +383,26 @@ group_sessions_per_user: false
 memory:
   memory_enabled: false
   user_profile_enabled: false
+python_sandbox:
+  enabled: true
+  datasets:
+    cases:
+      type: sqlite
+      path: /home/pclaw/.systems-pcl/data/tenants/tgg.db
+      description: "Operational case/work-costing database (read-only snapshot; sqlite)"
+    media:
+      type: path
+      path: /home/pclaw/.systems-pcl/data/media/tgg/hermes
+      description: "Retained WhatsApp media/attachments (read-only; spreadsheets land here)"
+  limits:
+    wall_seconds: 120
+    max_wall_seconds: 300
+    cpu_seconds: 60
+    memory_mb: 1024
+    file_size_mb: 64
+    scratch_mb: 64
+    max_processes: 64
+    max_open_files: 256
+    max_snapshot_mb: 512
+  artifact_ttl_days: 7
+  max_runs_kept: 40

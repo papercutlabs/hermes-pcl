@@ -1,0 +1,10 @@
+$ uvx ruff check tools/python_sandbox_tool.py tests/test_python_sandbox_tool.py
+All checks passed!
+$ python scripts/plane_lint.py --strict
+plane-lint: total 68 (client-token=68), suppressed by baseline: 68, new: 0
+plane-lint: OK (strict)
+$ python deploy/tgg/christopher/scripts/build_runtime_slots.py
+$ python deploy/tgg/christopher/scripts/validate_deployment_spec.py --app-root . --spec deploy/tgg/christopher/client-agent-deployment.yaml
+{"allowed_slots": ["gpt-5.4-mini", "gpt-5.6-luna", "gpt-5.6-luna-low"], "brain_ref": "agentbrain:tgg:christopher:june-2026@sha256:433d98de07a61f6978862db04fa1a81a943a81bad92446898c26741652afea1e", "default_slot": "gpt-5.4-mini", "group_sessions_per_user": false, "ok": true, "owned_units": ["christopher-tgg-hermes-health.service", "christopher-tgg-hermes-health.timer", "christopher-tgg-hermes.service"], "processing_enabled": false, "slot_hashes": {"gpt-5.4-mini": {"config": "6c37897720deec81a6d6fbf1292cca76cada10f1e82663b0b25a9644894f20f7", "constitution": "36255c7e39daa03b31ab505a65c8f2a4f0c2c1a7cf9462083ce99d5fb08ec15b"}, "gpt-5.6-luna": {"config": "debcf850b63e5ae799b224acec43df8e5d7b249c9a2d48af4290db1b4843dfea", "constitution": "dbef9884aaff4eddc42d79f78f77855cefafe838c816d6fd70ce78ef10b22e73"}, "gpt-5.6-luna-low": {"config": "c7cae032cbd7ba007c6f09172420a814b0a1d6234b870703d4e32c7b5d2c4b67", "constitution": "dbef9884aaff4eddc42d79f78f77855cefafe838c816d6fd70ce78ef10b22e73"}}, "spec": "/Users/pcloffice/pcl/_worktrees/edna-8ddae42d-482b604f/deploy/tgg/christopher/client-agent-deployment.yaml"}
+$ git diff --check
+exit=0
