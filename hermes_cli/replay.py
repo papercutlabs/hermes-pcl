@@ -63,11 +63,14 @@ def add_replay_parser(subparsers) -> argparse.ArgumentParser:
         help="Honor live gateway authorization checks during replay (default bypasses them).",
     )
     parser.add_argument("--chat-id", help="bridge_message_log chat_jid to replay.")
+    parser.add_argument("--tenant", help="PA tenant for replay context.")
+    parser.add_argument("--agent-id", help="PA agent id for replay context.")
+    parser.add_argument("--job-type", help="PA job type for replay context.")
     parser.add_argument(
-        "--since-sgt", help="Inclusive bridge_message_log sgt lower bound."
+        "--since", help="Inclusive bridge_message_log time lower bound."
     )
     parser.add_argument(
-        "--until-sgt", help="Exclusive bridge_message_log sgt upper bound."
+        "--until", help="Exclusive bridge_message_log time upper bound."
     )
     parser.add_argument(
         "--limit-messages",
@@ -102,13 +105,22 @@ def _load_plan(args) -> ReplayPlan:
     if getattr(args, "bridge_message_log", None):
         if not getattr(args, "chat_id", None):
             raise SystemExit("--bridge-message-log requires --chat-id")
-        if not getattr(args, "since_sgt", None):
-            raise SystemExit("--bridge-message-log requires --since-sgt")
+        for flag, attribute in (
+            ("--since", "since"),
+            ("--tenant", "tenant"),
+            ("--agent-id", "agent_id"),
+            ("--job-type", "job_type"),
+        ):
+            if not getattr(args, attribute, None):
+                raise SystemExit(f"--bridge-message-log requires {flag}")
         corpus = ReplayCorpus.from_bridge_message_log(
             Path(args.bridge_message_log),
             chat_id=args.chat_id,
-            since_sgt=args.since_sgt,
-            until_sgt=getattr(args, "until_sgt", None),
+            since=args.since,
+            until=getattr(args, "until", None),
+            tenant=args.tenant,
+            agent_id=args.agent_id,
+            job_type=args.job_type,
             limit=getattr(args, "limit_messages", None),
             skip_messages=getattr(args, "skip_messages", 0),
             media_root=getattr(args, "media_root", None),
@@ -179,11 +191,13 @@ def _add_plan_source_args(
         help="Honor live gateway authorization checks during replay (default bypasses them).",
     )
     parser.add_argument("--chat-id", help="bridge_message_log chat_jid to replay.")
+    parser.add_argument("--agent-id", help="PA agent id for replay context.")
+    parser.add_argument("--job-type", help="PA job type for replay context.")
     parser.add_argument(
-        "--since-sgt", help="Inclusive bridge_message_log sgt lower bound."
+        "--since", help="Inclusive bridge_message_log time lower bound."
     )
     parser.add_argument(
-        "--until-sgt", help="Exclusive bridge_message_log sgt upper bound."
+        "--until", help="Exclusive bridge_message_log time upper bound."
     )
     parser.add_argument(
         "--limit-messages",
@@ -212,7 +226,7 @@ def _add_provider_args(parser: argparse.ArgumentParser) -> None:
         help="Provider admin bearer token (or PS_REPLAY_PROVIDER_ADMIN_TOKEN).",
     )
     parser.add_argument(
-        "--tenant", default="tgg", help="Provider tenant query value (default: tgg)."
+        "--tenant", required=True, help="Provider tenant query value."
     )
     parser.add_argument(
         "--provider-timeout",
@@ -231,7 +245,7 @@ def _provider_client_from_args(args):
     config = provider_config_from_env(
         provider_url=getattr(args, "provider_url", None),
         admin_token=getattr(args, "provider_admin_token", None),
-        tenant=getattr(args, "tenant", "tgg"),
+        tenant=getattr(args, "tenant", None),
         timeout_seconds=getattr(args, "provider_timeout", 30.0),
     )
     if not config.provider_url:
@@ -347,8 +361,7 @@ def add_replay_run_parser(subparsers) -> argparse.ArgumentParser:
     promote.add_argument(
         "--confirm",
         required=True,
-        choices=("ORCHESTRATOR_PROMOTE",),
-        help="Explicit orchestrator promote confirmation. Provider still requires its own SWAP_TGG_TARGET body.",
+        help="Tenant-derived confirmation: ORCHESTRATOR_<TENANT>_TARGET.",
     )
 
     rollback = commands.add_parser(
@@ -452,6 +465,13 @@ def cmd_replay_run(args) -> None:
         print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
         return
     if command == "promote":
+        from gateway.replay_orchestrator import tenant_confirmation_token
+
+        expected_confirm = tenant_confirmation_token("ORCHESTRATOR", args.tenant)
+        if args.confirm != expected_confirm:
+            raise SystemExit(
+                f"--confirm must be {expected_confirm!r} for tenant {args.tenant!r}"
+            )
         print(
             json.dumps(
                 orch.promote(prod_data_dir=args.prod_data_dir),

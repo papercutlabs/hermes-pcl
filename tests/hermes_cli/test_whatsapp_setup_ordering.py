@@ -29,6 +29,11 @@ def isolated_home(tmp_path, monkeypatch):
     hermes.mkdir(parents=True)
     monkeypatch.setattr(Path, "home", lambda: home)
     monkeypatch.setenv("HERMES_HOME", str(hermes))
+    # Bind both consumers to the same canonical profile-aware home.  Merely
+    # patching Path.home/HERMES_HOME is insufficient once hermes_constants has
+    # cached a profile resolution in another test.
+    monkeypatch.setattr("hermes_cli.config.get_hermes_home", lambda: hermes)
+    monkeypatch.setattr("hermes_cli.main.get_hermes_home", lambda: hermes)
     # Ensure get_env_value cache doesn't carry stale state.
     for key in list(os.environ):
         if key.startswith("WHATSAPP_"):
@@ -127,7 +132,7 @@ def test_existing_pairing_skip_branch_enables_whatsapp(isolated_home, monkeypatc
     # in the same function still works because we wrote it ourselves.
     _orig_exists = Path.exists
     def _stub_exists(self):
-        if self.name == "node_modules":
+        if self.name == "node_modules" or self.name == "bridge.js":
             return True
         return _orig_exists(self)
     monkeypatch.setattr(Path, "exists", _stub_exists)

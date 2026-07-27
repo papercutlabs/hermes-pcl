@@ -1,0 +1,31 @@
+name: Plane lint (anti-drift, warn mode)
+
+# PA de-fusion Phase 0.2 (WB 69614cce): enforces the shared-plane /
+# client-plane boundary declared in plane-manifest.json.
+#   - import-direction: shared-plane files must not import client-plane code
+#   - client-token: client tokens must not appear in shared-plane files
+# Currently WARN mode: violations not in plane-lint-baseline.json are
+# printed but never fail the job. Flip the run step to --strict once the
+# suppression baseline is burned down (plan (b) dial setting).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: plane-lint-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  plane-lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run plane lint (warn mode)
+        run: python3 scripts/plane_lint.py

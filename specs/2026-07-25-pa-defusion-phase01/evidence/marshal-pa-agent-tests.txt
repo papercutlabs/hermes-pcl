@@ -1,0 +1,45 @@
+✓ Lockfile passes supply-chain policies (verified 8m ago)
+Progress: resolved 1, reused 0, downloaded 0, added 0
+[WARN] deprecated @types/libsodium-wrappers@0.8.2: This is a stub types definition. libsodium-wrappers provides its own type definitions, so you do not need this installed.
+[WARN] deprecated crypto@1.0.1: This package is no longer supported. It's now a built-in Node module. If you've depended on crypto, you should switch to the one that's built-in.
+Progress: resolved 340, reused 340, downloaded 0, added 0
+[WARN] 9 deprecated subdependencies found: @esbuild-kit/core-utils@3.3.2, @esbuild-kit/esm-loader@2.6.5, glob@7.2.3, inflight@1.0.6, lodash.isequal@4.5.0, node-domexception@1.0.0, prebuild-install@7.1.3, uuid@9.0.1, whatwg-encoding@3.1.1
+Packages: +2
+++
+Progress: resolved 929, reused 807, downloaded 0, added 2, done
+. postinstall$ patch-package
+. postinstall: patch-package 8.0.1
+. postinstall: Applying patches...
+. postinstall: @vitest/coverage-v8@1.6.1 ✔
+. postinstall: Done
+[WARN] Issues with peer dependencies found. Run "pnpm peers check" to list them.
+
+Done in 3.8s using pnpm v11.13.1
+✓ Lockfile passes supply-chain policies (verified 1s ago)
+Progress: resolved 1, reused 0, downloaded 0, added 0
+[WARN] deprecated @types/libsodium-wrappers@0.8.2: This is a stub types definition. libsodium-wrappers provides its own type definitions, so you do not need this installed.
+[WARN] deprecated crypto@1.0.1: This package is no longer supported. It's now a built-in Node module. If you've depended on crypto, you should switch to the one that's built-in.
+Progress: resolved 455, reused 428, downloaded 0, added 0
+[WARN] 9 deprecated subdependencies found: @esbuild-kit/core-utils@3.3.2, @esbuild-kit/esm-loader@2.6.5, glob@7.2.3, inflight@1.0.6, lodash.isequal@4.5.0, node-domexception@1.0.0, prebuild-install@7.1.3, uuid@9.0.1, whatwg-encoding@3.1.1
+Packages: +2
+++
+Progress: resolved 929, reused 807, downloaded 0, added 2, done
+. postinstall$ patch-package
+. postinstall: patch-package 8.0.1
+. postinstall: Applying patches...
+. postinstall: @vitest/coverage-v8@1.6.1 ✔
+. postinstall: Done
+[WARN] Issues with peer dependencies found. Run "pnpm peers check" to list them.
+
+Done in 3s using pnpm v11.13.1
+
+ RUN  v1.6.1 /Users/pcloffice/pcl/_worktrees/marshal-d1-35-ef7660ab
+
+ ✓ src/commands/pa-agent/__tests__/registration.test.ts  (1 test) 3ms
+ ✓ src/lib/pa-agent/__tests__/bundle.test.ts  (6 tests) 25730ms
+
+ Test Files  2 passed (2)
+      Tests  7 passed (7)
+   Start at  06:44:30
+   Duration  26.80s (transform 159ms, setup 0ms, collect 841ms, tests 25.73s, environment 0ms, prepare 96ms)
+

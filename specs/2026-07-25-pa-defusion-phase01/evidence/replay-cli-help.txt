@@ -1,0 +1,48 @@
+usage: hermes replay [-h] (--plan PATH | --corpus PATH |
+                     --bridge-message-log PATH) [--platform PLATFORM]
+                     [--delivery-mode {capture,drop}] [--require-mention]
+                     [--enforce-auth] [--chat-id CHAT_ID] [--tenant TENANT]
+                     [--agent-id AGENT_ID] [--job-type JOB_TYPE]
+                     [--since SINCE] [--until UNTIL]
+                     [--limit-messages LIMIT_MESSAGES]
+                     [--skip-messages SKIP_MESSAGES] [--media-root MEDIA_ROOT]
+
+Replay a typed bridge-message corpus through the real Hermes gateway adapter
+path without connecting live adapters or sending live outbound messages.
+ReplayCorpus applies deterministic ordering, dedup, bare-reaction skipping,
+quote/media preservation, missing-media reporting, and the per-turn future-
+read fence before messages feed the ReplayPlan.
+
+options:
+  -h, --help            show this help message and exit
+  --plan PATH           JSON replay plan containing platform, messages/corpus,
+                        and replay options.
+  --corpus PATH         JSON/JSONL bridge-message corpus. Defaults to
+                        --platform whatsapp.
+  --bridge-message-log PATH
+                        SQLite DB containing bridge_message_log rows (first-
+                        class ReplayCorpus source).
+  --platform PLATFORM   Platform adapter to use with --corpus (default:
+                        whatsapp).
+  --delivery-mode {capture,drop}
+                        Capture outbound sends in the replay result or
+                        silently drop them (default: capture).
+  --require-mention     Honor platform mention gates during replay (default
+                        bypasses them).
+  --enforce-auth        Honor live gateway authorization checks during replay
+                        (default bypasses them).
+  --chat-id CHAT_ID     bridge_message_log chat_jid to replay.
+  --tenant TENANT       PA tenant for replay context.
+  --agent-id AGENT_ID   PA agent id for replay context.
+  --job-type JOB_TYPE   PA job type for replay context.
+  --since SINCE         Inclusive bridge_message_log time lower bound.
+  --until UNTIL         Exclusive bridge_message_log time upper bound.
+  --limit-messages LIMIT_MESSAGES
+                        Limit bridge_message_log rows before policy skips.
+  --skip-messages SKIP_MESSAGES
+                        Skip the first N ordered bridge_message_log rows;
+                        reported in corpus_report.
+  --media-root MEDIA_ROOT
+                        Flat directory for remapping missing
+                        bridge_message_log media basenames; unresolved media
+                        is reported.

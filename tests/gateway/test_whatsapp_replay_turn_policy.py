@@ -24,8 +24,18 @@ def _message(message_id: str, ts: int, body: str, chat_id: str = CHAT) -> dict:
     }
 
 
+@pytest.fixture(autouse=True)
+def _isolate_whatsapp_group_policy(monkeypatch):
+    """Keep replay fixtures independent of config-loader env side effects."""
+    monkeypatch.delenv("WHATSAPP_GROUP_POLICY", raising=False)
+    monkeypatch.delenv("WHATSAPP_GROUP_ALLOWED_USERS", raising=False)
+
+
 def _adapter(extra: dict | None = None) -> WhatsAppAdapter:
-    return WhatsAppAdapter(PlatformConfig(enabled=True, extra=extra or {}))
+    config = {"group_policy": "open", **(extra or {})}
+    adapter = WhatsAppAdapter(PlatformConfig(enabled=True, extra=config))
+    assert adapter._group_policy == config["group_policy"]
+    return adapter
 
 
 async def _capture_replay(adapter: WhatsAppAdapter, messages: list[dict]) -> list:

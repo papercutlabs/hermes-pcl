@@ -162,8 +162,8 @@ EVENT_LABELS_NEW = (
 )
 
 NEW_OPERATIONS = ("tgg_clarification_raise", "tgg_attention_raise", "tgg_case_wc_attach")
-NEW_INSTRUCTION_COUNT = 13
-MGMT_NEW_INSTRUCTION_COUNT = 12
+NEW_INSTRUCTION_COUNT = 14
+MGMT_NEW_INSTRUCTION_COUNT = 13
 
 # The ingest brief is unscoped (no `business_operations` block at all), which
 # grants it the full registry — that is exactly what makes it reachable for
@@ -290,15 +290,19 @@ CREATE_POLICY_OLD = (
 CREATE_POLICY_NEW = (
     "    - 'tgg_case_create has exactly one trigger — a genuinely new case report (a new\n"
     "      job sheet, or a new problem report with zone, address, problem, and WhatsApp\n"
-    "      source). When a job number is present, first call pa_business_read with operation\n"
-    "      tgg_case_lookup; if a case already exists, record the material as a tgg_case_observation\n"
+    "      source). The source document or job sheet in the current site-chat turn IS the\n"
+    "      citation for that new event. No registry confirmation exists or is required.\n"
+    "      Bind the create to the current turn''s exact message ids in sourceRefs and preserve\n"
+    "      its media references as evidence. When a job number is present, first call\n"
+    "      pa_business_read with operation tgg_case_lookup only to prevent a duplicate; if\n"
+    "      a case already exists, record the material as a tgg_case_observation\n"
     "      on that case instead of creating. Only a genuinely new report without a job\n"
     "      number may let PS generate a WA job number. Never create a placeholder case\n"
     "      for photos, evidence, works orders, completion reports, or anything you have\n"
     "      raised a clarification or attention item about — those paths are observation,\n"
-    "      scope addition (tgg_case_wc_attach), attention item, or clarification. If address,\n"
-    "      problem, source, or confidence is unclear, do not create; raise a clarification\n"
-    "      instead.\n"
+    "      scope addition (tgg_case_wc_attach), attention item, or clarification. The Master\n"
+    "      List is backup/audit only and must never enter the decision path: never query it,\n"
+    "      wait for it, or use its absence to block a create.\n"
     "\n"
     "      '\n"
 )
@@ -554,6 +558,15 @@ def _validate(
     assert "tgg_clarification_raise" in joined
     assert "tgg_case_wc_attach" in joined
     assert "attention_raised" in joined
+    # Teren 2026-07-22 21:22/22:03: the source job sheet is the citation;
+    # Master is an audit surface and clarification is exception-only.
+    assert "source document or job sheet in the current site-chat turn IS" in joined
+    assert "No registry confirmation exists or is required" in joined
+    assert "Master List is backup/audit only" in joined
+    assert "must never enter the decision path" in joined
+    assert "Clarification boundary and routing" in joined
+    assert "Route every clarification to the manager chat for now" in joined
+    assert "do not ask in the source site thread" in joined
     all_instructions = "\n".join(
         instruction
         for job in constitution["job_briefs"].values()
@@ -577,6 +590,10 @@ def _validate(
     assert "LOW confidence" in joined
     assert "runtime supplies" in joined
     assert "current-turn refs when they are omitted" in joined
+    assert "exact date-only source string in receiptDate" in joined
+    assert "Do not calculate midnight or dueAt" in joined
+    assert "runtime mechanically normalizes receiptDate" in joined
+    assert "actual timestamp, pass it as receivedAt" in joined
     # Stage-1 roll-forward (2026-07-20): placeholder sourceRefs ban + the
     # evidence-attach justification contract with refs-preserving retry.
     assert "Never write a placeholder token" in joined

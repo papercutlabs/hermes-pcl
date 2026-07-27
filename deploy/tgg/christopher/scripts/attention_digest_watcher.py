@@ -59,7 +59,7 @@ def fetch_open_items(base_url: str, token: str, tenant: str, replay_run_id: str 
 def load_marker(path: Path) -> set[int]:
     if not path.exists():
         return set()
-    data = json.loads(path.read_text())
+    data = json.loads(path.read_text(encoding="utf-8"))
     return set(int(i) for i in data.get("announced_ids", []))
 
 

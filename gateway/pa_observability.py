@@ -9,7 +9,7 @@ record of what the deployed PA agent did:
 
 It is universal (agent_id keys the rows), NOT TGG-specific.  A tool-call record
 carries only universal fields (name / input / result / cost / timing) plus an
-optional STRING ``client_entity_pointer`` (e.g. a case jobNo) — it NEVER imports
+optional STRING ``client_entity_pointer`` (a client-defined entity reference) — it NEVER imports
 client schema.
 
 SHARED SHAPE CONTRACT
@@ -79,7 +79,7 @@ class PaToolCall:
     result: Optional[Any] = None
     cost_usd: Optional[float] = None
     duration_ms: Optional[int] = None
-    # Optional STRING pointer at a client entity (e.g. a case jobNo).  A
+    # Optional STRING pointer at a client-defined entity reference.  A
     # pointer, NOT the client entity itself.  None for tools that touch no
     # client entity.
     client_entity_pointer: Optional[str] = None

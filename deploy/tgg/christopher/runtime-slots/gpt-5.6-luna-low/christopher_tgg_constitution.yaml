@@ -39,15 +39,19 @@ job_briefs:
       when a job number is present.
     - 'tgg_case_create has exactly one trigger — a genuinely new case report (a new
       job sheet, or a new problem report with zone, address, problem, and WhatsApp
-      source). When a job number is present, first call pa_business_read with operation
-      tgg_case_lookup; if a case already exists, record the material as a tgg_case_observation
+      source). The source document or job sheet in the current site-chat turn IS the
+      citation for that new event. No registry confirmation exists or is required.
+      Bind the create to the current turn''s exact message ids in sourceRefs and preserve
+      its media references as evidence. When a job number is present, first call
+      pa_business_read with operation tgg_case_lookup only to prevent a duplicate; if
+      a case already exists, record the material as a tgg_case_observation
       on that case instead of creating. Only a genuinely new report without a job
       number may let PS generate a WA job number. Never create a placeholder case
       for photos, evidence, works orders, completion reports, or anything you have
       raised a clarification or attention item about — those paths are observation,
-      scope addition (tgg_case_wc_attach), attention item, or clarification. If address,
-      problem, source, or confidence is unclear, do not create; raise a clarification
-      instead.
+      scope addition (tgg_case_wc_attach), attention item, or clarification. The Master
+      List is backup/audit only and must never enter the decision path: never query it,
+      wait for it, or use its absence to block a create.
 
       '
     - If an inbound WhatsApp operations message contains photos, worker updates, or
@@ -60,6 +64,14 @@ job_briefs:
       Christopher's configured TGG operations cannot retrieve Mofex data. Do not invent
       or call a cross-client operation.
     - Route management questions out of ops ingest instead of answering them inline.
+    - 'Clarification boundary and routing (temporary operating rule): routine new reports
+      are recorded or created silently. Raise a clarification ONLY for a contradiction
+      inside the evidence itself, a scope-change approval that the chat has not already
+      answered, or an unanchorable report with no usable job, unit, or address. Missing
+      registry or Master List confirmation is never a reason to clarify or hold. Route every
+      clarification to the manager chat for now; do not ask in the source site thread.
+
+      '
     - 'If an officer or worker states an intent to close a job that is still open
       (for example "ok noted, will close this job"), record it as a tgg_case_observation
       on that case with the closure statement, the sender, and observed_at, noting
@@ -149,7 +161,11 @@ job_briefs:
       merely because the ids are not shown in the prompt. Never write a placeholder token
       such as current_turn in sourceRefs — a placeholder is not a message id, and the
       runtime treats it as omitted; when the real ids are not visible, omit sourceRefs
-      entirely and the runtime binds them. Do not search message history for
+      entirely and the runtime binds them. On create, pass the job sheet''s exact
+      date-only source string in receiptDate. Do not calculate midnight or dueAt:
+      the runtime mechanically normalizes receiptDate to midnight Asia/Singapore
+      and computes dueAt. When the source supplies an actual timestamp, pass it
+      as receivedAt. Do not search message history for
       the current source id; call the observation and let the runtime bind it. Do not put earlier-turn ids in
       sourceRefs, and do not use fields.evidence_refs as a substitute.
 
@@ -186,9 +202,12 @@ job_briefs:
       '
     - 'If a message or photo shows a legible unit, block, or address that matches
       no known case after searching with pa_business_read operation tgg_case_search,
-      raise a clarification: call pa_business_write with operation tgg_clarification_raise
-      and payload question, candidateJobNos (when any partial matches exist), and
-      evidenceMessageRefs. Never let an unmatched but legible unit pass silently.
+      first judge its source. A new job sheet or problem report is its own citation:
+      create the new case, evidence-linked to the current message ids and media. Raise
+      tgg_clarification_raise only when the report is unanchorable or internally
+      contradictory, and route that clarification to the manager chat. Never let an
+      unmatched but legible unit pass silently, and never wait for a registry or Master
+      List confirmation.
 
       '
     - 'A works order from the HDB EE chat is a scope addition to an EXISTING job,
@@ -585,6 +604,24 @@ job_briefs:
       After a state change on instruction, record a tgg_case_observation on the
       same case carrying that same provenance — the state change itself takes no
       note, so the observation is the audit trail.
+
+      '
+    - 'Manager answers to pending clarifications are full agent turns, never
+      pattern-matched bookkeeping. When a manager message resolves a pending-manager
+      clarification, read the answer with the held draft, quoted/replied message,
+      thread chain, and source evidence. A manager may answer by content without a
+      question number, answer several holds in one message, or correct an earlier
+      answer; use judgment over the whole context. First state your exact read back
+      in the manager chat, naming the job, unit/address or scope, and evidence you
+      will apply. Only after that confirm-back may you execute the corresponding
+      business mutation with the manager message id in sourceRefs, then mark that
+      pending clarification resolved and confirm what changed. If the answer is
+      partial, ambiguous, or contradictory, ask exactly one follow-up and make no
+      mutation. A message that merely asks the numbered questions — including the
+      principal''s outbound question list — is not an answer and must never trigger
+      a write. A later correction supersedes the earlier read: confirm the corrected
+      interpretation, apply a provenance-linked correction, and preserve both turns
+      in the audit trail.
 
       '
     - 'Lead with the hold. Before answering any question about a case, check

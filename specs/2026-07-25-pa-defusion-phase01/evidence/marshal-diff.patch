@@ -1,0 +1,168 @@
+commit 531fd40df92cc9db5ae19c1a2242ca7b806667fc
+Author:     Rasim <rasim@papercut-labs.com>
+AuthorDate: Sat Jul 25 06:36:23 2026 +0800
+Commit:     Rasim <rasim@papercut-labs.com>
+CommitDate: Sat Jul 25 06:36:23 2026 +0800
+
+    fix(pa-agent): require explicit source manifest
+
+diff --git a/src/commands/pa-agent/__tests__/registration.test.ts b/src/commands/pa-agent/__tests__/registration.test.ts
+index 525a039d9..3abc31b6f 100644
+--- a/src/commands/pa-agent/__tests__/registration.test.ts
++++ b/src/commands/pa-agent/__tests__/registration.test.ts
+@@ -17,6 +17,10 @@ describe('pcl pa-agent command registration', () => {
+       'verify',
+     ]);
+     expect(command?.commands.every((cmd) => cmd.registeredArguments.length === 0)).toBe(true);
++    const bundle = command?.commands.find((cmd) => cmd.name() === 'bundle');
++    const manifest = bundle?.options.find((option) => option.long === '--manifest');
++    expect(manifest?.mandatory).toBe(true);
++    expect(bundle?.helpInformation()).toContain('--manifest <path>');
+     const rollback = command?.commands.find((cmd) => cmd.name() === 'rollback');
+     expect(rollback?.options.map((option) => option.long)).toEqual(expect.arrayContaining([
+       '--to',
+diff --git a/src/commands/pa-agent/bundle.ts b/src/commands/pa-agent/bundle.ts
+index 7b95f0f9e..f96d61e4b 100644
+--- a/src/commands/pa-agent/bundle.ts
++++ b/src/commands/pa-agent/bundle.ts
+@@ -6,7 +6,7 @@ interface BundleOpts {
+   client: string;
+   agent: string;
+   repo: string;
+-  manifest?: string;
++  manifest: string;
+   outputRoot?: string;
+   allowDirty?: boolean;
+   dryRun?: boolean;
+@@ -19,7 +19,7 @@ export function registerPaAgentBundle(parent: Command): void {
+     .requiredOption('--client <slug>', 'Client/tenant slug')
+     .requiredOption('--agent <slug>', 'Agent slug')
+     .requiredOption('--repo <path>', 'Local source repo/workspace path')
+-    .option('--manifest <path>', 'Optional pa-agent source manifest path')
++    .requiredOption('--manifest <path>', 'Explicit pa-agent source manifest path')
+     .option('--output-root <path>', 'Bundle output root (default: ~/.marshal/pa-agent-bundles)')
+     .option('--allow-dirty', 'Allow dirty source repo; default is to fail fast')
+     .option('--dry-run', 'Validate and print intended bundle without writing files or registry events')
+diff --git a/src/lib/pa-agent/__tests__/bundle.test.ts b/src/lib/pa-agent/__tests__/bundle.test.ts
+index 14cda72da..26999dfbb 100644
+--- a/src/lib/pa-agent/__tests__/bundle.test.ts
++++ b/src/lib/pa-agent/__tests__/bundle.test.ts
+@@ -95,6 +95,7 @@ describe('pa-agent bundle', () => {
+       client: 'tgg',
+       agent: 'christopher',
+       repo,
++      manifestPath: path.join(repo, 'pa-agent.manifest.json'),
+       outputRoot,
+       registryContext: registryContext(),
+       writeRegistryEvent: noOpRegistryEvent,
+@@ -109,6 +110,20 @@ describe('pa-agent bundle', () => {
+     expect(result.manifest.files[0].sha256).toMatch(/^[a-f0-9]{64}$/);
+   });
+ 
++  it('refuses to infer a repo-root source manifest', async () => {
++    const repo = makeRepo();
++
++    await expect(buildPaAgentBundle({
++      client: 'tgg',
++      agent: 'christopher',
++      repo,
++      manifestPath: '' as string,
++      outputRoot: fs.mkdtempSync(path.join(os.tmpdir(), 'pa-agent-bundles-')),
++      registryContext: registryContext(),
++      writeRegistryEvent: noOpRegistryEvent,
++    })).rejects.toThrow(/PA_AGENT_MANIFEST_REQUIRED/);
++  });
++
+   it('refuses dirty source by default', async () => {
+     const repo = makeRepo();
+     fs.appendFileSync(path.join(repo, 'agent.js'), 'console.log("dirty");\n');
+@@ -117,6 +132,7 @@ describe('pa-agent bundle', () => {
+       client: 'tgg',
+       agent: 'christopher',
+       repo,
++      manifestPath: path.join(repo, 'pa-agent.manifest.json'),
+       outputRoot: fs.mkdtempSync(path.join(os.tmpdir(), 'pa-agent-bundles-')),
+       registryContext: registryContext(),
+       writeRegistryEvent: noOpRegistryEvent,
+@@ -138,6 +154,7 @@ describe('pa-agent bundle', () => {
+       client: 'tgg',
+       agent: 'christopher',
+       repo,
++      manifestPath: path.join(repo, 'pa-agent.manifest.json'),
+       outputRoot: fs.mkdtempSync(path.join(os.tmpdir(), 'pa-agent-bundles-')),
+       registryContext: registryContext(),
+       writeRegistryEvent: noOpRegistryEvent,
+@@ -158,6 +175,7 @@ describe('pa-agent bundle', () => {
+       client: 'demo',
+       agent: 'agent',
+       repo,
++      manifestPath: path.join(repo, 'pa-agent.manifest.json'),
+       outputRoot: fs.mkdtempSync(path.join(os.tmpdir(), 'pa-agent-bundles-')),
+       registryContext: registryContext(),
+       writeRegistryEvent: noOpRegistryEvent,
+@@ -188,6 +206,7 @@ describe('pa-agent bundle', () => {
+       client: 'tgg',
+       agent: 'christopher',
+       repo,
++      manifestPath: path.join(repo, 'pa-agent.manifest.json'),
+       outputRoot: fs.mkdtempSync(path.join(os.tmpdir(), 'pa-agent-bundles-')),
+       registryContext: registryContext(),
+       writeRegistryEvent: noOpRegistryEvent,
+diff --git a/src/lib/pa-agent/bundle.ts b/src/lib/pa-agent/bundle.ts
+index 327ca992d..fc43b6967 100644
+--- a/src/lib/pa-agent/bundle.ts
++++ b/src/lib/pa-agent/bundle.ts
+@@ -16,7 +16,7 @@ export interface BuildBundleOptions {
+   client: string;
+   agent: string;
+   repo: string;
+-  manifestPath?: string;
++  manifestPath: string;
+   allowDirty?: boolean;
+   outputRoot?: string;
+   dryRun?: boolean;
+diff --git a/src/lib/pa-agent/manifest-schema.md b/src/lib/pa-agent/manifest-schema.md
+index e23f7ccc3..b5cdc3788 100644
+--- a/src/lib/pa-agent/manifest-schema.md
++++ b/src/lib/pa-agent/manifest-schema.md
+@@ -5,7 +5,7 @@ The local source repo is authoritative. `pcl pa-agent bundle` emits an immutable
+ - `manifest.json` — validated deploy manifest
+ - `files/` — source files copied by relative path
+ 
+-Optional source file: `pa-agent.manifest.json` in the repo, or `--manifest <path>`.
++Required source file: pass the client-specific manifest explicitly with `--manifest <path>`. There is no repo-root default.
+ 
+ ## Source Manifest
+ 
+diff --git a/src/lib/pa-agent/manifest.ts b/src/lib/pa-agent/manifest.ts
+index 4d4697169..31124c7ed 100644
+--- a/src/lib/pa-agent/manifest.ts
++++ b/src/lib/pa-agent/manifest.ts
+@@ -118,19 +118,15 @@ export function readSourceManifest(filePath: string): PaAgentSourceManifest {
+   return paAgentSourceManifestSchema.parse(JSON.parse(fs.readFileSync(filePath, 'utf8')));
+ }
+ 
+-export function findSourceManifest(repoPath: string, explicitPath?: string): { path: string | null; manifest: PaAgentSourceManifest } {
+-  const candidate = explicitPath ? path.resolve(explicitPath) : path.join(repoPath, 'pa-agent.manifest.json');
++export function findSourceManifest(repoPath: string, explicitPath: string): { path: string; manifest: PaAgentSourceManifest } {
++  if (!explicitPath) {
++    throw new Error('PA_AGENT_MANIFEST_REQUIRED: --manifest must name the client-specific source manifest');
++  }
++  const candidate = path.isAbsolute(explicitPath)
++    ? path.resolve(explicitPath)
++    : path.resolve(repoPath, explicitPath);
+   if (!fs.existsSync(candidate)) {
+-    return {
+-      path: null,
+-      manifest: {
+-        requiredEnv: [],
+-        services: [],
+-        verifyHooks: [],
+-        runtimeOnlyDriftExclusions: defaultRuntimeOnlyExclusions(),
+-        retainDeploys: 5,
+-      },
+-    };
++    throw new Error(`PA_AGENT_MANIFEST_NOT_FOUND: explicit source manifest not found at ${candidate}`);
+   }
+   const manifest = readSourceManifest(candidate);
+   return {

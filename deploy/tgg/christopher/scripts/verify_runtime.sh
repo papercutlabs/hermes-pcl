@@ -8,6 +8,53 @@ TEST_HOME="${TEST_HOME:-/home/pclaw/.hermes-christopher-tgg-test}"
 DEPLOY_ROOT="$APP_ROOT/deploy/tgg/christopher"
 RUNTIME_ROOT="$HERMES_HOME/runtime"
 
+if [[ "$MODE" == "--verify-status-contract" ]]; then
+  if [[ "$#" -ne 4 ]]; then
+    echo "usage: $0 --verify-status-contract <config> <processing-gate> <consumer-status>" >&2
+    exit 2
+  fi
+  exec "${VERIFY_PYTHON:-$APP_ROOT/.venv/bin/python}" - "$2" "$3" "$4" <<'PY'
+import json
+import pathlib
+import sys
+
+import yaml
+
+config = yaml.safe_load(pathlib.Path(sys.argv[1]).read_text())
+gate = json.loads(pathlib.Path(sys.argv[2]).read_text())
+status = json.loads(pathlib.Path(sys.argv[3]).read_text())
+
+config_enabled = config["pa"]["enabled"]
+gate_enabled = gate["enabled"]
+assert isinstance(config_enabled, bool), config_enabled
+assert isinstance(gate_enabled, bool), gate_enabled
+assert gate_enabled is config_enabled, (gate_enabled, config_enabled)
+
+state = status.get("state")
+assert state != "held", "fatal consumer state: held"
+
+for key in ("processing_enabled", "config_enabled", "gate_enabled"):
+    assert isinstance(status.get(key), bool), (key, status.get(key))
+    assert status[key] is config_enabled, (key, status[key], config_enabled)
+
+retention_held = status.get("retention_held")
+retention_hold = status.get("retention_hold")
+assert isinstance(retention_held, int) and not isinstance(retention_held, bool), retention_held
+assert retention_held >= 0, retention_held
+has_retention_hold = isinstance(retention_hold, str) and bool(retention_hold.strip())
+if not config_enabled:
+    assert state == "standby", (state, "standby")
+    assert retention_held == 0, retention_held
+    assert not has_retention_hold, retention_hold
+elif retention_held > 0 or has_retention_hold:
+    assert retention_held > 0, retention_held
+    assert has_retention_hold, retention_hold
+    assert state == "held-pending", (state, "held-pending")
+else:
+    assert state == "running", (state, "running")
+PY
+fi
+
 if [[ "$MODE" == "--check-mode" ]]; then
   raw="$(pcl service locate --system christopher --domain pa)"
   target="$(python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["data"]["system"]["liveFacts"]["host"]["sshTargetAlias"])' <<<"$raw")"
@@ -21,6 +68,7 @@ fi
 hostname
 systemctl is-active --quiet christopher-tgg-hermes.service
 systemctl is-active --quiet christopher-tgg-hermes-health.timer
+systemctl is-active --quiet systems-papercut-labs.service
 test -x "$APP_ROOT/.venv/bin/python"
 test -s "$HERMES_HOME/.env"
 test -s "$HERMES_HOME/config.yaml"
@@ -48,6 +96,16 @@ fi
 grep -q '/var/lib/tgg-capture/whatsapp/capture/events.jsonl' \
   "$DEPLOY_ROOT/systemd/christopher-tgg-hermes.service"
 
+if python3 - "$RUNTIME_ROOT/capture-consumer-status.json" <<'PY'
+import json, pathlib, sys
+status = json.loads(pathlib.Path(sys.argv[1]).read_text())
+raise SystemExit(0 if status.get("state") == "held" else 1)
+PY
+then
+  echo "fatal consumer state: held" >&2
+  exit 34
+fi
+
 main_pid="$(systemctl show -p MainPID --value christopher-tgg-hermes.service)"
 if [[ ! "$main_pid" =~ ^[1-9][0-9]*$ ]]; then
   echo "Christopher consumer has no live MainPID" >&2
@@ -73,6 +131,11 @@ status = json.loads(pathlib.Path(sys.argv[1]).read_text())
 assert status.get("pid") == int(sys.argv[2]), (status.get("pid"), int(sys.argv[2]))
 assert status.get("scheduler_mode") == "per-chat-parallel"
 PY
+APP_ROOT="$APP_ROOT" VERIFY_PYTHON="$APP_ROOT/.venv/bin/python" \
+  "$0" --verify-status-contract \
+  "$HERMES_HOME/config.yaml" \
+  "$RUNTIME_ROOT/processing-gate.json" \
+  "$RUNTIME_ROOT/capture-consumer-status.json"
 if python3 - "$RUNTIME_ROOT/capture-consumer-status.json" <<'PY'
 import json, pathlib, sys
 raise SystemExit(0 if not json.loads(pathlib.Path(sys.argv[1]).read_text()).get("processing_enabled") else 1)
@@ -158,10 +221,6 @@ if not config_enabled:
     assert int(cursor["offset"]) == int(cursor["initial_offset"])
 
 status = json.loads((runtime / "capture-consumer-status.json").read_text())
-assert status["state"] == ("running" if config_enabled else "standby")
-assert status["processing_enabled"] is config_enabled
-assert status["config_enabled"] is config_enabled
-assert status["gate_enabled"] is config_enabled
 assert status["gate_generation"] == gate["generation"]
 assert status["scheduler_mode"] == "per-chat-parallel"
 assert status["site_concurrency"] == 4
@@ -269,7 +328,10 @@ print(json.dumps({
     "production_inbox_rows": inbox_rows,
     "cursor_unchanged_while_disabled": (not config_enabled),
     "scheduler_mode": status["scheduler_mode"],
+    "state": status["state"],
     "state_total": status["state_total"],
+    "retention_held": status["retention_held"],
+    "retention_hold": status["retention_hold"],
 }, sort_keys=True))
 PY
 

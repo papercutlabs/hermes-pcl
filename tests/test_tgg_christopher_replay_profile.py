@@ -22,6 +22,7 @@ def _args(db_path: Path, **overrides):
         "debounce_seconds": None,
         "rotate_session_every_turns": None,
         "business_base_url": None,
+        "prod_pilot_run_id": None,
         "no_local_operator_backend": False,
         "db": str(db_path),
     }

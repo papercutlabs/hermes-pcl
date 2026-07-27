@@ -8357,10 +8357,24 @@ class GatewayRunner:
                         f"The file is also saved at: {agent_path}]"
                     )
                 else:
+                    if mtype in {
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        "text/csv",
+                        "application/csv",
+                    }:
+                        action = (
+                            "This spreadsheet passed MIME, extension, and content "
+                            "verification. Use tgg_spreadsheet_job_numbers to read "
+                            "its job-number column, then feed those exact numbers to "
+                            "the existing tgg_case_query cross-check. Do not ask the "
+                            "user to convert it."
+                        )
+                    else:
+                        action = "Ask the user what they'd like you to do with it."
                     context_note = (
                         f"[The user sent a document: '{display_name}'. "
                         f"The file is saved at: {agent_path}. "
-                        f"Ask the user what they'd like you to do with it.]"
+                        f"{action}]"
                     )
                 message_text = f"{context_note}\n\n{message_text}"
 

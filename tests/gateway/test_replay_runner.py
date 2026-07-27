@@ -671,13 +671,25 @@ def test_replay_corpus_loads_bridge_message_log_with_explicit_determinism_report
     corpus = ReplayCorpus.from_bridge_message_log(
         db_path,
         chat_id="120363111@g.us",
-        since_sgt="2026-05-24 00:00:00 SGT",
+        since="2026-05-24 00:00:00 SGT",
+        tenant="tgg",
+        agent_id="christopher",
+        job_type="tgg_ops_ingest",
         skip_messages=1,
     )
 
     assert [message["messageId"] for message in corpus.messages] == ["m1", "m2", "m3"]
     assert corpus.messages[1]["quotedText"] == "Job sheet SK/JOB/2605/1954"
     assert corpus.messages[2]["mediaUrls"] == [str(missing_media)]
+    assert corpus.messages[0]["_pa_source_ref"] == "chat::m1"
+    assert corpus.messages[0]["_pa_local_time"]
+    assert corpus.messages[0]["_tgg_source_ref"] == "chat::m1"
+    assert corpus.messages[0]["_tgg_sgt"] == corpus.messages[0]["_pa_local_time"]
+    assert corpus.messages[0]["_hermes_pa_context"] == {
+        "tenant": "tgg",
+        "agent_id": "christopher",
+        "job_type": "tgg_ops_ingest",
+    }
     assert corpus.report["messages_skipped"] == [
         {"reason": "offset", "count": 1},
         {"reason": "bare_reaction", "source_ref": "chat::reaction", "message_kind": "reaction"},
@@ -733,7 +745,10 @@ def test_replay_corpus_dedup_reports_skipped_duplicates(tmp_path):
     corpus = ReplayCorpus.from_bridge_message_log(
         db_path,
         chat_id="120363111@g.us",
-        since_sgt="2026-05-24 00:00:00 SGT",
+        since="2026-05-24 00:00:00 SGT",
+        tenant="finexis",
+        agent_id="mtu",
+        job_type="advisor_ingest",
     )
 
     assert [message["messageId"] for message in corpus.messages] == ["same-id", "m2"]
@@ -755,7 +770,10 @@ async def test_replay_corpus_fixture_matches_current_harness_turn_boundaries(tmp
     corpus = ReplayCorpus.from_bridge_message_log(
         db_path,
         chat_id="120363111@g.us",
-        since_sgt="2026-05-24 00:00:00 SGT",
+        since="2026-05-24 00:00:00 SGT",
+        tenant="tgg",
+        agent_id="christopher",
+        job_type="tgg_ops_ingest",
     )
     plan = ReplayPlan(
         platform="whatsapp",
@@ -830,6 +848,11 @@ def test_replay_plan_loads_bridge_message_log_corpus_spec(tmp_path):
             "source": "bridge_message_log",
             "db_path": str(db_path),
             "chat_id": "120363111@g.us",
+            "tenant": "tgg",
+            "agent_id": "christopher",
+            "job_type": "tgg_ops_ingest",
+            # Legacy plan fixtures remain readable; the CLI surface is now
+            # the generic --since/--until pair.
             "since_sgt": "2026-05-24 00:00:00 SGT",
         },
     })

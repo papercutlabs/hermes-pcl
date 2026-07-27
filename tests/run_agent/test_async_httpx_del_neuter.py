@@ -179,10 +179,11 @@ class TestClientCacheBoundedGrowth:
         from agent.auxiliary_client import (
             _client_cache,
             _client_cache_lock,
+            _client_cache_key,
             _get_cached_client,
         )
 
-        key = ("test_replace", True, "", "", "", (), False, "")
+        key = _client_cache_key("test_replace", async_mode=True)
 
         # Simulate a stale entry from a closed loop
         old_loop = asyncio.new_event_loop()

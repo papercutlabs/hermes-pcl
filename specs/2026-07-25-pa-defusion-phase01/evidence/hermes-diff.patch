@@ -1,0 +1,1189 @@
+diff --git a/deploy/tgg/christopher/pa-agent.hermes.manifest.json b/deploy/tgg/christopher/pa-agent.hermes.manifest.json
+index ee736c88d9..15e058b773 100644
+--- a/deploy/tgg/christopher/pa-agent.hermes.manifest.json
++++ b/deploy/tgg/christopher/pa-agent.hermes.manifest.json
+@@ -171,6 +171,7 @@
+     "deploy/tgg/christopher/client-agent-deployment.yaml",
+     "deploy/tgg/christopher/config.yaml",
+     "deploy/tgg/christopher/pa-agent.hermes.manifest.json",
++    "deploy/tgg/christopher/pa-agent.manifest.json",
+     "deploy/tgg/christopher/patches/mgmt-business-operations.snippet.yaml",
+     "deploy/tgg/christopher/patches/mgmt-chat-behavior.snippet.yaml",
+     "deploy/tgg/christopher/patches/ops-ingest-judgment.snippet.yaml",
+diff --git a/pa-agent.manifest.json b/deploy/tgg/christopher/pa-agent.manifest.json
+similarity index 99%
+rename from pa-agent.manifest.json
+rename to deploy/tgg/christopher/pa-agent.manifest.json
+index daa040436b..b928d1c026 100644
+--- a/pa-agent.manifest.json
++++ b/deploy/tgg/christopher/pa-agent.manifest.json
+@@ -117,7 +117,7 @@
+       "owner": "pclaw:pclaw"
+     },
+     {
+-      "sourcePath": "pa-agent.manifest.json",
++      "sourcePath": "deploy/tgg/christopher/pa-agent.manifest.json",
+       "targetPath": "home/pclaw/apps/hermes-pcl/pa-agent.manifest.json",
+       "mode": "644",
+       "owner": "pclaw:pclaw"
+diff --git a/docs/pa-replay-run-lifecycle.md b/docs/pa-replay-run-lifecycle.md
+index 483584b247..4121d378fe 100644
+--- a/docs/pa-replay-run-lifecycle.md
++++ b/docs/pa-replay-run-lifecycle.md
+@@ -35,6 +35,9 @@ export PS_REPLAY_PROVIDER_URL="http://127.0.0.1:5192"
+ export PS_REPLAY_PROVIDER_ADMIN_TOKEN="..."
+ 
+ hermes replay-run start \
++  --tenant tgg \
++  --agent-id christopher \
++  --job-type replay \
+   --provider-url "$PS_REPLAY_PROVIDER_URL" \
+   --provider-admin-token "$PS_REPLAY_PROVIDER_ADMIN_TOKEN" \
+   --source-data-dir /path/to/source-ps-data \
+@@ -45,6 +48,14 @@ hermes replay-run start \
+   --tool-error-budget 0
+ ```
+ 
++For a `bridge_message_log` corpus, `tenant`, `agent_id`, and `job_type` are
++required replay-context fields. They may be supplied by the command line as
++shown above or explicitly in that corpus source block. Existing persisted
++plans that omit them are rejected rather than inferred. Because these fields
++are part of the canonical source manifest, a plan created before this contract
++change has a different digest; finish or abandon an in-flight run with its
++original code version rather than mixing versions.
++
+ The command writes:
+ 
+ - `run-manifest.json` — state machine, target descriptor/baseline digests, attempt digests, gate result.
+@@ -72,6 +83,7 @@ Re-run the gate:
+ 
+ ```bash
+ hermes replay-run verify \
++  --tenant tgg \
+   --manifest /path/to/replay-runs/<run-id>/run-manifest.json \
+   --session-db ~/.hermes/state.db \
+   --tool-error-budget 0
+@@ -84,18 +96,23 @@ A failed verify marks the target dirty locally and through the provider dirty en
+ Promotion must be called through the orchestrator manifest. Do not call the provider promote endpoint directly.
+ 
+ For this phase, use only non-prod target directories. Real TGG production promote is held for the gated validation phase.
++The confirmation token is tenant-derived:
++`ORCHESTRATOR_<NORMALIZED_TENANT>_TARGET` (for example,
++`ORCHESTRATOR_TGG_TARGET`).
+ 
+ ```bash
+ hermes replay-run promote \
++  --tenant tgg \
+   --manifest /path/to/replay-runs/<run-id>/run-manifest.json \
+   --prod-data-dir /path/to/non-prod-prod-dir \
+-  --confirm ORCHESTRATOR_PROMOTE
++  --confirm ORCHESTRATOR_TGG_TARGET
+ ```
+ 
+ Rollback uses the provider promotion manifest recorded in `run-manifest.json`:
+ 
+ ```bash
+ hermes replay-run rollback \
++  --tenant tgg \
+   --manifest /path/to/replay-runs/<run-id>/run-manifest.json
+ ```
+ 
+@@ -103,6 +120,7 @@ If the provider manifest path must be supplied manually:
+ 
+ ```bash
+ hermes replay-run rollback \
++  --tenant tgg \
+   --manifest /path/to/replay-runs/<run-id>/run-manifest.json \
+   --promotion-manifest-path /path/to/provider/promotions/<promotion>.json
+ ```
+diff --git a/gateway/pa_observability.py b/gateway/pa_observability.py
+index 65fcefa1cb..5ceee011e4 100644
+--- a/gateway/pa_observability.py
++++ b/gateway/pa_observability.py
+@@ -9,7 +9,7 @@ record of what the deployed PA agent did:
+ 
+ It is universal (agent_id keys the rows), NOT TGG-specific.  A tool-call record
+ carries only universal fields (name / input / result / cost / timing) plus an
+-optional STRING ``client_entity_pointer`` (e.g. a case jobNo) — it NEVER imports
++optional STRING ``client_entity_pointer`` (a client-defined entity reference) — it NEVER imports
+ client schema.
+ 
+ SHARED SHAPE CONTRACT
+@@ -79,7 +79,7 @@ class PaToolCall:
+     result: Optional[Any] = None
+     cost_usd: Optional[float] = None
+     duration_ms: Optional[int] = None
+-    # Optional STRING pointer at a client entity (e.g. a case jobNo).  A
++    # Optional STRING pointer at a client-defined entity reference.  A
+     # pointer, NOT the client entity itself.  None for tools that touch no
+     # client entity.
+     client_entity_pointer: Optional[str] = None
+diff --git a/gateway/replay.py b/gateway/replay.py
+index 756b499fa6..49816973da 100644
+--- a/gateway/replay.py
++++ b/gateway/replay.py
+@@ -131,7 +131,7 @@ def _is_bare_reaction_row(*, message_kind: str = "", text: str = "", has_media:
+ 
+ 
+ def _source_ref_from_bridge_message(message: Mapping[str, Any]) -> str:
+-    for key in ("_tgg_source_ref", "source_ref", "sourceRef", "messageId", "message_id", "id"):
++    for key in ("_pa_source_ref", "_tgg_source_ref", "source_ref", "sourceRef", "messageId", "message_id", "id"):
+         value = message.get(key)
+         if value is not None and str(value):
+             return str(value)
+@@ -139,7 +139,7 @@ def _source_ref_from_bridge_message(message: Mapping[str, Any]) -> str:
+ 
+ 
+ def _dedup_key_for_message(message: Mapping[str, Any]) -> str:
+-    for key in ("messageId", "message_id", "id", "_tgg_source_ref", "source_ref", "sourceRef"):
++    for key in ("messageId", "message_id", "id", "_pa_source_ref", "_tgg_source_ref", "source_ref", "sourceRef"):
+         value = message.get(key)
+         if value is not None and str(value):
+             return str(value)
+@@ -211,8 +211,11 @@ class ReplayCorpus:
+             return cls.from_bridge_message_log(
+                 db_path,
+                 chat_id=source.get("chat_id") or source.get("chatId"),
+-                since_sgt=source.get("since_sgt") or source.get("sinceSgt"),
+-                until_sgt=source.get("until_sgt") or source.get("untilSgt"),
++                since=source.get("since") or source.get("since_sgt") or source.get("sinceSgt"),
++                until=source.get("until") or source.get("until_sgt") or source.get("untilSgt"),
++                tenant=source.get("tenant"),
++                agent_id=source.get("agent_id") or source.get("agentId") or source.get("agent"),
++                job_type=source.get("job_type") or source.get("jobType"),
+                 limit=source.get("limit") or source.get("limit_messages") or source.get("limitMessages"),
+                 skip_messages=source.get("skip_messages") or source.get("skipMessages") or 0,
+                 media_root=source.get("media_root") or source.get("mediaRoot"),
+@@ -256,24 +259,33 @@ class ReplayCorpus:
+         db_path: str | Path,
+         *,
+         chat_id: Any,
+-        since_sgt: Any,
+-        until_sgt: Any = None,
++        since: Any,
++        tenant: Any,
++        agent_id: Any,
++        job_type: Any,
++        until: Any = None,
+         limit: Any = None,
+         skip_messages: Any = 0,
+         media_root: str | Path | None = None,
+     ) -> "ReplayCorpus":
+         if not chat_id:
+             raise ValueError("bridge_message_log corpus requires chat_id")
+-        if not since_sgt:
+-            raise ValueError("bridge_message_log corpus requires since_sgt")
++        if not since:
++            raise ValueError("bridge_message_log corpus requires since")
++        if not tenant:
++            raise ValueError("bridge_message_log corpus requires tenant")
++        if not agent_id:
++            raise ValueError("bridge_message_log corpus requires agent_id")
++        if not job_type:
++            raise ValueError("bridge_message_log corpus requires job_type")
+         path = Path(db_path).expanduser()
+         skip_count = int(skip_messages or 0)
+         limit_count = int(limit) if limit is not None and str(limit) != "" else None
+         rows, skipped_offset = _load_bridge_message_log_rows(
+             path,
+             chat_id=str(chat_id),
+-            since_sgt=str(since_sgt),
+-            until_sgt=str(until_sgt) if until_sgt else None,
++            since_sgt=str(since),
++            until_sgt=str(until) if until else None,
+             limit=limit_count,
+             skip_messages=skip_count,
+         )
+@@ -294,7 +306,16 @@ class ReplayCorpus:
+                     "message_kind": row.get("message_kind"),
+                 })
+                 continue
+-            messages.append(_bridge_message_from_log_row(row, media_root=media_root_path, report=report))
++            messages.append(
++                _bridge_message_from_log_row(
++                    row,
++                    media_root=media_root_path,
++                    report=report,
++                    tenant=str(tenant),
++                    agent_id=str(agent_id),
++                    job_type=str(job_type),
++                )
++            )
+         messages.sort(key=_bridge_sort_key)
+         messages, duplicates = _dedup_bridge_messages(messages)
+         report["duplicates_skipped"] = duplicates
+@@ -302,8 +323,11 @@ class ReplayCorpus:
+             "source_type": "bridge_message_log",
+             "db_path": str(path),
+             "chat_id": str(chat_id),
+-            "since_sgt": str(since_sgt),
+-            "until_sgt": str(until_sgt) if until_sgt else None,
++            "since": str(since),
++            "until": str(until) if until else None,
++            "tenant": str(tenant),
++            "agent_id": str(agent_id),
++            "job_type": str(job_type),
+             "limit_messages": limit_count,
+             "skip_messages": skip_count,
+         }
+@@ -459,7 +483,15 @@ def _media_paths_from_log_refs(refs: list[dict[str, Any]], *, source_ref: str, m
+     return paths
+ 
+ 
+-def _bridge_message_from_log_row(row: Mapping[str, Any], *, media_root: Path | None, report: dict[str, Any]) -> dict[str, Any]:
++def _bridge_message_from_log_row(
++    row: Mapping[str, Any],
++    *,
++    media_root: Path | None,
++    report: dict[str, Any],
++    tenant: str,
++    agent_id: str,
++    job_type: str,
++) -> dict[str, Any]:
+     raw = _raw_json(row.get("raw_json"))
+     source_ref = str(row.get("source_ref") or "")
+     message_id = raw.get("id") or source_ref.rsplit("::", 1)[-1] or source_ref
+@@ -493,13 +525,17 @@ def _bridge_message_from_log_row(row: Mapping[str, Any], *, media_root: Path | N
+         "quotedText": str(row.get("quoted_text") or ""),
+         "quotedMessageId": str(row.get("reply_to_source_ref") or ""),
+         "fromMe": bool(raw.get("fromMe", False)),
++        "_pa_source_ref": source_ref,
++        "_pa_local_time": str(row.get("sgt") or ""),
++        # D1-23 (the live WhatsApp renderer) is intentionally outside this
++        # phase. Dual-write its legacy replay keys until that consumer moves.
+         "_tgg_source_ref": source_ref,
+         "_tgg_sgt": str(row.get("sgt") or ""),
+-        "_hermes_pa_job_type": "tgg_ops_ingest",
++        "_hermes_pa_job_type": job_type,
+         "_hermes_pa_context": {
+-            "tenant": "tgg",
+-            "agent_id": "christopher",
+-            "job_type": "tgg_ops_ingest",
++            "tenant": tenant,
++            "agent_id": agent_id,
++            "job_type": job_type,
+         },
+     }
+     return bridge
+diff --git a/gateway/replay_orchestrator.py b/gateway/replay_orchestrator.py
+index 4838a9fcde..db91a8eb57 100644
+--- a/gateway/replay_orchestrator.py
++++ b/gateway/replay_orchestrator.py
+@@ -25,7 +25,6 @@ from gateway.replay import ReplayPlan, canonical_digest, canonical_json
+ 
+ 
+ RUN_MANIFEST_VERSION = 1
+-PROVIDER_CONFIRM_PROMOTE = "SWAP_TGG_TARGET"
+ NON_DELIVERING_REPLAY_DELIVERY_MODES = {"capture", "drop"}
+ 
+ 
+@@ -72,6 +71,15 @@ def _safe_id_part(value: str) -> str:
+     return "".join(ch if ch.isalnum() or ch in "_.:-" else "-" for ch in value)
+ 
+ 
++def tenant_confirmation_token(prefix: str, tenant: str) -> str:
++    normalized = "".join(
++        ch if ch.isalnum() else "_" for ch in str(tenant).strip().upper()
++    ).strip("_")
++    if not normalized:
++        raise ValueError("tenant is required")
++    return f"{prefix}_{normalized}_TARGET"
++
++
+ def mint_replay_run_id(prefix: str = "pa-replay") -> str:
+     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+     return f"{prefix}-{stamp}-{uuid.uuid4().hex[:8]}"
+@@ -210,7 +218,7 @@ class CheckResult:
+ class ReplayTargetProviderConfig:
+     provider_url: str
+     admin_token: str
+-    tenant: str = "tgg"
++    tenant: str
+     timeout_seconds: float = 30.0
+ 
+ 
+@@ -222,6 +230,8 @@ class ReplayTargetProviderClient:
+             raise ValueError("provider_url is required")
+         if not config.admin_token:
+             raise ValueError("provider admin token is required")
++        if not config.tenant:
++            raise ValueError("tenant is required")
+         self.config = config
+ 
+     def _url(self, path: str, *, query: Mapping[str, Any] | None = None) -> str:
+@@ -343,7 +353,9 @@ class ReplayTargetProviderClient:
+                     "runId": run_id,
+                     "targetDataDir": target_data_dir,
+                     "prodDataDir": prod_data_dir,
+-                    "confirm": PROVIDER_CONFIRM_PROMOTE,
++                    "confirm": tenant_confirmation_token(
++                        "SWAP", self.config.tenant
++                    ),
+                 },
+             )
+         )
+@@ -1169,7 +1181,7 @@ def provider_config_from_env(
+     *,
+     provider_url: str | None = None,
+     admin_token: str | None = None,
+-    tenant: str = "tgg",
++    tenant: str,
+     timeout_seconds: float = 30.0,
+ ) -> ReplayTargetProviderConfig:
+     return ReplayTargetProviderConfig(
+@@ -1180,6 +1192,6 @@ def provider_config_from_env(
+         admin_token=admin_token
+         or os.environ.get("PS_REPLAY_PROVIDER_ADMIN_TOKEN")
+         or "",
+-        tenant=tenant,
++        tenant=str(tenant or "").strip(),
+         timeout_seconds=timeout_seconds,
+     )
+diff --git a/hermes_cli/replay.py b/hermes_cli/replay.py
+index f699e6bc3b..455a47db87 100644
+--- a/hermes_cli/replay.py
++++ b/hermes_cli/replay.py
+@@ -63,11 +63,14 @@ def add_replay_parser(subparsers) -> argparse.ArgumentParser:
+         help="Honor live gateway authorization checks during replay (default bypasses them).",
+     )
+     parser.add_argument("--chat-id", help="bridge_message_log chat_jid to replay.")
++    parser.add_argument("--tenant", help="PA tenant for replay context.")
++    parser.add_argument("--agent-id", help="PA agent id for replay context.")
++    parser.add_argument("--job-type", help="PA job type for replay context.")
+     parser.add_argument(
+-        "--since-sgt", help="Inclusive bridge_message_log sgt lower bound."
++        "--since", help="Inclusive bridge_message_log time lower bound."
+     )
+     parser.add_argument(
+-        "--until-sgt", help="Exclusive bridge_message_log sgt upper bound."
++        "--until", help="Exclusive bridge_message_log time upper bound."
+     )
+     parser.add_argument(
+         "--limit-messages",
+@@ -102,13 +105,22 @@ def _load_plan(args) -> ReplayPlan:
+     if getattr(args, "bridge_message_log", None):
+         if not getattr(args, "chat_id", None):
+             raise SystemExit("--bridge-message-log requires --chat-id")
+-        if not getattr(args, "since_sgt", None):
+-            raise SystemExit("--bridge-message-log requires --since-sgt")
++        for flag, attribute in (
++            ("--since", "since"),
++            ("--tenant", "tenant"),
++            ("--agent-id", "agent_id"),
++            ("--job-type", "job_type"),
++        ):
++            if not getattr(args, attribute, None):
++                raise SystemExit(f"--bridge-message-log requires {flag}")
+         corpus = ReplayCorpus.from_bridge_message_log(
+             Path(args.bridge_message_log),
+             chat_id=args.chat_id,
+-            since_sgt=args.since_sgt,
+-            until_sgt=getattr(args, "until_sgt", None),
++            since=args.since,
++            until=getattr(args, "until", None),
++            tenant=args.tenant,
++            agent_id=args.agent_id,
++            job_type=args.job_type,
+             limit=getattr(args, "limit_messages", None),
+             skip_messages=getattr(args, "skip_messages", 0),
+             media_root=getattr(args, "media_root", None),
+@@ -179,11 +191,13 @@ def _add_plan_source_args(
+         help="Honor live gateway authorization checks during replay (default bypasses them).",
+     )
+     parser.add_argument("--chat-id", help="bridge_message_log chat_jid to replay.")
++    parser.add_argument("--agent-id", help="PA agent id for replay context.")
++    parser.add_argument("--job-type", help="PA job type for replay context.")
+     parser.add_argument(
+-        "--since-sgt", help="Inclusive bridge_message_log sgt lower bound."
++        "--since", help="Inclusive bridge_message_log time lower bound."
+     )
+     parser.add_argument(
+-        "--until-sgt", help="Exclusive bridge_message_log sgt upper bound."
++        "--until", help="Exclusive bridge_message_log time upper bound."
+     )
+     parser.add_argument(
+         "--limit-messages",
+@@ -212,7 +226,7 @@ def _add_provider_args(parser: argparse.ArgumentParser) -> None:
+         help="Provider admin bearer token (or PS_REPLAY_PROVIDER_ADMIN_TOKEN).",
+     )
+     parser.add_argument(
+-        "--tenant", default="tgg", help="Provider tenant query value (default: tgg)."
++        "--tenant", required=True, help="Provider tenant query value."
+     )
+     parser.add_argument(
+         "--provider-timeout",
+@@ -231,7 +245,7 @@ def _provider_client_from_args(args):
+     config = provider_config_from_env(
+         provider_url=getattr(args, "provider_url", None),
+         admin_token=getattr(args, "provider_admin_token", None),
+-        tenant=getattr(args, "tenant", "tgg"),
++        tenant=getattr(args, "tenant", None),
+         timeout_seconds=getattr(args, "provider_timeout", 30.0),
+     )
+     if not config.provider_url:
+@@ -347,8 +361,7 @@ def add_replay_run_parser(subparsers) -> argparse.ArgumentParser:
+     promote.add_argument(
+         "--confirm",
+         required=True,
+-        choices=("ORCHESTRATOR_PROMOTE",),
+-        help="Explicit orchestrator promote confirmation. Provider still requires its own SWAP_TGG_TARGET body.",
++        help="Tenant-derived confirmation: ORCHESTRATOR_<TENANT>_TARGET.",
+     )
+ 
+     rollback = commands.add_parser(
+@@ -452,6 +465,13 @@ def cmd_replay_run(args) -> None:
+         print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
+         return
+     if command == "promote":
++        from gateway.replay_orchestrator import tenant_confirmation_token
++
++        expected_confirm = tenant_confirmation_token("ORCHESTRATOR", args.tenant)
++        if args.confirm != expected_confirm:
++            raise SystemExit(
++                f"--confirm must be {expected_confirm!r} for tenant {args.tenant!r}"
++            )
+         print(
+             json.dumps(
+                 orch.promote(prod_data_dir=args.prod_data_dir),
+diff --git a/plane-lint-baseline.json b/plane-lint-baseline.json
+index 050ff0a67e..80fc2831fb 100644
+--- a/plane-lint-baseline.json
++++ b/plane-lint-baseline.json
+@@ -1,134 +1,8 @@
+ {
+   "tool": "plane_lint.py",
+-  "generated": "2026-07-24T05:14:37+00:00",
+-  "count": 68,
++  "generated": "2026-07-24T22:40:44+00:00",
++  "count": 23,
+   "entries": {
+-    "deploy/finexis/mtu/OPS-NOTE.md::client-token::mtu:bor_": {
+-      "note": "content x4, first at line 10"
+-    },
+-    "deploy/finexis/mtu/OPS-NOTE.md::client-token::mtu:finexis": {
+-      "note": "path; content x3, first at line 14"
+-    },
+-    "deploy/finexis/mtu/OPS-NOTE.md::client-token::mtu:mtu": {
+-      "note": "path; content x23, first at line 1"
+-    },
+-    "deploy/finexis/mtu/OPS-NOTE.md::client-token::tgg:christopher": {
+-      "note": "content x2, first at line 11"
+-    },
+-    "deploy/finexis/mtu/README.md::client-token::mtu:bor_": {
+-      "note": "content x2, first at line 5"
+-    },
+-    "deploy/finexis/mtu/README.md::client-token::mtu:finexis": {
+-      "note": "path; content x5, first at line 1"
+-    },
+-    "deploy/finexis/mtu/README.md::client-token::mtu:mtu": {
+-      "note": "path; content x14, first at line 1"
+-    },
+-    "deploy/finexis/mtu/README.md::client-token::tgg:christopher": {
+-      "note": "content x1, first at line 3"
+-    },
+-    "deploy/finexis/mtu/README.md::client-token::tgg:tgg": {
+-      "note": "content x1, first at line 3"
+-    },
+-    "deploy/finexis/mtu/SOUL.md::client-token::mtu:bor_": {
+-      "note": "content x1, first at line 5"
+-    },
+-    "deploy/finexis/mtu/SOUL.md::client-token::mtu:finexis": {
+-      "note": "path; content x2, first at line 3"
+-    },
+-    "deploy/finexis/mtu/SOUL.md::client-token::mtu:mtu": {
+-      "note": "path; content x8, first at line 1"
+-    },
+-    "deploy/finexis/mtu/config.yaml::client-token::mtu:bor_": {
+-      "note": "content x1, first at line 25"
+-    },
+-    "deploy/finexis/mtu/config.yaml::client-token::mtu:finexis": {
+-      "note": "path"
+-    },
+-    "deploy/finexis/mtu/config.yaml::client-token::mtu:mtu": {
+-      "note": "path; content x5, first at line 1"
+-    },
+-    "deploy/finexis/mtu/config.yaml::client-token::tgg:christopher": {
+-      "note": "content x2, first at line 6"
+-    },
+-    "deploy/finexis/mtu/knowledge/bor-draft-template.md::client-token::mtu:finexis": {
+-      "note": "path"
+-    },
+-    "deploy/finexis/mtu/knowledge/bor-draft-template.md::client-token::mtu:mtu": {
+-      "note": "path; content x1, first at line 1"
+-    },
+-    "deploy/finexis/mtu/knowledge/bor-required-checks.yaml::client-token::mtu:finexis": {
+-      "note": "path; content x1, first at line 4"
+-    },
+-    "deploy/finexis/mtu/knowledge/bor-required-checks.yaml::client-token::mtu:mtu": {
+-      "note": "path; content x2, first at line 1"
+-    },
+-    "deploy/finexis/mtu/knowledge/replacement-path-taxonomy.md::client-token::mtu:finexis": {
+-      "note": "path"
+-    },
+-    "deploy/finexis/mtu/knowledge/replacement-path-taxonomy.md::client-token::mtu:mtu": {
+-      "note": "path; content x1, first at line 1"
+-    },
+-    "deploy/finexis/mtu/knowledge/standard-disclosures.md::client-token::mtu:finexis": {
+-      "note": "path"
+-    },
+-    "deploy/finexis/mtu/knowledge/standard-disclosures.md::client-token::mtu:mtu": {
+-      "note": "path; content x1, first at line 1"
+-    },
+-    "deploy/finexis/mtu/mtu_constitution.yaml::client-token::mtu:bor_": {
+-      "note": "content x3, first at line 4"
+-    },
+-    "deploy/finexis/mtu/mtu_constitution.yaml::client-token::mtu:finexis": {
+-      "note": "path; content x3, first at line 20"
+-    },
+-    "deploy/finexis/mtu/mtu_constitution.yaml::client-token::mtu:mtu": {
+-      "note": "path; content x8, first at line 1"
+-    },
+-    "deploy/finexis/mtu/mtu_constitution.yaml::client-token::tgg:christopher": {
+-      "note": "content x2, first at line 3"
+-    },
+-    "deploy/finexis/mtu/mtu_constitution.yaml::client-token::tgg:tgg": {
+-      "note": "content x1, first at line 3"
+-    },
+-    "deploy/finexis/mtu/scripts/bootstrap_local.sh::client-token::mtu:finexis": {
+-      "note": "path"
+-    },
+-    "deploy/finexis/mtu/scripts/bootstrap_local.sh::client-token::mtu:mtu": {
+-      "note": "path; content x10, first at line 2"
+-    },
+-    "deploy/finexis/mtu/test-transcripts/2026-07-13-synthetic-e2e.md::client-token::mtu:bor_": {
+-      "note": "content x8, first at line 3"
+-    },
+-    "deploy/finexis/mtu/test-transcripts/2026-07-13-synthetic-e2e.md::client-token::mtu:finexis": {
+-      "note": "path; content x1, first at line 5"
+-    },
+-    "deploy/finexis/mtu/test-transcripts/2026-07-13-synthetic-e2e.md::client-token::mtu:mtu": {
+-      "note": "path; content x20, first at line 1"
+-    },
+-    "deploy/finexis/mtu/test-transcripts/2026-07-14-affordability-boolean-regression.md::client-token::mtu:finexis": {
+-      "note": "path"
+-    },
+-    "deploy/finexis/mtu/test-transcripts/2026-07-14-affordability-boolean-regression.md::client-token::mtu:mtu": {
+-      "note": "path; content x1, first at line 1"
+-    },
+-    "deploy/finexis/mtu/test-transcripts/2026-07-14-concision-regression.md::client-token::mtu:finexis": {
+-      "note": "path"
+-    },
+-    "deploy/finexis/mtu/test-transcripts/2026-07-14-concision-regression.md::client-token::mtu:mtu": {
+-      "note": "path; content x1, first at line 1"
+-    },
+-    "deploy/finexis/mtu/test-transcripts/2026-07-14-draft-first-placeholders.md::client-token::mtu:finexis": {
+-      "note": "path"
+-    },
+-    "deploy/finexis/mtu/test-transcripts/2026-07-14-draft-first-placeholders.md::client-token::mtu:mtu": {
+-      "note": "path; content x3, first at line 1"
+-    },
+-    "deploy/finexis/mtu/test-transcripts/2026-07-14-hospital-field-contract-regression.md::client-token::mtu:finexis": {
+-      "note": "path"
+-    },
+-    "deploy/finexis/mtu/test-transcripts/2026-07-14-hospital-field-contract-regression.md::client-token::mtu:mtu": {
+-      "note": "path; content x1, first at line 1"
+-    },
+     "gateway/durable_jsonl_consumer.py::client-token::tgg:christopher": {
+       "note": "content x3, first at line 3483"
+     },
+@@ -147,21 +21,12 @@
+     "gateway/platforms/whatsapp.py::client-token::tgg:tgg": {
+       "note": "content x6, first at line 586"
+     },
+-    "gateway/replay.py::client-token::tgg:christopher": {
+-      "note": "content x1, first at line 501"
+-    },
+     "gateway/replay.py::client-token::tgg:tgg": {
+       "note": "content x7, first at line 134"
+     },
+-    "gateway/replay_orchestrator.py::client-token::tgg:tgg": {
+-      "note": "content x3, first at line 28"
+-    },
+     "gateway/run.py::client-token::tgg:tgg": {
+       "note": "content x2, first at line 8315"
+     },
+-    "hermes_cli/replay.py::client-token::tgg:tgg": {
+-      "note": "content x4, first at line 215"
+-    },
+     "tools/pa_business_tools.py::client-token::tgg:SK/JOB": {
+       "note": "content x9, first at line 542"
+     },
+diff --git a/plane-lint-coverage.md b/plane-lint-coverage.md
+index 47f96c715a..dbb012e8e0 100644
+--- a/plane-lint-coverage.md
++++ b/plane-lint-coverage.md
+@@ -1,8 +1,17 @@
+-# plane-lint coverage vs the agnosticism audit (42 findings + 2 ilinked modules)
++# plane-lint coverage vs the agnosticism audit
+ 
+ **Date:** 2026-07-24 · **WB:** 69614cce (PA de-fusion Phase 0.2, L2 warn-mode)
+ **Audit:** `specs/2026-07-23-tgg-diag-synthesis/agnosticism-audit.md` (worktree edna-675911a8, commit 4ce36d6e) — IDs D1-1..34, D2-1..6, D3-1..2.
+-**Baselines:** hermes-pcl `plane-lint-baseline.json` = 68 entries (68 client-token, 0 import-direction); systems-papercut-labs `plane-lint-baseline.json` = 26 entries (14 client-token, 12 import-direction).
++**Original Phase-0 baselines:** hermes-pcl = 68 entries; systems-papercut-labs
++= 26 entries.
++
++**Phase-1 amendment:** the Hermes scan now includes `scripts/`, repo-root
++manifests, and `tests/`, while `deploy/<client>/` and per-client test
++directories are client-plane. The current Hermes result is 98 findings:
++23 established baseline entries plus 75 newly exposed, unsuppressed findings
++enumerated in `plane-lint-findings.md`. The scorecard below is the historical
++Phase-0 audit mapping; it is not a claim about the amended scanner's current
++counts.
+ 
+ Granularity note: the lint keys violations by **file + check + token/import**, not by audit finding. "Caught" below means the finding's shared-plane site carries at least one baselined lint entry that the finding's fix would remove or that pins the file as contaminated. Several findings share one file (e.g. 8 findings in `tools/pa_business_tools.py`); burning one finding down does not clear the file's entry until all its tokens go.
+ 
+@@ -23,7 +32,9 @@ The plan's honest-coverage table (§4, plan doc) estimated L2 at ~30/42; the shi
+ 
+ - **D1-1..11** — `tools/pa_business_tools.py` (tokens: tgg, SK/JOB, hdb, ilinked, christopher, sprucing), `toolsets.py` (tgg, sprucing), `tools/pa_photo_pair_classifier.py` (sprucing; its `/JOB/` grammar rides the file's sprucing flag).
+ - **D1-13..23** — `gateway/run.py`, `gateway/durable_jsonl_consumer.py`, `gateway/replay.py`, `gateway/platforms/whatsapp.py` (tgg, hdb, christopher), `gateway/replay_orchestrator.py` (tgg). D1-19's hard import of `validate_tgg_spreadsheet` is caught as a **token** violation, not import-direction — `tools/` is itself shared-plane today, so the arrow is shared→shared until Phase 2 moves the validator into `clients/tgg/`; the token entry pins the site regardless.
+-- **D1-24, D1-25** — `hermes_cli/replay.py` (tgg; `SWAP_TGG_TARGET` and the `--tenant` default both carry the token).
++- **D1-24, D1-25** — historically caught in `hermes_cli/replay.py`. Phase 1
++  removed the literal `SWAP_TGG_TARGET` and tenant default; confirmation is
++  now tenant-derived and tenant is explicit.
+ - **D1-28, D1-29, D1-31..34** — systems: `src/lib/types.ts` (hdb, sprucing, ilinked, tgg — the camelCase boundary rule catches `iLinked*`/`Tgg*` identifiers), `src/spine/agent-config.ts` (tgg), `src/App.tsx` (tgg token + 4 `@/tenants/tgg/*` import-direction entries), `src/server/main.ts` (tgg, huidapcl + 4 import entries), `src/server/seed-tgg-master.ts` (path + content + 2 imports).
+ - **D2-3** — `gateway/durable_jsonl_consumer.py`: the tenant-DB capture writer sits in an already-token-flagged shared file (file-granular catch).
+ - **D2-5** — caught on its shared-plane side: `src/server/main.ts :: import-direction :: ../tenants/tgg/media-index.js` is exactly the platform→client dependency inversion the finding names.
+@@ -42,7 +53,11 @@ Every miss is a **by-design L2 boundary**, not matcher weakness — each is assi
+ ## Matcher notes
+ 
+ - Word-ish boundaries treat `_ - / .` as separators AND recognize camelCase transitions — required for `tggView`, `registerTggRoutes`, `iLinkedReconciliation` (real audit sites). Verified no false positives from `mtu`-in-word (`mtual` etc.): zero mtu-registry hits in hermes shared code, matching the audit's finding that drift is entirely TGG-direction.
+-- `deploy/finexis/` is shared-plane per the manifest spec, so its 15 client-content files dominate the hermes baseline (mtu/finexis/bor_ entries, plus cross-client `tgg`/`christopher` tokens inside MTU docs — a real hygiene observation the audit didn't cover). If finexis deploy content is later declared client-plane, those entries drop out of both scan and baseline.
++- `deploy/finexis/` was shared-plane in the original Phase-0 snapshot. The
++  amended manifest now classifies `deploy/<client>/` as client-plane, so those
++  42 prior baseline entries are intentionally outside shared-plane lint. This
++  is a plane-boundary reclassification, not proof that the carried client
++  content is clean.
+ - Hermes has **zero import-direction violations today** because the fused client code physically lives inside shared dirs — there is no `clients/` package to import yet. The import check becomes load-bearing at Phase 2 (tool-pack extraction), when `clients/tgg/` exists and the loader seam gets its one `loaderSeamExceptions` entry.
+ 
+ ## CI
+diff --git a/plane-lint-findings.md b/plane-lint-findings.md
+new file mode 100644
+index 0000000000..bd4ea03f49
+--- /dev/null
++++ b/plane-lint-findings.md
+@@ -0,0 +1,91 @@
++# Plane-lint findings exposed by Phase 0 manifest widening
++
++**Date:** 2026-07-25 · **Status:** findings, not suppressions
++
++The scan surface now includes `scripts/`, `tests/`, and repo-root `*.manifest.json` files. Client deploy trees (`deploy/<client>/`) and per-client fixture trees remain client-plane.
++
++The previous 68-entry baseline was re-based by retaining only the **23** established violations that still fire after correcting the Finexis client-plane classification and applying the in-tree Phase 1 edits. **No newly exposed violation was added to the baseline.**
++
++Widened scan result at generation time: **98 total** · **23 established baseline** · **75 newly exposed findings**.
++
++Warn mode exits 0 while printing every finding. Strict mode is intentionally red until these findings are classified and de-fused; calling strict green here would hide the newly exposed inventory.
++
++## Newly exposed findings
++
++- `scripts/deploy/configure_christopher_outbound.py` — **client-token** `tgg:christopher` (path; content x16, first at line 2)
++- `scripts/deploy/configure_christopher_outbound.py` — **client-token** `tgg:tgg` (content x28, first at line 2)
++- `scripts/pa_fake_business_bridge.py` — **client-token** `tgg:tgg` (content x2, first at line 39)
++- `scripts/plane_lint.py` — **client-token** `mtu:bor_` (content x2, first at line 38)
++- `scripts/plane_lint.py` — **client-token** `mtu:mtu` (content x1, first at line 29)
++- `scripts/plane_lint.py` — **client-token** `tgg:SK/JOB` (content x2, first at line 39)
++- `scripts/plane_lint.py` — **client-token** `tgg:hdb` (content x3, first at line 28)
++- `scripts/plane_lint.py` — **client-token** `tgg:ilinked` (content x2, first at line 28)
++- `scripts/plane_lint.py` — **client-token** `tgg:tgg` (content x8, first at line 26)
++- `scripts/tgg_christopher_hermes_replay.py` — **client-token** `tgg:SK/JOB` (content x1, first at line 574)
++- `scripts/tgg_christopher_hermes_replay.py` — **client-token** `tgg:christopher` (path; content x55, first at line 36)
++- `scripts/tgg_christopher_hermes_replay.py` — **client-token** `tgg:hdb` (content x1, first at line 790)
++- `scripts/tgg_christopher_hermes_replay.py` — **client-token** `tgg:ilinked` (content x1, first at line 790)
++- `scripts/tgg_christopher_hermes_replay.py` — **client-token** `tgg:tgg` (path; content x77, first at line 2)
++- `tests/agent/test_llm_call_audit.py` — **client-token** `tgg:tgg` (content x2, first at line 38)
++- `tests/cron/test_pa_job_brief.py` — **client-token** `tgg:tgg` (content x10, first at line 11)
++- `tests/deploy/test_tgg_ensure_processing_gate.py` — **client-token** `tgg:christopher` (content x1, first at line 11)
++- `tests/deploy/test_tgg_ensure_processing_gate.py` — **client-token** `tgg:tgg` (path; content x2, first at line 11)
++- `tests/deploy/test_tgg_processing_activation.py` — **client-token** `tgg:christopher` (content x10, first at line 18)
++- `tests/deploy/test_tgg_processing_activation.py` — **client-token** `tgg:tgg` (path; content x11, first at line 18)
++- `tests/fixtures/pa/bobby_tgg_constitution.yaml` — **client-token** `tgg:ilinked` (content x4, first at line 70)
++- `tests/fixtures/pa/bobby_tgg_constitution.yaml` — **client-token** `tgg:tgg` (path; content x19, first at line 1)
++- `tests/fixtures/pa/bobby_tgg_dev_config.yaml` — **client-token** `tgg:tgg` (path; content x1, first at line 10)
++- `tests/gateway/test_channel_directory.py` — **client-token** `tgg:sprucing` (content x2, first at line 287)
++- `tests/gateway/test_channel_directory.py` — **client-token** `tgg:tgg` (content x2, first at line 313)
++- `tests/gateway/test_consumer_reply_delivery.py` — **client-token** `tgg:SK/JOB` (content x4, first at line 187)
++- `tests/gateway/test_consumer_reply_delivery.py` — **client-token** `tgg:tgg` (content x12, first at line 39)
++- `tests/gateway/test_durable_jsonl_consumer.py` — **client-token** `tgg:christopher` (content x25, first at line 705)
++- `tests/gateway/test_durable_jsonl_consumer.py` — **client-token** `tgg:tgg` (content x45, first at line 68)
++- `tests/gateway/test_inter_session.py` — **client-token** `tgg:christopher` (content x11, first at line 33)
++- `tests/gateway/test_inter_session.py` — **client-token** `tgg:tgg` (content x11, first at line 37)
++- `tests/gateway/test_pa_job_runtime.py` — **client-token** `tgg:christopher` (content x1, first at line 11)
++- `tests/gateway/test_pa_job_runtime.py` — **client-token** `tgg:tgg` (content x6, first at line 10)
++- `tests/gateway/test_replay_orchestrator.py` — **client-token** `mtu:finexis` (content x9, first at line 227)
++- `tests/gateway/test_replay_orchestrator.py` — **client-token** `mtu:mtu` (content x2, first at line 307)
++- `tests/gateway/test_replay_orchestrator.py` — **client-token** `tgg:SK/JOB` (content x1, first at line 159)
++- `tests/gateway/test_replay_orchestrator.py` — **client-token** `tgg:christopher` (content x1, first at line 149)
++- `tests/gateway/test_replay_orchestrator.py` — **client-token** `tgg:tgg` (content x19, first at line 31)
++- `tests/gateway/test_replay_runner.py` — **client-token** `mtu:finexis` (content x1, first at line 749)
++- `tests/gateway/test_replay_runner.py` — **client-token** `mtu:mtu` (content x1, first at line 750)
++- `tests/gateway/test_replay_runner.py` — **client-token** `tgg:SK/JOB` (content x2, first at line 657)
++- `tests/gateway/test_replay_runner.py` — **client-token** `tgg:christopher` (content x5, first at line 651)
++- `tests/gateway/test_replay_runner.py` — **client-token** `tgg:tgg` (content x21, first at line 332)
++- `tests/gateway/test_telegram_outbound_allowlist.py` — **client-token** `tgg:christopher` (content x2, first at line 134)
++- `tests/gateway/test_whatsapp_formatting.py` — **client-token** `tgg:SK/JOB` (content x2, first at line 382)
++- `tests/gateway/test_whatsapp_replay_turn_policy.py` — **client-token** `tgg:SK/JOB` (content x4, first at line 269)
++- `tests/gateway/test_whatsapp_replay_turn_policy.py` — **client-token** `tgg:tgg` (content x1, first at line 250)
++- `tests/test_gateway_pa_context.py` — **client-token** `tgg:tgg` (content x17, first at line 18)
++- `tests/test_pa_business_facts.py` — **client-token** `tgg:SK/JOB` (content x28, first at line 360)
++- `tests/test_pa_business_facts.py` — **client-token** `tgg:christopher` (content x5, first at line 23)
++- `tests/test_pa_business_facts.py` — **client-token** `tgg:hdb` (content x4, first at line 368)
++- `tests/test_pa_business_facts.py` — **client-token** `tgg:ilinked` (content x34, first at line 18)
++- `tests/test_pa_business_facts.py` — **client-token** `tgg:sprucing` (content x3, first at line 473)
++- `tests/test_pa_business_facts.py` — **client-token** `tgg:tgg` (content x138, first at line 22)
++- `tests/test_pa_business_operation_scope.py` — **client-token** `tgg:SK/JOB` (content x3, first at line 246)
++- `tests/test_pa_business_operation_scope.py` — **client-token** `tgg:christopher` (content x3, first at line 3)
++- `tests/test_pa_business_operation_scope.py` — **client-token** `tgg:ilinked` (content x2, first at line 167)
++- `tests/test_pa_business_operation_scope.py` — **client-token** `tgg:tgg` (content x46, first at line 3)
++- `tests/test_pa_case_state_echo.py` — **client-token** `tgg:christopher` (content x5, first at line 4)
++- `tests/test_pa_case_state_echo.py` — **client-token** `tgg:hdb` (content x2, first at line 86)
++- `tests/test_pa_case_state_echo.py` — **client-token** `tgg:ilinked` (content x1, first at line 5)
++- `tests/test_pa_case_state_echo.py` — **client-token** `tgg:tgg` (content x29, first at line 1)
++- `tests/test_pa_client_overlay.py` — **client-token** `tgg:tgg` (content x21, first at line 6)
++- `tests/test_pa_compaction_guidance.py` — **client-token** `tgg:christopher` (content x10, first at line 3)
++- `tests/test_pa_compaction_guidance.py` — **client-token** `tgg:tgg` (content x5, first at line 31)
++- `tests/test_pa_constitution.py` — **client-token** `tgg:christopher` (content x2, first at line 23)
++- `tests/test_pa_constitution.py` — **client-token** `tgg:ilinked` (content x4, first at line 113)
++- `tests/test_pa_constitution.py` — **client-token** `tgg:sprucing` (content x2, first at line 141)
++- `tests/test_pa_constitution.py` — **client-token** `tgg:tgg` (content x35, first at line 18)
++- `tests/test_pa_turn_recording.py` — **client-token** `tgg:christopher` (content x23, first at line 92)
++- `tests/test_tgg_christopher_replay_profile.py` — **client-token** `tgg:christopher` (path; content x11, first at line 9)
++- `tests/test_tgg_christopher_replay_profile.py` — **client-token** `tgg:tgg` (path; content x27, first at line 9)
++- `tests/tools/test_async_delegation.py` — **client-token** `tgg:christopher` (content x2, first at line 541)
++- `tests/tools/test_tgg_ilinked_lookup.py` — **client-token** `tgg:ilinked` (path; content x5, first at line 3)
++- `tests/tools/test_tgg_ilinked_lookup.py` — **client-token** `tgg:tgg` (path; content x1, first at line 3)
++
++These entries remain loud findings. This inventory does not authorize suppressing them.
+diff --git a/plane-manifest.json b/plane-manifest.json
+index 336653cab8..9cad03cfd8 100644
+--- a/plane-manifest.json
++++ b/plane-manifest.json
+@@ -1,21 +1,39 @@
+ {
+-  "$comment": "Anti-drift plane boundary declaration (PA de-fusion Phase 0.2). Consumed by scripts/plane_lint.py. Client planes win over shared planes on overlap: deploy/ is shared EXCEPT deploy/tgg/, which is client-plane. clients/ is the future hermes client-pack root (Phase 2). loaderSeamExceptions is the ONLY sanctioned shared->client import seam (the pack loader / tenant registration entry point); empty until the Phase-2 tool-pack loader lands.",
++  "$comment": "Anti-drift plane boundary declaration (PA de-fusion Phase 0.2). Consumed by scripts/plane_lint.py. Client planes win over shared planes on overlap. Wildcard directory entries (for example deploy/*/) cover each client's subtree; the shared deploy root therefore contains only platform-level files. Per-client test fixtures are client-plane. loaderSeamExceptions is the ONLY sanctioned shared->client import seam; empty until the Phase-2 tool-pack loader lands.",
+   "sharedPlanePaths": [
+     "gateway/",
+     "tools/",
+     "hermes_cli/",
+     "agent/",
+     "toolsets.py",
+-    "deploy/"
++    "deploy/",
++    "scripts/",
++    "tests/",
++    "*.manifest.json"
+   ],
+   "clientPlanePaths": [
+     "deploy/tgg/",
++    "deploy/finexis/",
++    "deploy/*/",
+     "tests/fixtures/clients/",
++    "tests/fixtures/clients/*/",
+     "clients/"
+   ],
+   "loaderSeamExceptions": [],
+   "clientTokenRegistry": {
+-    "tgg": ["tgg", "christopher", "SK/JOB", "hdb", "ilinked", "huidapcl", "sprucing"],
+-    "mtu": ["mtu", "finexis", "bor_"]
++    "tgg": [
++      "tgg",
++      "christopher",
++      "SK/JOB",
++      "hdb",
++      "ilinked",
++      "huidapcl",
++      "sprucing"
++    ],
++    "mtu": [
++      "mtu",
++      "finexis",
++      "bor_"
++    ]
+   }
+ }
+diff --git a/scripts/plane_lint.py b/scripts/plane_lint.py
+index b223916b58..b133f82ca9 100644
+--- a/scripts/plane_lint.py
++++ b/scripts/plane_lint.py
+@@ -60,6 +60,8 @@ from __future__ import annotations
+ 
+ import argparse
+ import ast
++import fnmatch
++import glob
+ import json
+ import os
+ import re
+@@ -113,11 +115,14 @@ def load_manifest(root: str) -> dict:
+             sys.exit(2)
+     # Manifest self-verification: declared paths must exist (a path moving
+     # without a manifest update is a loud config error, not a silent pass).
+-    missing = [
+-        p
+-        for p in manifest["sharedPlanePaths"]
+-        if not os.path.exists(os.path.join(root, p.rstrip("/")))
+-    ]
++    missing = []
++    for entry in manifest["sharedPlanePaths"]:
++        # Wildcards declare a class of paths (for example repo-root manifests)
++        # and may legitimately have zero current members. Literal paths must exist.
++        if any(ch in entry for ch in "*?["):
++            continue
++        if not os.path.exists(os.path.join(root, entry.rstrip("/"))):
++            missing.append(entry)
+     if missing:
+         sys.stderr.write(
+             "plane-lint: manifest sharedPlanePaths do not exist on disk: "
+@@ -135,7 +140,20 @@ def under(rel: str, prefixes: list[str]) -> bool:
+     directory prefix.
+     """
+     for prefix in prefixes:
+-        p = prefix.rstrip("/")
++        directory_pattern = norm(prefix).endswith("/")
++        p = norm(prefix).rstrip("/")
++        if any(ch in p for ch in "*?["):
++            # A wildcard basename without a slash is a repo-root file pattern.
++            if "/" not in p:
++                if "/" not in rel and fnmatch.fnmatchcase(rel, p):
++                    return True
++                continue
++            # Directory patterns own the matched directory and its full subtree.
++            if directory_pattern and fnmatch.fnmatchcase(rel, p + "/**"):
++                return True
++            if not directory_pattern and fnmatch.fnmatchcase(rel, p):
++                return True
++            continue
+         if rel == p or rel.startswith(p + "/"):
+             return True
+     return False
+@@ -162,22 +180,27 @@ def iter_shared_files(root: str, manifest: dict):
+     client = manifest["clientPlanePaths"]
+     seen = set()
+     for entry in shared:
+-        abs_entry = os.path.join(root, entry.rstrip("/"))
+-        if os.path.isfile(abs_entry):
+-            rel = norm(os.path.relpath(abs_entry, root))
+-            if rel not in seen and not under(rel, client):
+-                seen.add(rel)
+-                yield rel
+-            continue
+-        for dirpath, dirnames, filenames in os.walk(abs_entry):
+-            dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIR_NAMES)
+-            for name in sorted(filenames):
+-                abs_path = os.path.join(dirpath, name)
+-                rel = norm(os.path.relpath(abs_path, root))
+-                if rel in seen or under(rel, client):
+-                    continue
+-                seen.add(rel)
+-                yield rel
++        raw_entry = entry.rstrip("/")
++        if any(ch in raw_entry for ch in "*?["):
++            candidates = sorted(glob.glob(os.path.join(root, raw_entry)))
++        else:
++            candidates = [os.path.join(root, raw_entry)]
++        for abs_entry in candidates:
++            if os.path.isfile(abs_entry):
++                rel = norm(os.path.relpath(abs_entry, root))
++                if rel not in seen and not under(rel, client):
++                    seen.add(rel)
++                    yield rel
++                continue
++            for dirpath, dirnames, filenames in os.walk(abs_entry):
++                dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIR_NAMES)
++                for name in sorted(filenames):
++                    abs_path = os.path.join(dirpath, name)
++                    rel = norm(os.path.relpath(abs_path, root))
++                    if rel in seen or under(rel, client):
++                        continue
++                    seen.add(rel)
++                    yield rel
+ 
+ 
+ def token_occurrences(text: str, token: str, regex: re.Pattern) -> list[int]:
+@@ -210,7 +233,7 @@ def build_token_matchers(manifest: dict):
+ 
+ 
+ def client_module_prefixes(manifest: dict) -> list[str]:
+-    """clientPlanePaths as python module prefixes: deploy/tgg/ -> deploy.tgg"""
++    """Client-plane path patterns as Python module patterns."""
+     prefixes = []
+     for entry in manifest["clientPlanePaths"]:
+         mod = entry.strip("/").replace("/", ".")
+@@ -307,7 +330,12 @@ def collect_violations(root: str, manifest: dict) -> list[dict]:
+         if ext in PY_EXTENSIONS:
+             for mod in python_imported_modules(rel, text):
+                 for prefix in py_client_prefixes:
+-                    if mod == prefix or mod.startswith(prefix + "."):
++                    if (
++                        mod == prefix
++                        or mod.startswith(prefix + ".")
++                        or fnmatch.fnmatchcase(mod, prefix)
++                        or fnmatch.fnmatchcase(mod, prefix + ".**")
++                    ):
+                         violations.append(
+                             {
+                                 "file": rel,
+diff --git a/tests/gateway/test_replay_orchestrator.py b/tests/gateway/test_replay_orchestrator.py
+index 8020bf14d8..1bdfe5d800 100644
+--- a/tests/gateway/test_replay_orchestrator.py
++++ b/tests/gateway/test_replay_orchestrator.py
+@@ -1,5 +1,6 @@
+ from __future__ import annotations
+ 
++import argparse
+ import json
+ import threading
+ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+@@ -19,7 +20,9 @@ from gateway.replay_orchestrator import (
+     ReplayVerifyError,
+     VerifyGateConfig,
+     _sha256_hex_manifest,
++    tenant_confirmation_token,
+ )
++from hermes_cli.replay import add_replay_parser, add_replay_run_parser
+ from hermes_state import SessionDB
+ 
+ 
+@@ -32,6 +35,7 @@ class FakeProviderClient:
+         self.promote_calls = []
+         self.rollback_calls = []
+ 
++
+     def prepare(
+         self, *, run_id: str, source_data_dir: str, target_data_dir: str, base_url: str
+     ):
+@@ -218,6 +222,104 @@ def _prepared_orchestrator(tmp_path, *, runner_factory=None, provider=None):
+     return orch, provider
+ 
+ 
++
++def test_tenant_confirmation_tokens_are_derived_not_tgg_constants():
++    assert tenant_confirmation_token("SWAP", "finexis") == "SWAP_FINEXIS_TARGET"
++    assert (
++        tenant_confirmation_token("ORCHESTRATOR", "client-east")
++        == "ORCHESTRATOR_CLIENT_EAST_TARGET"
++    )
++    with pytest.raises(ValueError, match="tenant is required"):
++        tenant_confirmation_token("SWAP", "")
++
++
++def test_provider_promote_derives_confirmation_from_configured_tenant(monkeypatch):
++    client = ReplayTargetProviderClient(
++        ReplayTargetProviderConfig(
++            provider_url="http://provider.test",
++            admin_token="secret",
++            tenant="finexis",
++        )
++    )
++    captured = {}
++
++    def fake_request(method, path, *, body=None, query=None):
++        captured.update({"method": method, "path": path, "body": body})
++        return {"ok": True}
++
++    monkeypatch.setattr(client, "_request", fake_request)
++    client.promote(
++        run_id="run-finexis",
++        target_data_dir="/tmp/target",
++        prod_data_dir="/tmp/prod",
++    )
++
++    assert captured["body"]["confirm"] == "SWAP_FINEXIS_TARGET"
++
++
++def test_replay_run_cli_requires_explicit_tenant():
++    parser = argparse.ArgumentParser()
++    subparsers = parser.add_subparsers(dest="command", required=True)
++    add_replay_run_parser(subparsers)
++
++    with pytest.raises(SystemExit):
++        parser.parse_args(
++            [
++                "replay-run",
++                "verify",
++                "--manifest",
++                "/tmp/run.json",
++            ]
++        )
++
++    args = parser.parse_args(
++        [
++            "replay-run",
++            "verify",
++            "--tenant",
++            "finexis",
++            "--manifest",
++            "/tmp/run.json",
++        ]
++    )
++    assert args.tenant == "finexis"
++
++
++def test_replay_cli_uses_generic_window_flags_and_explicit_pa_context():
++    parser = argparse.ArgumentParser()
++    subparsers = parser.add_subparsers(dest="command", required=True)
++    add_replay_parser(subparsers)
++
++    args = parser.parse_args(
++        [
++            "replay",
++            "--bridge-message-log",
++            "/tmp/bridge.db",
++            "--chat-id",
++            "group",
++            "--since",
++            "2026-05-24T00:00:00+08:00",
++            "--until",
++            "2026-05-25T00:00:00+08:00",
++            "--tenant",
++            "finexis",
++            "--agent-id",
++            "mtu",
++            "--job-type",
++            "advisor_ingest",
++        ]
++    )
++    assert (args.since, args.until) == (
++        "2026-05-24T00:00:00+08:00",
++        "2026-05-25T00:00:00+08:00",
++    )
++    assert (args.tenant, args.agent_id, args.job_type) == (
++        "finexis",
++        "mtu",
++        "advisor_ingest",
++    )
++
++
+ def test_orchestrator_prepare_run_verify_persists_manifest_and_gate(tmp_path):
+     runner = FakeRunner(tmp_path / "state.db")
+     orch, provider = _prepared_orchestrator(tmp_path, runner_factory=lambda: runner)
+@@ -531,6 +633,7 @@ def test_provider_client_uses_declared_http_routes_and_auth(tmp_path):
+             ReplayTargetProviderConfig(
+                 provider_url=f"http://127.0.0.1:{server.server_port}",
+                 admin_token="secret",
++                tenant="tgg",
+             )
+         )
+         client.prepare(
+@@ -599,6 +702,7 @@ def test_provider_client_surfaces_provider_error(tmp_path):
+             ReplayTargetProviderConfig(
+                 provider_url=f"http://127.0.0.1:{server.server_port}",
+                 admin_token="secret",
++                tenant="tgg",
+             )
+         )
+         with pytest.raises(ReplayProviderError) as err:
+diff --git a/tests/gateway/test_replay_runner.py b/tests/gateway/test_replay_runner.py
+index 2d740314a1..1f032f90cc 100644
+--- a/tests/gateway/test_replay_runner.py
++++ b/tests/gateway/test_replay_runner.py
+@@ -671,13 +671,25 @@ def test_replay_corpus_loads_bridge_message_log_with_explicit_determinism_report
+     corpus = ReplayCorpus.from_bridge_message_log(
+         db_path,
+         chat_id="120363111@g.us",
+-        since_sgt="2026-05-24 00:00:00 SGT",
++        since="2026-05-24 00:00:00 SGT",
++        tenant="tgg",
++        agent_id="christopher",
++        job_type="tgg_ops_ingest",
+         skip_messages=1,
+     )
+ 
+     assert [message["messageId"] for message in corpus.messages] == ["m1", "m2", "m3"]
+     assert corpus.messages[1]["quotedText"] == "Job sheet SK/JOB/2605/1954"
+     assert corpus.messages[2]["mediaUrls"] == [str(missing_media)]
++    assert corpus.messages[0]["_pa_source_ref"] == "chat::m1"
++    assert corpus.messages[0]["_pa_local_time"]
++    assert corpus.messages[0]["_tgg_source_ref"] == "chat::m1"
++    assert corpus.messages[0]["_tgg_sgt"] == corpus.messages[0]["_pa_local_time"]
++    assert corpus.messages[0]["_hermes_pa_context"] == {
++        "tenant": "tgg",
++        "agent_id": "christopher",
++        "job_type": "tgg_ops_ingest",
++    }
+     assert corpus.report["messages_skipped"] == [
+         {"reason": "offset", "count": 1},
+         {"reason": "bare_reaction", "source_ref": "chat::reaction", "message_kind": "reaction"},
+@@ -733,7 +745,10 @@ def test_replay_corpus_dedup_reports_skipped_duplicates(tmp_path):
+     corpus = ReplayCorpus.from_bridge_message_log(
+         db_path,
+         chat_id="120363111@g.us",
+-        since_sgt="2026-05-24 00:00:00 SGT",
++        since="2026-05-24 00:00:00 SGT",
++        tenant="finexis",
++        agent_id="mtu",
++        job_type="advisor_ingest",
+     )
+ 
+     assert [message["messageId"] for message in corpus.messages] == ["same-id", "m2"]
+@@ -755,7 +770,10 @@ async def test_replay_corpus_fixture_matches_current_harness_turn_boundaries(tmp
+     corpus = ReplayCorpus.from_bridge_message_log(
+         db_path,
+         chat_id="120363111@g.us",
+-        since_sgt="2026-05-24 00:00:00 SGT",
++        since="2026-05-24 00:00:00 SGT",
++        tenant="tgg",
++        agent_id="christopher",
++        job_type="tgg_ops_ingest",
+     )
+     plan = ReplayPlan(
+         platform="whatsapp",
+@@ -830,6 +848,11 @@ def test_replay_plan_loads_bridge_message_log_corpus_spec(tmp_path):
+             "source": "bridge_message_log",
+             "db_path": str(db_path),
+             "chat_id": "120363111@g.us",
++            "tenant": "tgg",
++            "agent_id": "christopher",
++            "job_type": "tgg_ops_ingest",
++            # Legacy plan fixtures remain readable; the CLI surface is now
++            # the generic --since/--until pair.
+             "since_sgt": "2026-05-24 00:00:00 SGT",
+         },
+     })
+diff --git a/tests/test_plane_lint.py b/tests/test_plane_lint.py
+new file mode 100644
+index 0000000000..c5587f191b
+--- /dev/null
++++ b/tests/test_plane_lint.py
+@@ -0,0 +1,41 @@
++"""Contract tests for the anti-drift plane manifest path grammar."""
++
++from __future__ import annotations
++
++import importlib.util
++from pathlib import Path
++
++
++_REPO = Path(__file__).resolve().parents[1]
++_SPEC = importlib.util.spec_from_file_location(
++    "plane_lint", _REPO / "scripts" / "plane_lint.py"
++)
++assert _SPEC and _SPEC.loader
++_PLANE_LINT = importlib.util.module_from_spec(_SPEC)
++_SPEC.loader.exec_module(_PLANE_LINT)
++
++
++def test_wildcard_client_directory_owns_full_subtree() -> None:
++    assert _PLANE_LINT.under("deploy/acme/agent/config.yaml", ["deploy/*/"])
++    assert not _PLANE_LINT.under("deploy/shared_tool.py", ["deploy/*/"])
++
++
++def test_root_manifest_pattern_does_not_match_nested_manifests() -> None:
++    assert _PLANE_LINT.under("runtime.manifest.json", ["*.manifest.json"])
++    assert not _PLANE_LINT.under(
++        "deploy/acme/runtime.manifest.json", ["*.manifest.json"]
++    )
++
++
++def test_client_plane_wins_when_shared_parent_is_scanned(tmp_path: Path) -> None:
++    (tmp_path / "deploy" / "acme").mkdir(parents=True)
++    (tmp_path / "deploy" / "shared_tool.py").write_text("shared\n")
++    (tmp_path / "deploy" / "acme" / "config.py").write_text("client\n")
++    manifest = {
++        "sharedPlanePaths": ["deploy/"],
++        "clientPlanePaths": ["deploy/*/"],
++    }
++
++    assert list(_PLANE_LINT.iter_shared_files(str(tmp_path), manifest)) == [
++        "deploy/shared_tool.py"
++    ]

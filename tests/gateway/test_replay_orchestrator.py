@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -19,7 +20,9 @@ from gateway.replay_orchestrator import (
     ReplayVerifyError,
     VerifyGateConfig,
     _sha256_hex_manifest,
+    tenant_confirmation_token,
 )
+from hermes_cli.replay import add_replay_parser, add_replay_run_parser
 from hermes_state import SessionDB
 
 
@@ -31,6 +34,7 @@ class FakeProviderClient:
         self.dirty_calls = []
         self.promote_calls = []
         self.rollback_calls = []
+
 
     def prepare(
         self, *, run_id: str, source_data_dir: str, target_data_dir: str, base_url: str
@@ -216,6 +220,104 @@ def _prepared_orchestrator(tmp_path, *, runner_factory=None, provider=None):
         target_base_url="http://127.0.0.1:5192",
     )
     return orch, provider
+
+
+
+def test_tenant_confirmation_tokens_are_derived_not_tgg_constants():
+    assert tenant_confirmation_token("SWAP", "finexis") == "SWAP_FINEXIS_TARGET"
+    assert (
+        tenant_confirmation_token("ORCHESTRATOR", "client-east")
+        == "ORCHESTRATOR_CLIENT_EAST_TARGET"
+    )
+    with pytest.raises(ValueError, match="tenant is required"):
+        tenant_confirmation_token("SWAP", "")
+
+
+def test_provider_promote_derives_confirmation_from_configured_tenant(monkeypatch):
+    client = ReplayTargetProviderClient(
+        ReplayTargetProviderConfig(
+            provider_url="http://provider.test",
+            admin_token="secret",
+            tenant="finexis",
+        )
+    )
+    captured = {}
+
+    def fake_request(method, path, *, body=None, query=None):
+        captured.update({"method": method, "path": path, "body": body})
+        return {"ok": True}
+
+    monkeypatch.setattr(client, "_request", fake_request)
+    client.promote(
+        run_id="run-finexis",
+        target_data_dir="/tmp/target",
+        prod_data_dir="/tmp/prod",
+    )
+
+    assert captured["body"]["confirm"] == "SWAP_FINEXIS_TARGET"
+
+
+def test_replay_run_cli_requires_explicit_tenant():
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    add_replay_run_parser(subparsers)
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "replay-run",
+                "verify",
+                "--manifest",
+                "/tmp/run.json",
+            ]
+        )
+
+    args = parser.parse_args(
+        [
+            "replay-run",
+            "verify",
+            "--tenant",
+            "finexis",
+            "--manifest",
+            "/tmp/run.json",
+        ]
+    )
+    assert args.tenant == "finexis"
+
+
+def test_replay_cli_uses_generic_window_flags_and_explicit_pa_context():
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    add_replay_parser(subparsers)
+
+    args = parser.parse_args(
+        [
+            "replay",
+            "--bridge-message-log",
+            "/tmp/bridge.db",
+            "--chat-id",
+            "group",
+            "--since",
+            "2026-05-24T00:00:00+08:00",
+            "--until",
+            "2026-05-25T00:00:00+08:00",
+            "--tenant",
+            "finexis",
+            "--agent-id",
+            "mtu",
+            "--job-type",
+            "advisor_ingest",
+        ]
+    )
+    assert (args.since, args.until) == (
+        "2026-05-24T00:00:00+08:00",
+        "2026-05-25T00:00:00+08:00",
+    )
+    assert (args.tenant, args.agent_id, args.job_type) == (
+        "finexis",
+        "mtu",
+        "advisor_ingest",
+    )
 
 
 def test_orchestrator_prepare_run_verify_persists_manifest_and_gate(tmp_path):
@@ -531,6 +633,7 @@ def test_provider_client_uses_declared_http_routes_and_auth(tmp_path):
             ReplayTargetProviderConfig(
                 provider_url=f"http://127.0.0.1:{server.server_port}",
                 admin_token="secret",
+                tenant="tgg",
             )
         )
         client.prepare(
@@ -599,6 +702,7 @@ def test_provider_client_surfaces_provider_error(tmp_path):
             ReplayTargetProviderConfig(
                 provider_url=f"http://127.0.0.1:{server.server_port}",
                 admin_token="secret",
+                tenant="tgg",
             )
         )
         with pytest.raises(ReplayProviderError) as err:

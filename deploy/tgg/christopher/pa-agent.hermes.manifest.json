@@ -171,6 +171,7 @@
     "deploy/tgg/christopher/client-agent-deployment.yaml",
     "deploy/tgg/christopher/config.yaml",
     "deploy/tgg/christopher/pa-agent.hermes.manifest.json",
+    "deploy/tgg/christopher/pa-agent.manifest.json",
     "deploy/tgg/christopher/patches/mgmt-business-operations.snippet.yaml",
     "deploy/tgg/christopher/patches/mgmt-chat-behavior.snippet.yaml",
     "deploy/tgg/christopher/patches/ops-ingest-judgment.snippet.yaml",

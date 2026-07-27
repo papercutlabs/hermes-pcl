@@ -1874,9 +1874,13 @@ class WhatsAppAdapter(BasePlatformAdapter):
             # Download media URLs to the local cache so agent tools
             # can access them reliably regardless of URL expiration.
             raw_urls = data.get("mediaUrls", [])
+            declared_media_mimes = data.get("mediaMimes") or []
+            if isinstance(declared_media_mimes, str):
+                declared_media_mimes = [declared_media_mimes]
             cached_urls = []
             media_types = []
-            for url in raw_urls:
+            refused_documents = []
+            for media_index, url in enumerate(raw_urls):
                 if msg_type == MessageType.PHOTO and url.startswith(("http://", "https://")):
                     try:
                         cached_path = await cache_image_from_url(url, ext=".jpg")
@@ -1909,9 +1913,33 @@ class WhatsAppAdapter(BasePlatformAdapter):
                     print(f"[{self.name}] Using bridge-cached audio: {url}", flush=True)
                 elif msg_type == MessageType.DOCUMENT and os.path.isabs(url):
                     # Local file path — bridge already downloaded the document
-                    cached_urls.append(url)
                     ext = Path(url).suffix.lower()
-                    mime = SUPPORTED_DOCUMENT_TYPES.get(ext, "application/octet-stream")
+                    mime = (
+                        str(declared_media_mimes[media_index])
+                        if media_index < len(declared_media_mimes)
+                        else ""
+                    )
+                    if ext in {".xlsx", ".csv", ".xlsm", ".xltm"}:
+                        try:
+                            from tools.pa_business_tools import validate_tgg_spreadsheet
+
+                            mime = validate_tgg_spreadsheet(
+                                url,
+                                declared_mime=mime,
+                            )
+                        except (OSError, ValueError) as exc:
+                            refusal_code = str(exc).split(":", 1)[0]
+                            refused_documents.append(refusal_code)
+                            print(
+                                f"[{self.name}] Refused spreadsheet document: {exc}",
+                                flush=True,
+                            )
+                            continue
+                    elif not mime:
+                        mime = SUPPORTED_DOCUMENT_TYPES.get(
+                            ext, "application/octet-stream"
+                        )
+                    cached_urls.append(url)
                     media_types.append(mime)
                     print(f"[{self.name}] Using bridge-cached document: {url}", flush=True)
                 elif msg_type == MessageType.VIDEO and os.path.isabs(url):
@@ -1928,6 +1956,13 @@ class WhatsAppAdapter(BasePlatformAdapter):
             body = data.get("body", "")
             if data.get("isGroup"):
                 body = self._clean_bot_mention_text(body, data)
+            if refused_documents:
+                refusal_note = (
+                    "[A document attachment was refused by the media safety gate: "
+                    + "; ".join(refused_documents)
+                    + "]"
+                )
+                body = f"{refusal_note}\n\n{body}" if body else refusal_note
             MAX_TEXT_INJECT_BYTES = 100 * 1024
             if msg_type == MessageType.DOCUMENT and cached_urls:
                 for doc_path in cached_urls:

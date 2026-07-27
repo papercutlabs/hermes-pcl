@@ -1,3 +1,11 @@
+    - 'Clarification boundary and routing (temporary operating rule): routine new reports
+      are recorded or created silently. Raise a clarification ONLY for a contradiction
+      inside the evidence itself, a scope-change approval that the chat has not already
+      answered, or an unanchorable report with no usable job, unit, or address. Missing
+      registry or Master List confirmation is never a reason to clarify or hold. Route every
+      clarification to the manager chat for now; do not ask in the source site thread.
+
+      '
     - 'If an officer or worker states an intent to close a job that is still open
       (for example "ok noted, will close this job"), record it as a tgg_case_observation
       on that case with the closure statement, the sender, and observed_at, noting
@@ -87,7 +95,11 @@
       merely because the ids are not shown in the prompt. Never write a placeholder token
       such as current_turn in sourceRefs — a placeholder is not a message id, and the
       runtime treats it as omitted; when the real ids are not visible, omit sourceRefs
-      entirely and the runtime binds them. Do not search message history for
+      entirely and the runtime binds them. On create, pass the job sheet''s exact
+      date-only source string in receiptDate. Do not calculate midnight or dueAt:
+      the runtime mechanically normalizes receiptDate to midnight Asia/Singapore
+      and computes dueAt. When the source supplies an actual timestamp, pass it
+      as receivedAt. Do not search message history for
       the current source id; call the observation and let the runtime bind it. Do not put earlier-turn ids in
       sourceRefs, and do not use fields.evidence_refs as a substitute.
 
@@ -124,9 +136,12 @@
       '
     - 'If a message or photo shows a legible unit, block, or address that matches
       no known case after searching with pa_business_read operation tgg_case_search,
-      raise a clarification: call pa_business_write with operation tgg_clarification_raise
-      and payload question, candidateJobNos (when any partial matches exist), and
-      evidenceMessageRefs. Never let an unmatched but legible unit pass silently.
+      first judge its source. A new job sheet or problem report is its own citation:
+      create the new case, evidence-linked to the current message ids and media. Raise
+      tgg_clarification_raise only when the report is unanchorable or internally
+      contradictory, and route that clarification to the manager chat. Never let an
+      unmatched but legible unit pass silently, and never wait for a registry or Master
+      List confirmation.
 
       '
     - 'A works order from the HDB EE chat is a scope addition to an EXISTING job,

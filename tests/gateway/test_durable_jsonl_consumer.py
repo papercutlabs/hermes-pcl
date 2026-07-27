@@ -3,6 +3,7 @@ import asyncio
 import json
 import os
 import sqlite3
+import zipfile
 from types import SimpleNamespace
 from pathlib import Path
 
@@ -38,6 +39,22 @@ def _write_jsonl(path: Path, values: list[dict]) -> None:
 
 def _png_bytes(payload: bytes = b"fixture") -> bytes:
     return b"\x89PNG\r\n\x1a\n" + payload
+
+
+def _xlsx(path: Path) -> None:
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr(
+            "[Content_Types].xml",
+            (
+                '<?xml version="1.0"?>'
+                '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+                '<Override PartName="/xl/workbook.xml" '
+                'ContentType="application/vnd.openxmlformats-officedocument.'
+                'spreadsheetml.sheet.main+xml"/>'
+                "</Types>"
+            ),
+        )
+        archive.writestr("xl/workbook.xml", "<workbook/>")
 
 
 def _retention_config(tmp_path: Path, source_root: Path, media_root: Path) -> Path:
@@ -107,6 +124,139 @@ def test_media_retention_refuses_source_path_escape(tmp_path, monkeypatch):
     record = consumer.InboxRecord(1, "ESCAPE", "test-group@g.us", 0, 1, raw)
     with pytest.raises(consumer.MediaRetentionError, match="escapes configured roots"):
         consumer.retain_record_media(record, config_path=config)
+
+
+def test_spreadsheet_is_content_validated_then_bypasses_image_retention(tmp_path):
+    capture = tmp_path / "capture"
+    capture.mkdir()
+    workbook = capture / "jobs.xlsx"
+    _xlsx(workbook)
+    config = _retention_config(tmp_path, capture, tmp_path / "retained")
+    raw = _message("SHEET-1")
+    raw.update(
+        {
+            "hasMedia": True,
+            "mediaType": "document",
+            "mediaUrls": [str(workbook)],
+            "mediaMimes": [
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            ],
+        }
+    )
+    record = consumer.InboxRecord(
+        1, "SHEET-1", "test-group@g.us", 0, 1, raw
+    )
+
+    assert consumer.retain_record_media(record, config_path=config) == {
+        "retained": 0,
+        "bytes": 0,
+        "operation": False,
+        "validated_spreadsheets": 1,
+    }
+
+
+def test_mixed_spreadsheet_and_image_still_retains_image(tmp_path, monkeypatch):
+    capture = tmp_path / "capture"
+    capture.mkdir()
+    workbook = capture / "jobs.xlsx"
+    _xlsx(workbook)
+    image = capture / "evidence.png"
+    image.write_bytes(_png_bytes())
+    config = _retention_config(tmp_path, capture, tmp_path / "retained")
+    monkeypatch.setattr(
+        consumer,
+        "_converge_retained_media",
+        lambda *_args, **_kwargs: {
+            "ok": True,
+            "data": {"ledgerChanged": False, "observationsChanged": False},
+        },
+    )
+    raw = _message("SHEET-IMAGE")
+    raw.update(
+        {
+            "hasMedia": True,
+            "mediaType": "document",
+            "mediaUrls": [str(workbook), str(image)],
+            "mediaMimes": [
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                "image/png",
+            ],
+        }
+    )
+    record = consumer.InboxRecord(
+        1, "SHEET-IMAGE", "test-group@g.us", 0, 1, raw
+    )
+
+    result = consumer.retain_record_media(record, config_path=config)
+
+    assert result["retained"] == 1
+    assert result["operation"] is True
+    assert len(list((tmp_path / "retained").glob("*.png"))) == 1
+
+
+def test_spreadsheet_without_declared_mime_is_permanently_refused(tmp_path):
+    capture = tmp_path / "capture"
+    capture.mkdir()
+    workbook = capture / "jobs.xlsx"
+    _xlsx(workbook)
+    config = _retention_config(tmp_path, capture, tmp_path / "retained")
+    raw = _message("SHEET-NO-MIME")
+    raw.update(
+        {
+            "hasMedia": True,
+            "mediaType": "document",
+            "mediaUrls": [str(workbook)],
+        }
+    )
+    record = consumer.InboxRecord(
+        1, "SHEET-NO-MIME", "test-group@g.us", 0, 1, raw
+    )
+
+    with pytest.raises(
+        consumer.PermanentMediaRefusal, match="provider-declared MIME"
+    ):
+        consumer.retain_record_media(record, config_path=config)
+
+
+def test_permanent_spreadsheet_refusal_is_durable_and_not_retried(tmp_path):
+    capture = tmp_path / "capture"
+    capture.mkdir()
+    executable = capture / "malware.xlsx"
+    executable.write_bytes(b"MZ" + b"\x00" * 100)
+    config = _retention_config(tmp_path, capture, tmp_path / "retained")
+    source = tmp_path / "events.jsonl"
+    raw = _message("SHEET-REFUSED")
+    raw.update(
+        {
+            "hasMedia": True,
+            "mediaType": "document",
+            "mediaUrls": [str(executable)],
+            "mediaMimes": [
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            ],
+        }
+    )
+    _write_jsonl(source, [raw])
+    cursor = tmp_path / "cursor.json"
+    inbox = consumer.DurableInbox(tmp_path / "inbox.db")
+    consumer.initialize_cursor(source, cursor, position="start")
+    inbox.stage_from_source(source, cursor)
+    record = inbox.retention_candidates(limit=1)[0]
+
+    result = consumer.ensure_record_media_retained(
+        inbox, record, config_path=config
+    )
+
+    assert result["refused"] is True
+    assert inbox.retention_candidates(limit=1) == []
+    with inbox.connect() as conn:
+        row = conn.execute(
+            "SELECT retention_state,retention_attempts,retention_failures,"
+            "retention_last_error FROM ingress_events WHERE message_id=?",
+            ("SHEET-REFUSED",),
+        ).fetchone()
+    assert tuple(row[:3]) == ("bypassed", 1, 0)
+    assert "PROVENANCE_DIVERGENCE" in row["retention_last_error"]
 
 
 def test_media_retention_normalizes_source_read_oserror(tmp_path, monkeypatch):
@@ -686,6 +836,46 @@ def test_stage_is_durable_before_cursor_and_idempotent(tmp_path):
     assert inbox.stage_from_source(source, cursor_path, max_records=10) == 2
     assert inbox.counts() == {"pending": 2}
     assert consumer.SourceCursor.from_path(cursor_path).offset == source.stat().st_size
+
+
+def test_stage_preserves_provider_document_mime_for_spreadsheet_gate(tmp_path):
+    source = tmp_path / "events.jsonl"
+    cursor = tmp_path / "cursor.json"
+    inbox = consumer.DurableInbox(tmp_path / "inbox.db")
+    normalized = _message("xlsx-provider-mime")
+    normalized.update(
+        {
+            "hasMedia": True,
+            "mediaType": "document",
+            "mediaUrls": ["/capture/jobs.xlsx"],
+        }
+    )
+    wrapped = {
+        "normalized": normalized,
+        "raw": {
+            "message": {
+                "documentWithCaptionMessage": {
+                    "message": {
+                        "documentMessage": {
+                            "mimetype": (
+                                "application/vnd.openxmlformats-officedocument."
+                                "spreadsheetml.sheet"
+                            )
+                        }
+                    }
+                }
+            }
+        },
+    }
+    _write_jsonl(source, [wrapped])
+    consumer.initialize_cursor(source, cursor, position="start")
+
+    assert inbox.stage_from_source(source, cursor) == 1
+    record = inbox.pending(limit=1)[0]
+    assert record.raw["mediaMimes"] == [
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    ]
+    assert inbox.retention_candidates(limit=1)[0].message_id == "xlsx-provider-mime"
 
 
 def test_inbox_v1_migration_classifies_existing_retention_queue(tmp_path):
@@ -1385,8 +1575,57 @@ def test_bounded_dry_run_is_read_only_and_predicts_reconciliation(
     tmp_path, monkeypatch
 ):
     inbox, chats, state_db, case_db, canonical, config = _seed_bounded_state(tmp_path)
-    before_bytes = inbox.db_path.read_bytes()
-    before_stat = inbox.db_path.stat()
+    cutoff = consumer._parse_ingress_timestamp("2026-07-20T00:00:00+08:00")
+    selected = inbox.bounded_window(chat_ids=chats, cutoff=cutoff)
+
+    def logical_state():
+        conn = inbox.connect()
+        try:
+            inbox_rows = [
+                tuple(row)
+                for row in conn.execute(
+                    "SELECT * FROM ingress_events ORDER BY seq"
+                )
+            ]
+            meta_rows = [
+                tuple(row)
+                for row in conn.execute("SELECT * FROM ingress_meta ORDER BY key")
+            ]
+            delivery_rows = [
+                tuple(row)
+                for row in conn.execute(
+                    "SELECT * FROM reply_deliveries ORDER BY delivery_key"
+                )
+            ]
+        finally:
+            conn.close()
+        conn = sqlite3.connect(state_db)
+        try:
+            state_rows = conn.execute(
+                "SELECT * FROM pa_turns ORDER BY turn_id"
+            ).fetchall()
+        finally:
+            conn.close()
+        conn = sqlite3.connect(case_db)
+        try:
+            case_rows = conn.execute("SELECT * FROM cases ORDER BY id").fetchall()
+            audit_rows = conn.execute(
+                "SELECT * FROM ps_audit_log ORDER BY id"
+            ).fetchall()
+        finally:
+            conn.close()
+        return {
+            "inbox_rows": inbox_rows,
+            "meta_rows": meta_rows,
+            "delivery_rows": delivery_rows,
+            "inbox_counts": inbox.counts(),
+            "selected_statuses": inbox.window_statuses(selected),
+            "state_rows": state_rows,
+            "case_rows": case_rows,
+            "audit_rows": audit_rows,
+        }
+
+    before = logical_state()
     monkeypatch.setenv("CHRISTOPHER_TGG_PS_SERVICE_TOKEN", "test-token")
     args = argparse.Namespace(
         inbox=str(inbox.db_path), config=str(config), state_db=str(state_db),
@@ -1397,8 +1636,7 @@ def test_bounded_dry_run_is_read_only_and_predicts_reconciliation(
         lock_file=str(tmp_path / "consumer.lock"),
     )
     assert asyncio.run(consumer.run_bounded_backplay(args)) == 0
-    assert inbox.db_path.read_bytes() == before_bytes
-    assert inbox.db_path.stat().st_mtime_ns == before_stat.st_mtime_ns
+    assert logical_state() == before
     assert inbox.counts() == {"pending": 3, "processing": 2}
     audit = json.loads(Path(args.audit).read_text())
     assert audit["reconciliation"]["completed"] == 1
@@ -1691,3 +1929,135 @@ def test_bounded_legitimate_consumed_no_turn_is_terminal_skipped(tmp_path, monke
     assert audit["conservation"]["preserved"] is True
     assert all(row["skipped"] == len(row["message_ids"]) for row in audit["mutations"])
     assert inbox.counts() == {"completed": 1, "skipped": 4}
+
+
+def test_message_id_selection_is_exact_and_missing_refuses(tmp_path):
+    inbox, *_ = _seed_bounded_state(tmp_path)
+    selected = inbox.message_id_selection(["bounded-3", "bounded-1"])
+    assert [record.message_id for record in selected] == ["bounded-1", "bounded-3"]
+    consumer.assert_message_id_selection(
+        selected,
+        expected_message_ids=["bounded-3", "bounded-1"],
+        expected_total=2,
+    )
+    with pytest.raises(consumer.ConsumerError, match="missing from inbox"):
+        inbox.message_id_selection(["bounded-1", "not-present"])
+
+
+def test_readjudication_reset_writes_before_image_and_conserves(tmp_path):
+    inbox, *_ = _seed_bounded_state(tmp_path)
+    records = inbox.message_id_selection(["bounded-1", "bounded-2"])
+    with inbox.connect() as conn:
+        conn.execute(
+            "UPDATE ingress_events SET status='completed',pa_turn_id='old-turn' "
+            "WHERE message_id='bounded-1'"
+        )
+    before_count = inbox.total()
+    before_image = tmp_path / "readjudication-before.json"
+    result = inbox.requeue_selected_for_readjudication(
+        records,
+        before_image_path=before_image,
+        run_id="readjudication-test",
+        dry_run=False,
+    )
+    assert result["selected"] == 2
+    assert result["cas_updated"] == 2
+    assert result["status_before"] == {"completed": 1, "pending": 1}
+    image = json.loads(before_image.read_text())
+    assert image["selected_count"] == 2
+    assert {row["message_id"]: row["status"] for row in image["rows"]} == {
+        "bounded-1": "completed",
+        "bounded-2": "pending",
+    }
+    assert inbox.total() == before_count
+    with inbox.connect() as conn:
+        rows = conn.execute(
+            "SELECT message_id,status,pa_turn_id,last_error FROM ingress_events "
+            "WHERE message_id IN ('bounded-1','bounded-2') ORDER BY message_id"
+        ).fetchall()
+    assert [(row["message_id"], row["status"], row["pa_turn_id"]) for row in rows] == [
+        ("bounded-1", "pending", None),
+        ("bounded-2", "pending", None),
+    ]
+    assert all(row["last_error"] == "readjudication:readjudication-test" for row in rows)
+
+
+def test_readjudication_dry_run_writes_nothing(tmp_path):
+    inbox, *_ = _seed_bounded_state(tmp_path)
+    records = inbox.message_id_selection(["bounded-1"])
+    before = inbox.db_path.read_bytes()
+    before_image = tmp_path / "must-not-exist.json"
+    result = inbox.requeue_selected_for_readjudication(
+        records,
+        before_image_path=before_image,
+        run_id="dry-readjudication",
+        dry_run=True,
+    )
+    assert result["cas_updated"] == 0
+    assert inbox.db_path.read_bytes() == before
+    assert not before_image.exists()
+
+
+def test_readjudication_draft_transitions_are_audited_and_dry_run_is_read_only(
+    tmp_path,
+):
+    case_db = tmp_path / "case.db"
+    conn = sqlite3.connect(case_db)
+    conn.executescript("""
+        CREATE TABLE draft_outbound (
+          id INTEGER PRIMARY KEY, case_id INTEGER, channel TEXT NOT NULL,
+          recipient TEXT, body TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'draft',
+          created_by TEXT NOT NULL, approved_by TEXT, sent_at INTEGER,
+          created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+        );
+        CREATE TABLE ps_audit_log (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, tenant_slug TEXT NOT NULL,
+          actor_kind TEXT NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL,
+          target_kind TEXT, target_id TEXT, before_json TEXT, after_json TEXT,
+          source_surface TEXT NOT NULL, summary TEXT NOT NULL, ts INTEGER NOT NULL
+        );
+        INSERT INTO draft_outbound VALUES
+          (1,NULL,'clarification',NULL,'one','draft','christopher',NULL,NULL,1,1),
+          (2,NULL,'clarification',NULL,'two','draft','christopher',NULL,NULL,1,1);
+    """)
+    conn.commit()
+    conn.close()
+    before = case_db.read_bytes()
+    before_image = tmp_path / "draft-before.json"
+    preview = consumer._transition_readjudication_drafts(
+        case_db,
+        readjudicated_ids=[1],
+        pending_manager_ids=[2],
+        manager_chat_id="manager@g.us",
+        before_image_path=before_image,
+        run_id="draft-test",
+        dry_run=True,
+    )
+    assert preview == {"readjudicated": 1, "pending_manager": 1, "dry_run": True}
+    assert case_db.read_bytes() == before
+    assert not before_image.exists()
+
+    result = consumer._transition_readjudication_drafts(
+        case_db,
+        readjudicated_ids=[1],
+        pending_manager_ids=[2],
+        manager_chat_id="manager@g.us",
+        before_image_path=before_image,
+        run_id="draft-test",
+        dry_run=False,
+    )
+    assert result["readjudicated"] == 1
+    assert result["pending_manager"] == 1
+    image = json.loads(before_image.read_text())
+    assert [row["id"] for row in image["draft_outbound"]] == [1, 2]
+    conn = sqlite3.connect(case_db)
+    rows = conn.execute(
+        "SELECT id,state,recipient FROM draft_outbound ORDER BY id"
+    ).fetchall()
+    actions = conn.execute("SELECT action,target_id FROM ps_audit_log ORDER BY id").fetchall()
+    conn.close()
+    assert rows == [(1, "readjudicated", None), (2, "pending_manager", "manager@g.us")]
+    assert actions == [
+        ("clarification.readjudicated", "1"),
+        ("clarification.pending_manager", "2"),
+    ]

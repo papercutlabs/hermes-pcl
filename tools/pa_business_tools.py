@@ -6,6 +6,7 @@ results to the caller.
 """
 from __future__ import annotations
 
+import csv
 import json
 import os
 import re
@@ -13,9 +14,13 @@ import subprocess
 import urllib.error
 import urllib.parse
 import urllib.request
+import zipfile
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Mapping
+from xml.etree import ElementTree
+from zoneinfo import ZoneInfo
 
 from tools.registry import registry, tool_error, tool_result
 
@@ -1121,6 +1126,366 @@ _TGG_IMAGE_SIGNATURES = (
     ("image/webp", b"WEBP", 8),
 )
 
+_TGG_SPREADSHEET_EXTENSIONS = frozenset({".xlsx", ".csv"})
+_TGG_SPREADSHEET_MIMES = {
+    ".xlsx": frozenset(
+        {"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"}
+    ),
+    ".csv": frozenset({"text/csv", "application/csv"}),
+}
+_TGG_SPREADSHEET_CANONICAL_MIME = {
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".csv": "text/csv",
+}
+_TGG_XLSX_MAIN_CONTENT_TYPE = (
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"
+)
+_TGG_SPREADSHEET_MACRO_MARKERS = ("macroenabled", "vbaproject", "macrosheet")
+_TGG_SPREADSHEET_MAX_ZIP_ENTRIES = 20_000
+_TGG_SPREADSHEET_MAX_UNCOMPRESSED_BYTES = 512 * 1024 * 1024
+_TGG_SPREADSHEET_MAX_FILE_BYTES = 64 * 1024 * 1024
+_TGG_SPREADSHEET_MAX_JOB_NUMBERS = 10_000
+_TGG_JOB_HEADER_NAMES = frozenset(
+    {"job no", "job number", "job no.", "job number."}
+)
+
+
+def _sniff_tgg_csv(path: Path) -> bool:
+    """Return whether a bounded prefix is plausibly comma-delimited text."""
+    with path.open("rb") as handle:
+        sample = handle.read(128 * 1024)
+    if not sample or b"\x00" in sample:
+        return False
+    try:
+        text = sample.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return False
+    if any(ord(char) < 32 and char not in "\r\n\t" for char in text):
+        return False
+    lines = [line for line in text.splitlines() if line.strip()]
+    if not lines:
+        return False
+    widths = [len(next(csv.reader([line]))) for line in lines[:20]]
+    return bool(widths and max(widths) >= 2 and sum(width >= 2 for width in widths) >= 1)
+
+
+def _sniff_tgg_xlsx(path: Path) -> bool:
+    """Validate an OOXML workbook without extracting or executing macros."""
+    with path.open("rb") as handle:
+        if handle.read(4) not in {b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08"}:
+            return False
+    try:
+        with zipfile.ZipFile(path) as archive:
+            infos = archive.infolist()
+            if (
+                len(infos) > _TGG_SPREADSHEET_MAX_ZIP_ENTRIES
+                or sum(info.file_size for info in infos)
+                > _TGG_SPREADSHEET_MAX_UNCOMPRESSED_BYTES
+            ):
+                return False
+            names = {info.filename.lower() for info in infos}
+            if "[content_types].xml" not in names or "xl/workbook.xml" not in names:
+                return False
+            if any(
+                marker in name
+                for name in names
+                for marker in ("vbaproject", "macrosheet")
+            ):
+                return False
+            content_types = archive.read("[Content_Types].xml")
+    except (
+        KeyError,
+        OSError,
+        RuntimeError,
+        zipfile.BadZipFile,
+        zipfile.LargeZipFile,
+    ):
+        return False
+    try:
+        root = ElementTree.fromstring(content_types)
+    except ElementTree.ParseError:
+        return False
+    declared_types = {
+        str(element.attrib.get("ContentType") or "").lower()
+        for element in root.iter()
+    }
+    if any(
+        marker in content_type
+        for content_type in declared_types
+        for marker in _TGG_SPREADSHEET_MACRO_MARKERS
+    ):
+        return False
+    return _TGG_XLSX_MAIN_CONTENT_TYPE in declared_types
+
+
+def validate_tgg_spreadsheet(
+    path: str | Path,
+    *,
+    declared_mime: str,
+) -> str:
+    """Validate an explicitly allowlisted spreadsheet by MIME, suffix and bytes.
+
+    Returns the canonical detected MIME. Unsupported/macro-bearing files are
+    refused. A declared MIME that disagrees with the content uses the same
+    PROVENANCE_DIVERGENCE contract as retained case images.
+    """
+    candidate = Path(path).expanduser().resolve(strict=True)
+    if not candidate.is_file():
+        raise ValueError("INVALID_MEDIA_REF: spreadsheet is not a regular file")
+    if candidate.stat().st_size > _TGG_SPREADSHEET_MAX_FILE_BYTES:
+        raise ValueError("SPREADSHEET_TOO_LARGE: file exceeds the media gate limit")
+    suffix = candidate.suffix.lower()
+    mime = str(declared_mime or "").split(";", 1)[0].strip().lower()
+    if suffix not in _TGG_SPREADSHEET_EXTENSIONS:
+        raise ValueError("UNSUPPORTED_MEDIA_TYPE: spreadsheet format is not allowlisted")
+    if mime not in _TGG_SPREADSHEET_MIMES[suffix]:
+        raise ValueError(
+            "PROVENANCE_DIVERGENCE: spreadsheet MIME does not match extension"
+        )
+    sniff = _sniff_tgg_xlsx if suffix == ".xlsx" else _sniff_tgg_csv
+    if not sniff(candidate):
+        raise ValueError(
+            "PROVENANCE_DIVERGENCE: spreadsheet MIME does not match bytes"
+        )
+    return _TGG_SPREADSHEET_CANONICAL_MIME[suffix]
+
+
+def _xlsx_column_index(cell_ref: str) -> int:
+    letters = "".join(char for char in str(cell_ref or "") if char.isalpha())
+    value = 0
+    for char in letters.upper():
+        value = value * 26 + ord(char) - ord("A") + 1
+    return value
+
+
+def _xlsx_cell_text(cell: ElementTree.Element, shared: list[str]) -> str:
+    cell_type = str(cell.attrib.get("t") or "")
+    if cell_type == "inlineStr":
+        return "".join(
+            str(node.text or "")
+            for node in cell.iter()
+            if node.tag.rsplit("}", 1)[-1] == "t"
+        ).strip()
+    raw = next(
+        (
+            str(node.text or "")
+            for node in cell
+            if node.tag.rsplit("}", 1)[-1] == "v"
+        ),
+        "",
+    )
+    if cell_type == "s" and raw:
+        try:
+            return shared[int(raw)].strip()
+        except (IndexError, ValueError):
+            return ""
+    return raw.strip()
+
+
+def _xlsx_shared_strings(archive: zipfile.ZipFile) -> list[str]:
+    try:
+        root = ElementTree.fromstring(archive.read("xl/sharedStrings.xml"))
+    except KeyError:
+        return []
+    except ElementTree.ParseError as exc:
+        raise ValueError("INVALID_SPREADSHEET: malformed shared strings") from exc
+    return [
+        "".join(
+            str(node.text or "")
+            for node in item.iter()
+            if node.tag.rsplit("}", 1)[-1] == "t"
+        )
+        for item in root
+        if item.tag.rsplit("}", 1)[-1] == "si"
+    ]
+
+
+def _xlsx_sheet_paths(archive: zipfile.ZipFile) -> list[str]:
+    try:
+        workbook = ElementTree.fromstring(archive.read("xl/workbook.xml"))
+        relationships = ElementTree.fromstring(
+            archive.read("xl/_rels/workbook.xml.rels")
+        )
+    except (KeyError, ElementTree.ParseError) as exc:
+        raise ValueError("INVALID_SPREADSHEET: malformed workbook relationships") from exc
+    targets = {
+        str(rel.attrib.get("Id") or ""): str(rel.attrib.get("Target") or "")
+        for rel in relationships
+    }
+    paths: list[str] = []
+    for sheet in workbook.iter():
+        if sheet.tag.rsplit("}", 1)[-1] != "sheet":
+            continue
+        relationship_id = next(
+            (
+                str(value)
+                for key, value in sheet.attrib.items()
+                if key.rsplit("}", 1)[-1] == "id"
+            ),
+            "",
+        )
+        target = targets.get(relationship_id, "")
+        if not target:
+            continue
+        normalized = target.lstrip("/")
+        if not normalized.startswith("xl/"):
+            normalized = f"xl/{normalized}"
+        if ".." in Path(normalized).parts:
+            raise ValueError("INVALID_SPREADSHEET: worksheet escapes workbook root")
+        paths.append(normalized)
+    return paths
+
+
+def _extract_xlsx_job_numbers(path: Path) -> list[str]:
+    jobs: list[str] = []
+    seen: set[str] = set()
+    with zipfile.ZipFile(path) as archive:
+        shared = _xlsx_shared_strings(archive)
+        for sheet_path in _xlsx_sheet_paths(archive):
+            try:
+                sheet_stream = archive.open(sheet_path)
+            except KeyError as exc:
+                raise ValueError("INVALID_SPREADSHEET: malformed worksheet") from exc
+            job_column = 0
+            try:
+                for _event, row in ElementTree.iterparse(
+                    sheet_stream, events=("end",)
+                ):
+                    if row.tag.rsplit("}", 1)[-1] != "row":
+                        continue
+                    values: dict[int, str] = {}
+                    for cell in row:
+                        if cell.tag.rsplit("}", 1)[-1] != "c":
+                            continue
+                        column = _xlsx_column_index(
+                            str(cell.attrib.get("r") or "")
+                        )
+                        if column:
+                            values[column] = _xlsx_cell_text(cell, shared)
+                    if not job_column:
+                        for column, value in values.items():
+                            normalized = " ".join(value.lower().split())
+                            if normalized in _TGG_JOB_HEADER_NAMES:
+                                job_column = column
+                                break
+                        row.clear()
+                        continue
+                    job_no = " ".join(
+                        values.get(job_column, "").upper().split()
+                    )
+                    if (
+                        job_no
+                        and re.fullmatch(JOB_NO_RE, job_no)
+                        and job_no not in seen
+                    ):
+                        seen.add(job_no)
+                        jobs.append(job_no)
+                        if len(jobs) > _TGG_SPREADSHEET_MAX_JOB_NUMBERS:
+                            raise ValueError(
+                                "SPREADSHEET_TOO_LARGE: too many unique job numbers"
+                            )
+                    row.clear()
+            except ElementTree.ParseError as exc:
+                raise ValueError("INVALID_SPREADSHEET: malformed worksheet") from exc
+            finally:
+                sheet_stream.close()
+    return jobs
+
+
+def _extract_csv_job_numbers(path: Path) -> list[str]:
+    jobs: list[str] = []
+    seen: set[str] = set()
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.reader(handle)
+        job_column: int | None = None
+        for row in reader:
+            if job_column is None:
+                for index, value in enumerate(row):
+                    normalized = " ".join(str(value).lower().split())
+                    if normalized in _TGG_JOB_HEADER_NAMES:
+                        job_column = index
+                        break
+                continue
+            if job_column >= len(row):
+                continue
+            job_no = " ".join(str(row[job_column]).upper().split())
+            if job_no and re.fullmatch(JOB_NO_RE, job_no) and job_no not in seen:
+                seen.add(job_no)
+                jobs.append(job_no)
+                if len(jobs) > _TGG_SPREADSHEET_MAX_JOB_NUMBERS:
+                    raise ValueError(
+                        "SPREADSHEET_TOO_LARGE: too many unique job numbers"
+                    )
+    return jobs
+
+
+def extract_tgg_spreadsheet_job_numbers(path: str | Path) -> list[str]:
+    """Open a media-gate-approved spreadsheet and return unique job numbers."""
+    candidate = Path(path).expanduser().resolve(strict=True)
+    suffix = candidate.suffix.lower()
+    canonical_mime = _TGG_SPREADSHEET_CANONICAL_MIME.get(suffix)
+    if canonical_mime is None:
+        raise ValueError("UNSUPPORTED_MEDIA_TYPE: spreadsheet format is not allowlisted")
+    validate_tgg_spreadsheet(candidate, declared_mime=canonical_mime)
+    extractor = _extract_xlsx_job_numbers if suffix == ".xlsx" else _extract_csv_job_numbers
+    jobs = extractor(candidate)
+    if not jobs:
+        raise ValueError(
+            "JOB_NUMBER_COLUMN_NOT_FOUND: no recognized job-number column with valid jobs"
+        )
+    return jobs
+
+
+def _handle_tgg_spreadsheet_job_numbers(
+    args: Mapping[str, Any], **_kwargs: Any
+) -> str:
+    try:
+        path = str(args.get("path") or "").strip()
+        if not path:
+            raise ValueError("path is required")
+        try:
+            from hermes_cli.config import read_raw_config
+
+            config = read_raw_config()
+            pa = config.get("pa") if isinstance(config, Mapping) else None
+            retention = (
+                pa.get("media_retention") if isinstance(pa, Mapping) else None
+            )
+            roots = (
+                retention.get("source_roots")
+                if isinstance(retention, Mapping)
+                else None
+            )
+            if isinstance(roots, (str, bytes)):
+                roots = [roots]
+            candidate = Path(path).expanduser().resolve(strict=True)
+            allowed_roots = [
+                Path(str(root)).expanduser().resolve(strict=True)
+                for root in (roots or [])
+            ]
+            if not allowed_roots or not any(
+                candidate.is_relative_to(root) for root in allowed_roots
+            ):
+                raise ValueError
+        except (OSError, RuntimeError, TypeError, ValueError):
+            raise ValueError(
+                "INVALID_MEDIA_REF: spreadsheet is unavailable or outside configured roots"
+            ) from None
+        jobs = extract_tgg_spreadsheet_job_numbers(candidate)
+        return tool_result(
+            {
+                "ok": True,
+                "jobNumbers": jobs,
+                "count": len(jobs),
+                "next": (
+                    "Feed these exact job numbers to the existing tgg_case_query "
+                    "cross-check; do not infer case state from the workbook."
+                ),
+            }
+        )
+    except Exception as exc:
+        return tool_error(exc)
+
 
 def _case_media_items(result: Mapping[str, Any]) -> list[Any]:
     """Extract only the compact case-media endpoint's documented file list."""
@@ -1423,6 +1788,142 @@ def _coerce_observed_at_epoch(value: Any) -> Any:
     return int(parsed.timestamp())
 
 
+_SGT = ZoneInfo("Asia/Singapore")
+_MONTH_NUMBERS = {
+    name: month
+    for month, names in enumerate(
+        (
+            (),
+            ("jan", "january"),
+            ("feb", "february"),
+            ("mar", "march"),
+            ("apr", "april"),
+            ("may",),
+            ("jun", "june"),
+            ("jul", "july"),
+            ("aug", "august"),
+            ("sep", "sept", "september"),
+            ("oct", "october"),
+            ("nov", "november"),
+            ("dec", "december"),
+        )
+    )
+    for name in names
+}
+_ENGLISH_DATE_ONLY_RE = re.compile(
+    r"^(?:receipt\s*date\s*:?\s*)?"
+    r"(?P<day>\d{1,2})\s+(?P<month>[A-Za-z]+)\s+(?P<year>\d{4})$",
+    re.IGNORECASE,
+)
+_ISO_DATE_ONLY_RE = re.compile(
+    r"^(?P<year>\d{4})-(?P<month>\d{2})-(?P<day>\d{2})$"
+)
+_SEPARATED_DATE_ONLY_RE = re.compile(
+    r"^(?:receipt\s*date\s*:?\s*)?"
+    r"(?P<day>\d{1,2})[-/](?P<month>[A-Za-z]+|\d{1,2})[-/](?P<year>\d{4})$",
+    re.IGNORECASE,
+)
+_MONTH_FIRST_DATE_ONLY_RE = re.compile(
+    r"^(?:receipt\s*date\s*:?\s*)?"
+    r"(?P<month>[A-Za-z]+)\s+(?P<day>\d{1,2}),?\s+(?P<year>\d{4})$",
+    re.IGNORECASE,
+)
+
+
+def _date_only_sgt_epoch(value: Any) -> int | None:
+    """Return midnight-SGT epoch for a supported date-only string."""
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    match = _ISO_DATE_ONLY_RE.fullmatch(text)
+    if match:
+        raw_month = match.group("month")
+    else:
+        match = (
+            _ENGLISH_DATE_ONLY_RE.fullmatch(text)
+            or _SEPARATED_DATE_ONLY_RE.fullmatch(text)
+            or _MONTH_FIRST_DATE_ONLY_RE.fullmatch(text)
+        )
+        if not match:
+            return None
+        raw_month = match.group("month").lower()
+    month = int(raw_month) if raw_month.isdigit() else _MONTH_NUMBERS.get(raw_month)
+    if month is None:
+        return None
+    try:
+        parsed = datetime(
+            int(match.group("year")),
+            month,
+            int(match.group("day")),
+            tzinfo=_SGT,
+        )
+    except ValueError:
+        return None
+    return int(parsed.timestamp())
+
+
+def _case_receipt_source_values(payload: Mapping[str, Any]) -> Iterable[Any]:
+    """Yield explicit receipt sources before considering receivedAt."""
+    for key in ("receiptDate", "receipt_date"):
+        if payload.get(key) not in (None, ""):
+            yield payload[key]
+    evidence = payload.get("evidence")
+    if isinstance(evidence, Mapping):
+        for key in ("receiptDate", "receipt_date", "job_receipt_date"):
+            if evidence.get(key) not in (None, ""):
+                yield evidence[key]
+
+
+def _normalise_case_receipt_epoch(payload: Mapping[str, Any]) -> Any:
+    """Resolve the receipt epoch without model-side timezone arithmetic."""
+    supplied = payload.get("receivedAt")
+    if supplied in (None, ""):
+        supplied = payload.get("received_at")
+    supplied_epoch = _coerce_observed_at_epoch(supplied)
+
+    source_epochs: list[int] = []
+    for source_value in _case_receipt_source_values(payload):
+        normalised = _date_only_sgt_epoch(source_value)
+        if normalised is None:
+            raise ValueError(
+                "receiptDate must be a date only, for example "
+                "'20 July 2026', '20-Jul-2026', '20/07/2026', "
+                "'Jul 20, 2026', or '2026-07-20'"
+            )
+        source_epochs.append(normalised)
+    if len(set(source_epochs)) > 1:
+        raise ValueError(
+            "conflicting receiptDate values were supplied; retry with the "
+            "single exact date from the cited job sheet"
+        )
+    if source_epochs:
+        return source_epochs[0]
+    if isinstance(supplied, str):
+        date_only_epoch = _date_only_sgt_epoch(supplied)
+        if date_only_epoch is not None:
+            return date_only_epoch
+    return supplied_epoch
+
+
+def _prepare_case_create_receipt(payload: Mapping[str, Any]) -> dict[str, Any] | str:
+    """Bind receivedAt and dueAt mechanically on every case-create path."""
+    prepared = dict(payload)
+    try:
+        receipt_timestamp = _normalise_case_receipt_epoch(prepared)
+    except ValueError as exc:
+        return tool_error(str(exc))
+    if not isinstance(receipt_timestamp, int):
+        return tool_error(
+            "tgg_case_create requires receivedAt as the job-sheet receipt epoch "
+            "seconds or receiptDate as a date-only source string."
+        )
+    prepared["receivedAt"] = receipt_timestamp
+    prepared["dueAt"] = receipt_timestamp + 30 * 86400
+    for key in ("received_at", "receiptDate", "receipt_date"):
+        prepared.pop(key, None)
+    return prepared
+
+
 def _handle_tgg_case_update_state(args: Mapping[str, Any], **_kwargs: Any) -> str:
     job_no = str(args.get("job_no") or args.get("jobNo") or "").strip()
     if not job_no:
@@ -1504,6 +2005,18 @@ _CREATE_JOB_NO_ALIASES = ("reportedJobNo", "reported_job_no", "job_no", "jobno",
 def _handle_tgg_case_create(args: Mapping[str, Any], **_kwargs: Any) -> str:
     payload = dict(args)
 
+    # New source documents are their own citation. Bind the current turn's
+    # exact message ids mechanically so the case and its opening observation
+    # retain the same evidence the model read.
+    if not payload.get("evidenceMessageRefs") and not payload.get("evidence_message_refs"):
+        current_refs = _current_turn_source_refs()
+        if current_refs:
+            payload["evidenceMessageRefs"] = current_refs
+            # A source-native job sheet is direct observed evidence, not an
+            # inferred candidate. Keep the backend decision gate explicit even
+            # when the model omits this mechanical classification.
+            payload.setdefault("confidence", "high")
+
     # Alias coercion: the model sometimes invents sibling names for the job
     # number param (PG day-26 run passed reportedJobNo); the backend only
     # honors jobNo and silently mints a WA/JOB placeholder otherwise.
@@ -1545,6 +2058,10 @@ def _handle_tgg_case_create(args: Mapping[str, Any], **_kwargs: Any) -> str:
             "operator instruction."
         )
     payload.pop("confirmNoJobNo", None)
+    prepared = _prepare_case_create_receipt(payload)
+    if isinstance(prepared, str):
+        return prepared
+    payload = prepared
     return _handle_tgg_write("tgg_case_create", payload)
 
 
@@ -1577,6 +2094,17 @@ def _handle_business_call(args: Mapping[str, Any], *, user_task: Any = None) -> 
         effective_operation = canonical or operation
         if effective_operation == "tgg_case_observation":
             payload = _bind_observation_source_refs(payload)
+        elif effective_operation == "tgg_case_create":
+            payload = dict(payload)
+            if not payload.get("evidenceMessageRefs") and not payload.get("evidence_message_refs"):
+                current_refs = _current_turn_source_refs()
+                if current_refs:
+                    payload["evidenceMessageRefs"] = current_refs
+                    payload.setdefault("confidence", "high")
+            prepared = _prepare_case_create_receipt(payload)
+            if isinstance(prepared, str):
+                return prepared
+            payload = prepared
         # Recover only declared path params accidentally placed beside the
         # generic payload object; arbitrary top-level args never cross over.
         if configured is not None:
@@ -1829,6 +2357,29 @@ TGG_CASE_QUERY_SCHEMA = {
             },
         },
         "required": ["sql"],
+        "additionalProperties": False,
+    },
+}
+
+
+TGG_SPREADSHEET_JOB_NUMBERS_SCHEMA = {
+    "name": "tgg_spreadsheet_job_numbers",
+    "description": (
+        "Open a spreadsheet that passed the TGG media gate and extract the "
+        "unique job-number column. Accepts only macro-free XLSX or text CSV, "
+        "revalidates content before reading, and never executes workbook code. "
+        "After this tool returns, use the existing tgg_case_query tool to "
+        "cross-check the returned job numbers against live case state."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "Exact local spreadsheet path from the message.",
+            },
+        },
+        "required": ["path"],
         "additionalProperties": False,
     },
 }
@@ -2141,6 +2692,21 @@ TGG_CASE_CREATE_SCHEMA = {
             "problem": {"type": "string", "description": "Problem or work description."},
             "source": {"type": "string", "description": "Source, e.g. whatsapp."},
             "observedAt": {"type": "string", "description": "Observed time in SGT or ISO format."},
+            "receivedAt": {
+                "type": "integer",
+                "description": (
+                    "Job-sheet receipt timestamp as epoch seconds. Optional "
+                    "when receiptDate carries the exact date-only source."
+                ),
+            },
+            "receiptDate": {
+                "type": "string",
+                "description": (
+                    "Exact receipt date string from the job sheet when it "
+                    "states a date without a time. Hermes normalizes this "
+                    "source to midnight Asia/Singapore and computes dueAt."
+                ),
+            },
             "evidence": {"type": "object", "description": "Evidence used to decide this is new.", "additionalProperties": True},
         },
         "required": ["zone", "address", "problem", "source"],
@@ -2186,6 +2752,14 @@ registry.register(
     toolset="pa-business",
     schema=TGG_CASE_QUERY_SCHEMA,
     handler=_handle_tgg_case_query,
+    check_fn=_bridge_available,
+)
+
+registry.register(
+    name="tgg_spreadsheet_job_numbers",
+    toolset="pa-business",
+    schema=TGG_SPREADSHEET_JOB_NUMBERS_SCHEMA,
+    handler=_handle_tgg_spreadsheet_job_numbers,
     check_fn=_bridge_available,
 )
 

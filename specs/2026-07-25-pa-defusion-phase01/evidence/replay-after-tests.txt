@@ -1,0 +1,82 @@
+...................................................................FF... [ 86%]
+...........                                                              [100%]
+=================================== FAILURES ===================================
+_______________ test_replay_preflight_rejects_prod_business_url ________________
+
+tmp_path = PosixPath('/private/var/folders/s9/3_6wbwsd2qqfnlr4z9lxsbgr0000gn/T/pytest-of-pcloffice/pytest-274/test_replay_preflight_rejects_0')
+
+    def test_replay_preflight_rejects_prod_business_url(tmp_path):
+        db_path = _sqlite_db(tmp_path / "tgg.db")
+    
+        with pytest.raises(SystemExit, match="localhost"):
+>           _validate_replay_args(
+                _args(db_path, business_base_url="https://systems.papercut-labs.com")
+            )
+
+tests/test_tgg_christopher_replay_profile.py:54: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+args = Namespace(profile='tgg-local-gpt54-mini-gemini-vision', model=None, vision_provider=None, vision_model=None, vision_co...var/folders/s9/3_6wbwsd2qqfnlr4z9lxsbgr0000gn/T/pytest-of-pcloffice/pytest-274/test_replay_preflight_rejects_0/tgg.db')
+
+    def _validate_replay_args(args: argparse.Namespace) -> None:
+        profile = _resolve_replay_profile(args)
+        vision_model = str(profile.vision_model or "").strip().lower()
+        vision_provider = str(profile.vision_provider or "main").strip().lower()
+        if vision_model.startswith("gemini") and vision_provider not in {"gemini", "google", "google-gemini", "google-ai-studio"}:
+            raise SystemExit(
+                "--vision-model looks like Gemini but --vision-provider points elsewhere. "
+                "Refusing to route a Gemini model name through the main provider."
+            )
+        external_business_url = bool(
+            args.business_base_url
+            and not str(args.business_base_url).startswith(LOCAL_BUSINESS_PREFIXES)
+        )
+>       if external_business_url and not profile.allow_prod_url and not args.prod_pilot_run_id:
+                                                                        ^^^^^^^^^^^^^^^^^^^^^^
+E       AttributeError: 'Namespace' object has no attribute 'prod_pilot_run_id'
+
+scripts/tgg_christopher_hermes_replay.py:412: AttributeError
+________________ test_replay_preflight_rejects_sqlite_sidecars _________________
+
+tmp_path = PosixPath('/private/var/folders/s9/3_6wbwsd2qqfnlr4z9lxsbgr0000gn/T/pytest-of-pcloffice/pytest-274/test_replay_preflight_rejects_1')
+
+    def test_replay_preflight_rejects_sqlite_sidecars(tmp_path):
+        db_path = _sqlite_db(tmp_path / "tgg.db")
+        Path(str(db_path) + "-wal").touch()
+    
+        with pytest.raises(SystemExit, match="sidecars"):
+>           _validate_replay_args(_args(db_path))
+
+tests/test_tgg_christopher_replay_profile.py:64: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+args = Namespace(profile='tgg-local-gpt54-mini-gemini-vision', model=None, vision_provider=None, vision_model=None, vision_co...var/folders/s9/3_6wbwsd2qqfnlr4z9lxsbgr0000gn/T/pytest-of-pcloffice/pytest-274/test_replay_preflight_rejects_1/tgg.db')
+
+    def _validate_replay_args(args: argparse.Namespace) -> None:
+        profile = _resolve_replay_profile(args)
+        vision_model = str(profile.vision_model or "").strip().lower()
+        vision_provider = str(profile.vision_provider or "main").strip().lower()
+        if vision_model.startswith("gemini") and vision_provider not in {"gemini", "google", "google-gemini", "google-ai-studio"}:
+            raise SystemExit(
+                "--vision-model looks like Gemini but --vision-provider points elsewhere. "
+                "Refusing to route a Gemini model name through the main provider."
+            )
+        external_business_url = bool(
+            args.business_base_url
+            and not str(args.business_base_url).startswith(LOCAL_BUSINESS_PREFIXES)
+        )
+        if external_business_url and not profile.allow_prod_url and not args.prod_pilot_run_id:
+            raise SystemExit(
+                "--business-base-url must be localhost/127.0.0.1 for replay. "
+                "Use the local copied-DB backend, or pass --prod-pilot-run-id to "
+                "enter the bounded production pilot write path."
+            )
+>       if args.prod_pilot_run_id:
+           ^^^^^^^^^^^^^^^^^^^^^^
+E       AttributeError: 'Namespace' object has no attribute 'prod_pilot_run_id'
+
+scripts/tgg_christopher_hermes_replay.py:418: AttributeError
+=========================== short test summary info ============================
+FAILED tests/test_tgg_christopher_replay_profile.py::test_replay_preflight_rejects_prod_business_url
+FAILED tests/test_tgg_christopher_replay_profile.py::test_replay_preflight_rejects_sqlite_sidecars
+2 failed, 81 passed in 194.34s (0:03:14)

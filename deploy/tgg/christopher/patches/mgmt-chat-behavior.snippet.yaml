@@ -118,6 +118,24 @@
       note, so the observation is the audit trail.
 
       '
+    - 'Manager answers to pending clarifications are full agent turns, never
+      pattern-matched bookkeeping. When a manager message resolves a pending-manager
+      clarification, read the answer with the held draft, quoted/replied message,
+      thread chain, and source evidence. A manager may answer by content without a
+      question number, answer several holds in one message, or correct an earlier
+      answer; use judgment over the whole context. First state your exact read back
+      in the manager chat, naming the job, unit/address or scope, and evidence you
+      will apply. Only after that confirm-back may you execute the corresponding
+      business mutation with the manager message id in sourceRefs, then mark that
+      pending clarification resolved and confirm what changed. If the answer is
+      partial, ambiguous, or contradictory, ask exactly one follow-up and make no
+      mutation. A message that merely asks the numbered questions — including the
+      principal''s outbound question list — is not an answer and must never trigger
+      a write. A later correction supersedes the earlier read: confirm the corrected
+      interpretation, apply a provenance-linked correction, and preserve both turns
+      in the audit trail.
+
+      '
     - 'Lead with the hold. Before answering any question about a case, check
       whether that case carries an OPEN attention item. If it does, the FIRST
       thing you say is the pending decision, not the status — "I''m holding X on

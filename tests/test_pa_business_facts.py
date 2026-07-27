@@ -1,6 +1,7 @@
 import json
 import sys
 import threading
+import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
@@ -45,6 +46,22 @@ class _FakeBusinessHandler(BaseHTTPRequestHandler):
 
     def log_message(self, _format, *_args):
         return
+
+
+@pytest.fixture
+def source_refs_context():
+    """Bind gateway turn refs on the task-local production surface."""
+    from gateway.session_context import set_session_vars
+
+    tokens = []
+
+    def bind(refs):
+        tokens.append(set_session_vars(source_message_refs=json.dumps(refs)))
+
+    yield bind
+    for turn_tokens in reversed(tokens):
+        for token in reversed(turn_tokens):
+            token.var.reset(token)
 
 
 @pytest.fixture
@@ -143,7 +160,9 @@ def test_legacy_operation_name_resolves_to_canonical_when_registry_is_canonical(
     }
 
 
-def test_generic_observation_injects_current_turn_source_refs(monkeypatch):
+def test_generic_observation_injects_current_turn_source_refs(
+    monkeypatch, source_refs_context
+):
     import tools.pa_business_tools as pbt
 
     bridge = load_business_bridge_config(
@@ -160,9 +179,7 @@ def test_generic_observation_injects_current_turn_source_refs(monkeypatch):
         }
     )
     captured = {}
-    monkeypatch.setenv(
-        "HERMES_SESSION_SOURCE_MESSAGE_REFS", '["wa-current-generic"]'
-    )
+    source_refs_context(["wa-current-generic"])
     monkeypatch.setattr(pbt, "_load_runtime_bridge_config", lambda: bridge)
 
     def fake_execute(_bridge, *, operation, payload):
@@ -219,13 +236,13 @@ def _run_generic_observation(monkeypatch, payload, backend_result=None):
     return result, captured
 
 
-def test_generic_observation_placeholder_source_refs_bind_real_turn_ids(monkeypatch):
+def test_generic_observation_placeholder_source_refs_bind_real_turn_ids(
+    monkeypatch, source_refs_context
+):
     """Literal "current_turn" is a placeholder, not a citable id — the tool
     layer must treat it as omitted and bind the gateway's real turn refs
     (stage-1 backprocess finding 1, 2026-07-20)."""
-    monkeypatch.setenv(
-        "HERMES_SESSION_SOURCE_MESSAGE_REFS", '["wa-real-1", "wa-real-2"]'
-    )
+    source_refs_context(["wa-real-1", "wa-real-2"])
     _, captured = _run_generic_observation(
         monkeypatch,
         {"jobNo": "AM/JOB/2601/1018", "sourceRefs": ["current_turn"]},
@@ -243,8 +260,10 @@ def test_generic_observation_mixed_placeholder_keeps_real_refs(monkeypatch):
     assert captured["payload"]["sourceRefs"] == ["wa-cited-9"]
 
 
-def test_generic_observation_placeholder_inside_fields_bind_real_turn_ids(monkeypatch):
-    monkeypatch.setenv("HERMES_SESSION_SOURCE_MESSAGE_REFS", '["wa-real-1"]')
+def test_generic_observation_placeholder_inside_fields_bind_real_turn_ids(
+    monkeypatch, source_refs_context
+):
+    source_refs_context(["wa-real-1"])
     _, captured = _run_generic_observation(
         monkeypatch,
         {
@@ -304,10 +323,12 @@ def test_non_attach_errors_get_no_recovery_field(monkeypatch):
     assert "recovery" not in result
 
 
-def test_direct_observation_placeholder_source_refs_bind_real_turn_ids(monkeypatch):
+def test_direct_observation_placeholder_source_refs_bind_real_turn_ids(
+    monkeypatch, source_refs_context
+):
     import tools.pa_business_tools as pbt
 
-    monkeypatch.setenv("HERMES_SESSION_SOURCE_MESSAGE_REFS", '["wa-real-7"]')
+    source_refs_context(["wa-real-7"])
     captured = {}
     monkeypatch.setattr(pbt, "_load_runtime_bridge_config", _observation_bridge)
 
@@ -779,6 +800,7 @@ def test_pa_business_toolset_is_registered_without_all_tools():
         "tgg_case_lookup",
         "tgg_case_photos",
         "tgg_case_query",
+        "tgg_spreadsheet_job_numbers",
         "tgg_case_search",
         "tgg_message_history_search",
         "message_history_search",
@@ -801,6 +823,258 @@ def test_pa_business_toolset_is_registered_without_all_tools():
 def _jpeg(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(b"\xff\xd8\xff\xe0fixture")
+
+
+def _xlsx(
+    path: Path,
+    *,
+    macro_enabled: bool = False,
+    job_numbers: tuple[str, ...] = (),
+) -> None:
+    workbook_type = (
+        "application/vnd.ms-excel.sheet.macroEnabled.main+xml"
+        if macro_enabled
+        else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"
+    )
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr(
+            "[Content_Types].xml",
+            (
+                '<?xml version="1.0"?>'
+                '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+                f'<Override PartName="/xl/workbook.xml" ContentType="{workbook_type}"/>'
+                "</Types>"
+            ),
+        )
+        archive.writestr(
+            "xl/workbook.xml",
+            (
+                '<workbook xmlns="http://schemas.openxmlformats.org/'
+                'spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/'
+                'officeDocument/2006/relationships"><sheets><sheet name="Sheet1" '
+                'sheetId="1" r:id="rId1"/></sheets></workbook>'
+            ),
+        )
+        archive.writestr(
+            "xl/_rels/workbook.xml.rels",
+            (
+                '<Relationships xmlns="http://schemas.openxmlformats.org/package/'
+                '2006/relationships"><Relationship Id="rId1" '
+                'Type="http://schemas.openxmlformats.org/officeDocument/2006/'
+                'relationships/worksheet" Target="worksheets/sheet1.xml"/>'
+                "</Relationships>"
+            ),
+        )
+        rows = [
+            '<row r="1"><c r="A1" t="inlineStr"><is><t>Job No.</t></is></c>'
+            '<c r="B1" t="inlineStr"><is><t>Status</t></is></c></row>'
+        ]
+        rows.extend(
+            f'<row r="{index}"><c r="A{index}" t="inlineStr"><is><t>{job}</t>'
+            f'</is></c><c r="B{index}" t="inlineStr"><is><t>Open</t></is></c></row>'
+            for index, job in enumerate(job_numbers, start=2)
+        )
+        archive.writestr(
+            "xl/worksheets/sheet1.xml",
+            (
+                '<worksheet xmlns="http://schemas.openxmlformats.org/'
+                'spreadsheetml/2006/main"><sheetData>'
+                + "".join(rows)
+                + "</sheetData></worksheet>"
+            ),
+        )
+        if macro_enabled:
+            archive.writestr("xl/vbaProject.bin", b"macro")
+
+
+def test_tgg_spreadsheet_gate_accepts_xlsx_and_csv_by_content(tmp_path):
+    import tools.pa_business_tools as pbt
+
+    workbook = tmp_path / "jobs.xlsx"
+    _xlsx(workbook)
+    csv_file = tmp_path / "jobs.csv"
+    csv_file.write_text("Job No.,Status\nAM/JOB/2607/0001,Open\n", encoding="utf-8")
+
+    assert pbt.validate_tgg_spreadsheet(
+        workbook,
+        declared_mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ).endswith("spreadsheetml.sheet")
+    assert pbt.validate_tgg_spreadsheet(
+        csv_file, declared_mime="text/csv"
+    ) == "text/csv"
+
+
+def test_tgg_spreadsheet_job_numbers_extracts_xlsx_and_csv(tmp_path):
+    import tools.pa_business_tools as pbt
+
+    workbook = tmp_path / "jobs.xlsx"
+    _xlsx(
+        workbook,
+        job_numbers=(
+            "AM/JOB/2607/0001",
+            "AM/JOB/2607/0002",
+            "AM/JOB/2607/0001",
+        ),
+    )
+    csv_file = tmp_path / "jobs.csv"
+    csv_file.write_text(
+        "Address,Job Number,Status\n"
+        "One,AM/JOB/2607/0003,Open\n"
+        "Two,not-a-job,Open\n",
+        encoding="utf-8",
+    )
+
+    assert pbt.extract_tgg_spreadsheet_job_numbers(workbook) == [
+        "AM/JOB/2607/0001",
+        "AM/JOB/2607/0002",
+    ]
+    assert pbt.extract_tgg_spreadsheet_job_numbers(csv_file) == [
+        "AM/JOB/2607/0003"
+    ]
+
+
+def test_tgg_spreadsheet_tool_hands_numbers_to_existing_cross_check(
+    tmp_path, monkeypatch
+):
+    import tools.pa_business_tools as pbt
+    import hermes_cli.config as hermes_config
+
+    workbook = tmp_path / "jobs.xlsx"
+    _xlsx(workbook, job_numbers=("AM/JOB/2607/0001", "AM/JOB/2607/0002"))
+    monkeypatch.setattr(
+        hermes_config,
+        "read_raw_config",
+        lambda: {
+            "pa": {"media_retention": {"source_roots": [str(tmp_path)]}}
+        },
+    )
+    result = json.loads(
+        pbt._handle_tgg_spreadsheet_job_numbers({"path": str(workbook)})
+    )
+
+    assert result["jobNumbers"] == [
+        "AM/JOB/2607/0001",
+        "AM/JOB/2607/0002",
+    ]
+    assert "tgg_case_query" in result["next"]
+
+
+def test_tgg_spreadsheet_tool_refuses_path_outside_configured_roots(
+    tmp_path, monkeypatch
+):
+    import tools.pa_business_tools as pbt
+    import hermes_cli.config as hermes_config
+
+    workbook = tmp_path / "outside" / "jobs.xlsx"
+    workbook.parent.mkdir()
+    _xlsx(workbook, job_numbers=("AM/JOB/2607/0001",))
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    monkeypatch.setattr(
+        hermes_config,
+        "read_raw_config",
+        lambda: {
+            "pa": {"media_retention": {"source_roots": [str(allowed)]}}
+        },
+    )
+
+    result = json.loads(
+        pbt._handle_tgg_spreadsheet_job_numbers({"path": str(workbook)})
+    )
+
+    assert result == {
+        "error": (
+            "INVALID_MEDIA_REF: spreadsheet is unavailable or outside "
+            "configured roots"
+        )
+    }
+    assert str(workbook) not in result["error"]
+
+
+def test_tgg_spreadsheet_gate_refuses_oversized_csv_without_full_read(
+    tmp_path, monkeypatch
+):
+    import tools.pa_business_tools as pbt
+
+    csv_file = tmp_path / "huge.csv"
+    csv_file.write_text("Job No.,Status\nAM/JOB/2607/0001,Open\n", encoding="utf-8")
+    real_stat = Path.stat
+
+    class Oversized:
+        st_mode = 0o100644
+        st_size = pbt._TGG_SPREADSHEET_MAX_FILE_BYTES + 1
+
+    monkeypatch.setattr(
+        Path,
+        "stat",
+        lambda self, *args, **kwargs: (
+            Oversized() if self == csv_file else real_stat(self, *args, **kwargs)
+        ),
+    )
+
+    with pytest.raises(ValueError, match="SPREADSHEET_TOO_LARGE"):
+        pbt.validate_tgg_spreadsheet(csv_file, declared_mime="text/csv")
+
+
+@pytest.mark.parametrize("suffix", [".xlsm", ".xltm"])
+def test_tgg_spreadsheet_gate_refuses_macro_enabled_extensions(tmp_path, suffix):
+    import tools.pa_business_tools as pbt
+
+    workbook = tmp_path / f"jobs{suffix}"
+    _xlsx(workbook, macro_enabled=True)
+    with pytest.raises(ValueError, match="UNSUPPORTED_MEDIA_TYPE"):
+        pbt.validate_tgg_spreadsheet(
+            workbook,
+            declared_mime="application/vnd.ms-excel.sheet.macroenabled.12",
+        )
+
+
+def test_tgg_spreadsheet_gate_refuses_macro_payload_renamed_xlsx(tmp_path):
+    import tools.pa_business_tools as pbt
+
+    workbook = tmp_path / "renamed.xlsx"
+    _xlsx(workbook, macro_enabled=True)
+    with pytest.raises(ValueError, match="PROVENANCE_DIVERGENCE"):
+        pbt.validate_tgg_spreadsheet(
+            workbook,
+            declared_mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+
+def test_tgg_spreadsheet_gate_refuses_executable_renamed_xlsx(tmp_path):
+    import tools.pa_business_tools as pbt
+
+    executable = tmp_path / "malware.xlsx"
+    executable.write_bytes(b"MZ" + b"\x00" * 100)
+    with pytest.raises(ValueError, match="PROVENANCE_DIVERGENCE"):
+        pbt.validate_tgg_spreadsheet(
+            executable,
+            declared_mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+
+def test_tgg_spreadsheet_gate_refuses_mime_bytes_mismatch(tmp_path):
+    import tools.pa_business_tools as pbt
+
+    csv_file = tmp_path / "jobs.csv"
+    csv_file.write_text("Job No.,Status\nAM/JOB/2607/0001,Open\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="PROVENANCE_DIVERGENCE"):
+        pbt.validate_tgg_spreadsheet(
+            csv_file,
+            declared_mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+
+def test_tgg_case_photo_provenance_gate_is_unchanged(tmp_path):
+    import tools.pa_business_tools as pbt
+
+    photo = tmp_path / "photo.jpg"
+    _jpeg(photo)
+    with pytest.raises(ValueError, match="PROVENANCE_DIVERGENCE"):
+        pbt._resolve_case_photo(
+            {"ref": "/media/photo.jpg", "mimeType": "image/png"},
+            tmp_path,
+        )
 
 
 def test_tgg_case_photos_resolves_opaque_refs_under_configured_root(
@@ -1619,6 +1893,7 @@ class TestCaseCreateJobNoContract:
         result, captured = self._create(monkeypatch, {
             "address": "Blk 1 Test St #01-01", "problem": "x",
             "reportedJobNo": "PG/JOB/2605/0973",
+            "receivedAt": 1_784_476_800,
         })
         assert captured.get("jobNo") == "PG/JOB/2605/0973"
         assert "reportedJobNo" not in captured
@@ -1636,6 +1911,7 @@ class TestCaseCreateJobNoContract:
         result, captured = self._create(monkeypatch, {
             "address": "Blk 1 Test St #01-01", "problem": "x",
             "confirmNoJobNo": True,
+            "receivedAt": 1_784_476_800,
             "evidence": {"messageText": "previous job SK/JOB/2603/1709 not attended"},
         })
         assert "JOB_NO_OMITTED" not in result
@@ -1658,6 +1934,7 @@ class TestCaseCreateJobNoContract:
         result, captured = self._create(monkeypatch, {
             "address": "Blk 1 Test St #01-01", "problem": "x",
             "confirmNoJobNo": True,
+            "receivedAt": 1_784_476_800,
             "evidence": {"messageText": "tenant reports leak, no job sheet"},
         })
         assert "JOB_NO_REQUIRED" not in result
@@ -1679,5 +1956,131 @@ class TestCaseCreateJobNoContract:
         result, captured = self._create(monkeypatch, {
             "address": "Blk 1 Test St #01-01", "problem": "x",
             "jobNo": "SK/JOB/2605/2564",
+            "receivedAt": 1_784_476_800,
         })
         assert captured.get("jobNo") == "SK/JOB/2605/2564"
+
+    def test_date_only_receipt_is_byte_identical_across_repeat_runs(
+        self, monkeypatch
+    ):
+        args = {
+            "jobNo": "AM/JOB/2607/9901",
+            "address": "Blk 1 Test St #01-01",
+            "problem": "x",
+            "receiptDate": "20 July 2026",
+        }
+        first_result, first = self._create(monkeypatch, args)
+        second_result, second = self._create(monkeypatch, args)
+
+        assert json.loads(first_result)["ok"] is True
+        assert first["receivedAt"] == 1_784_476_800
+        assert first["dueAt"] == 1_787_068_800
+        assert "receiptDate" not in first
+        assert json.dumps(first, sort_keys=True).encode() == json.dumps(
+            second, sort_keys=True
+        ).encode()
+        assert first_result.encode() == second_result.encode()
+
+    def test_invalid_explicit_receipt_date_fails_closed(self, monkeypatch):
+        result, captured = self._create(monkeypatch, {
+            "jobNo": "AM/JOB/2607/9901",
+            "address": "Blk 1 Test St #01-01",
+            "problem": "x",
+            "receivedAt": 1_784_509_200,
+            "receiptDate": "sometime last Monday",
+        })
+        assert "receiptDate must be a date only" in result
+        assert captured == {}
+
+    def test_explicit_receipt_source_precedes_broader_evidence_text(
+        self, monkeypatch
+    ):
+        result, captured = self._create(monkeypatch, {
+            "jobNo": "AM/JOB/2607/9901",
+            "address": "Blk 1 Test St #01-01",
+            "problem": "x",
+            "receiptDate": "20 July 2026",
+            "evidence": {
+                "messageText": "Previous case receipt date: 1 June 2026."
+            },
+        })
+        assert json.loads(result)["ok"] is True
+        assert captured["receivedAt"] == 1_784_476_800
+        assert captured["dueAt"] == 1_787_068_800
+
+    def test_explicit_evidence_receipt_date_overrides_model_epoch(
+        self, monkeypatch
+    ):
+        result, captured = self._create(monkeypatch, {
+            "jobNo": "AM/JOB/2607/9901",
+            "address": "Blk 1 Test St #01-01",
+            "problem": "x",
+            "receivedAt": 1_784_509_200,
+            "evidence": {
+                "receipt_date": "20 July 2026",
+                "messageText": "Previous case receipt date: 1 June 2026.",
+            },
+        })
+        assert json.loads(result)["ok"] is True
+        assert captured["receivedAt"] == 1_784_476_800
+        assert captured["dueAt"] == 1_787_068_800
+
+    def test_generic_case_create_preparation_uses_same_runtime_contract(self):
+        import tools.pa_business_tools as pbt
+
+        prepared = pbt._prepare_case_create_receipt({
+            "receivedAt": 1_784_509_200,
+            "receipt_date": "20 July 2026",
+            "dueAt": 42,
+        })
+        assert isinstance(prepared, dict)
+        assert prepared["receivedAt"] == 1_784_476_800
+        assert prepared["dueAt"] == 1_787_068_800
+        assert "receipt_date" not in prepared
+
+    def test_runtime_overwrites_model_due_at(self, monkeypatch):
+        result, captured = self._create(monkeypatch, {
+            "jobNo": "AM/JOB/2607/9901",
+            "address": "Blk 1 Test St #01-01",
+            "problem": "x",
+            "receiptDate": "20 July 2026",
+            "dueAt": 42,
+        })
+        assert json.loads(result)["ok"] is True
+        assert captured["dueAt"] == 1_787_068_800
+
+    def test_create_requires_epoch_or_date_source(self, monkeypatch):
+        result, captured = self._create(monkeypatch, {
+            "jobNo": "AM/JOB/2607/9901",
+            "address": "Blk 1 Test St #01-01",
+            "problem": "x",
+        })
+        assert "requires receivedAt" in result
+        assert captured == {}
+
+    def test_schema_exposes_receipt_date_without_model_due_at(self):
+        import tools.pa_business_tools as pbt
+
+        parameters = pbt.TGG_CASE_CREATE_SCHEMA["parameters"]
+        assert parameters["properties"]["receiptDate"]["type"] == "string"
+        assert parameters["properties"]["receivedAt"]["type"] == "integer"
+        assert "dueAt" not in parameters["properties"]
+
+    def test_generated_runtime_slots_carry_receipt_date_instruction(self):
+        slots_root = (
+            Path(__file__).parents[1]
+            / "deploy"
+            / "tgg"
+            / "christopher"
+            / "runtime-slots"
+        )
+        for slot in ("gpt-5.4-mini", "gpt-5.6-luna", "gpt-5.6-luna-low"):
+            constitution = yaml.safe_load(
+                (slots_root / slot / "christopher_tgg_constitution.yaml").read_text()
+            )
+            joined = "\n".join(
+                constitution["job_briefs"]["tgg_ops_ingest"]["instructions"]
+            )
+            assert "exact date-only source string in receiptDate" in joined
+            assert "Do not calculate midnight or dueAt" in joined
+            assert "runtime mechanically normalizes receiptDate" in joined

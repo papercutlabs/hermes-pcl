@@ -1,0 +1,8 @@
+531fd40df fix(pa-agent): require explicit source manifest
+ src/commands/pa-agent/__tests__/registration.test.ts |  4 ++++
+ src/commands/pa-agent/bundle.ts                      |  4 ++--
+ src/lib/pa-agent/__tests__/bundle.test.ts            | 19 +++++++++++++++++++
+ src/lib/pa-agent/bundle.ts                           |  2 +-
+ src/lib/pa-agent/manifest-schema.md                  |  2 +-
+ src/lib/pa-agent/manifest.ts                         | 20 ++++++++------------
+ 6 files changed, 35 insertions(+), 16 deletions(-)

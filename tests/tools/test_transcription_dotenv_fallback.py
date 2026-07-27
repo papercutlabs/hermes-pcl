@@ -89,8 +89,12 @@ class TestProviderSelectionGate:
 
         with patch.object(tt, "_HAS_FASTER_WHISPER", False), \
              patch.object(tt, "_has_local_command", return_value=False), \
-             patch("hermes_cli.config.load_env",
-                   return_value={"XAI_API_KEY": "dotenv-secret"}):
+             patch(
+                 "tools.xai_http.get_env_value",
+                 side_effect=lambda name, default=None: (
+                     "dotenv-secret" if name == "XAI_API_KEY" else default
+                 ),
+             ):
             assert tt._get_provider({"enabled": True, "provider": "xai"}) == "xai"
 
     def test_auto_detect_sees_dotenv_groq(self):
@@ -226,16 +230,15 @@ class TestEndToEndRegressionGuard:
             response.json.return_value = {"text": "ok"}
             return response
 
-        with patch("hermes_cli.config.load_env",
-                   return_value={"XAI_API_KEY": "dotenv-secret"}):
-            # Sanity: get_env_value resolves through load_env when
-            # os.environ is empty.
-            from hermes_cli.config import get_env_value as live_get
-            assert live_get("XAI_API_KEY") == "dotenv-secret"
-
-            with patch("requests.post", side_effect=fake_post), \
-                 patch("builtins.open", MagicMock()):
-                result = tt._transcribe_xai("/tmp/fake.mp3", "grok-stt")
+        with patch(
+            "tools.xai_http.get_env_value",
+            side_effect=lambda name, default=None: (
+                "dotenv-secret" if name == "XAI_API_KEY" else default
+            ),
+        ), \
+             patch("requests.post", side_effect=fake_post), \
+             patch("builtins.open", MagicMock()):
+            result = tt._transcribe_xai("/tmp/fake.mp3", "grok-stt")
 
         assert result["success"] is True
         assert captured["headers"]["Authorization"] == "Bearer dotenv-secret"

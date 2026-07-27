@@ -131,7 +131,7 @@ def _is_bare_reaction_row(*, message_kind: str = "", text: str = "", has_media: 
 
 
 def _source_ref_from_bridge_message(message: Mapping[str, Any]) -> str:
-    for key in ("_tgg_source_ref", "source_ref", "sourceRef", "messageId", "message_id", "id"):
+    for key in ("_pa_source_ref", "_tgg_source_ref", "source_ref", "sourceRef", "messageId", "message_id", "id"):
         value = message.get(key)
         if value is not None and str(value):
             return str(value)
@@ -139,7 +139,7 @@ def _source_ref_from_bridge_message(message: Mapping[str, Any]) -> str:
 
 
 def _dedup_key_for_message(message: Mapping[str, Any]) -> str:
-    for key in ("messageId", "message_id", "id", "_tgg_source_ref", "source_ref", "sourceRef"):
+    for key in ("messageId", "message_id", "id", "_pa_source_ref", "_tgg_source_ref", "source_ref", "sourceRef"):
         value = message.get(key)
         if value is not None and str(value):
             return str(value)
@@ -211,8 +211,11 @@ class ReplayCorpus:
             return cls.from_bridge_message_log(
                 db_path,
                 chat_id=source.get("chat_id") or source.get("chatId"),
-                since_sgt=source.get("since_sgt") or source.get("sinceSgt"),
-                until_sgt=source.get("until_sgt") or source.get("untilSgt"),
+                since=source.get("since") or source.get("since_sgt") or source.get("sinceSgt"),
+                until=source.get("until") or source.get("until_sgt") or source.get("untilSgt"),
+                tenant=source.get("tenant"),
+                agent_id=source.get("agent_id") or source.get("agentId") or source.get("agent"),
+                job_type=source.get("job_type") or source.get("jobType"),
                 limit=source.get("limit") or source.get("limit_messages") or source.get("limitMessages"),
                 skip_messages=source.get("skip_messages") or source.get("skipMessages") or 0,
                 media_root=source.get("media_root") or source.get("mediaRoot"),
@@ -256,24 +259,33 @@ class ReplayCorpus:
         db_path: str | Path,
         *,
         chat_id: Any,
-        since_sgt: Any,
-        until_sgt: Any = None,
+        since: Any,
+        tenant: Any,
+        agent_id: Any,
+        job_type: Any,
+        until: Any = None,
         limit: Any = None,
         skip_messages: Any = 0,
         media_root: str | Path | None = None,
     ) -> "ReplayCorpus":
         if not chat_id:
             raise ValueError("bridge_message_log corpus requires chat_id")
-        if not since_sgt:
-            raise ValueError("bridge_message_log corpus requires since_sgt")
+        if not since:
+            raise ValueError("bridge_message_log corpus requires since")
+        if not tenant:
+            raise ValueError("bridge_message_log corpus requires tenant")
+        if not agent_id:
+            raise ValueError("bridge_message_log corpus requires agent_id")
+        if not job_type:
+            raise ValueError("bridge_message_log corpus requires job_type")
         path = Path(db_path).expanduser()
         skip_count = int(skip_messages or 0)
         limit_count = int(limit) if limit is not None and str(limit) != "" else None
         rows, skipped_offset = _load_bridge_message_log_rows(
             path,
             chat_id=str(chat_id),
-            since_sgt=str(since_sgt),
-            until_sgt=str(until_sgt) if until_sgt else None,
+            since_sgt=str(since),
+            until_sgt=str(until) if until else None,
             limit=limit_count,
             skip_messages=skip_count,
         )
@@ -294,7 +306,16 @@ class ReplayCorpus:
                     "message_kind": row.get("message_kind"),
                 })
                 continue
-            messages.append(_bridge_message_from_log_row(row, media_root=media_root_path, report=report))
+            messages.append(
+                _bridge_message_from_log_row(
+                    row,
+                    media_root=media_root_path,
+                    report=report,
+                    tenant=str(tenant),
+                    agent_id=str(agent_id),
+                    job_type=str(job_type),
+                )
+            )
         messages.sort(key=_bridge_sort_key)
         messages, duplicates = _dedup_bridge_messages(messages)
         report["duplicates_skipped"] = duplicates
@@ -302,8 +323,11 @@ class ReplayCorpus:
             "source_type": "bridge_message_log",
             "db_path": str(path),
             "chat_id": str(chat_id),
-            "since_sgt": str(since_sgt),
-            "until_sgt": str(until_sgt) if until_sgt else None,
+            "since": str(since),
+            "until": str(until) if until else None,
+            "tenant": str(tenant),
+            "agent_id": str(agent_id),
+            "job_type": str(job_type),
             "limit_messages": limit_count,
             "skip_messages": skip_count,
         }
@@ -459,7 +483,15 @@ def _media_paths_from_log_refs(refs: list[dict[str, Any]], *, source_ref: str, m
     return paths
 
 
-def _bridge_message_from_log_row(row: Mapping[str, Any], *, media_root: Path | None, report: dict[str, Any]) -> dict[str, Any]:
+def _bridge_message_from_log_row(
+    row: Mapping[str, Any],
+    *,
+    media_root: Path | None,
+    report: dict[str, Any],
+    tenant: str,
+    agent_id: str,
+    job_type: str,
+) -> dict[str, Any]:
     raw = _raw_json(row.get("raw_json"))
     source_ref = str(row.get("source_ref") or "")
     message_id = raw.get("id") or source_ref.rsplit("::", 1)[-1] or source_ref
@@ -493,13 +525,17 @@ def _bridge_message_from_log_row(row: Mapping[str, Any], *, media_root: Path | N
         "quotedText": str(row.get("quoted_text") or ""),
         "quotedMessageId": str(row.get("reply_to_source_ref") or ""),
         "fromMe": bool(raw.get("fromMe", False)),
+        "_pa_source_ref": source_ref,
+        "_pa_local_time": str(row.get("sgt") or ""),
+        # D1-23 (the live WhatsApp renderer) is intentionally outside this
+        # phase. Dual-write its legacy replay keys until that consumer moves.
         "_tgg_source_ref": source_ref,
         "_tgg_sgt": str(row.get("sgt") or ""),
-        "_hermes_pa_job_type": "tgg_ops_ingest",
+        "_hermes_pa_job_type": job_type,
         "_hermes_pa_context": {
-            "tenant": "tgg",
-            "agent_id": "christopher",
-            "job_type": "tgg_ops_ingest",
+            "tenant": tenant,
+            "agent_id": agent_id,
+            "job_type": job_type,
         },
     }
     return bridge

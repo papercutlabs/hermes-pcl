@@ -122,8 +122,10 @@ async def test_streaming_delivery_routes_telegram_flac_media_tag_to_document_sen
     adapter = SimpleNamespace(
         name="test",
         extract_media=BasePlatformAdapter.extract_media,
+        extract_attachment_images=BasePlatformAdapter.extract_attachment_images,
         extract_images=BasePlatformAdapter.extract_images,
         extract_local_files=BasePlatformAdapter.extract_local_files,
+        send_multiple_images=AsyncMock(return_value=SendResult(success=True, message_id="images")),
         send_voice=AsyncMock(return_value=SendResult(success=True, message_id="voice")),
         send_document=AsyncMock(return_value=SendResult(success=True, message_id="doc")),
         send_image_file=AsyncMock(return_value=SendResult(success=True, message_id="image")),
@@ -151,8 +153,10 @@ async def test_streaming_delivery_routes_non_voice_telegram_ogg_media_tag_to_doc
     adapter = SimpleNamespace(
         name="test",
         extract_media=BasePlatformAdapter.extract_media,
+        extract_attachment_images=BasePlatformAdapter.extract_attachment_images,
         extract_images=BasePlatformAdapter.extract_images,
         extract_local_files=BasePlatformAdapter.extract_local_files,
+        send_multiple_images=AsyncMock(return_value=SendResult(success=True, message_id="images")),
         send_voice=AsyncMock(return_value=SendResult(success=True, message_id="voice")),
         send_document=AsyncMock(return_value=SendResult(success=True, message_id="doc")),
         send_image_file=AsyncMock(return_value=SendResult(success=True, message_id="image")),
@@ -182,8 +186,10 @@ async def test_streaming_delivery_routes_telegram_mp3_media_tag_to_voice_sender(
     adapter = SimpleNamespace(
         name="test",
         extract_media=BasePlatformAdapter.extract_media,
+        extract_attachment_images=BasePlatformAdapter.extract_attachment_images,
         extract_images=BasePlatformAdapter.extract_images,
         extract_local_files=BasePlatformAdapter.extract_local_files,
+        send_multiple_images=AsyncMock(return_value=SendResult(success=True, message_id="images")),
         send_voice=AsyncMock(return_value=SendResult(success=True, message_id="voice")),
         send_document=AsyncMock(return_value=SendResult(success=True, message_id="doc")),
         send_image_file=AsyncMock(return_value=SendResult(success=True, message_id="image")),

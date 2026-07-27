@@ -353,7 +353,7 @@ async def test_session_hygiene_messages_stay_in_originating_topic(monkeypatch, t
     runner._pending_approvals = {}
     runner._session_db = None
     runner._is_user_authorized = lambda _source: True
-    runner._set_session_env = lambda _context: None
+    runner._set_session_env = lambda _context, event=None: None
     runner._run_agent = AsyncMock(
         return_value={
             "final_response": "ok",
@@ -460,7 +460,7 @@ async def test_session_hygiene_warns_user_when_summary_generation_fails(monkeypa
     runner._pending_approvals = {}
     runner._session_db = None
     runner._is_user_authorized = lambda _source: True
-    runner._set_session_env = lambda _context: None
+    runner._set_session_env = lambda _context, event=None: None
     runner._run_agent = AsyncMock(
         return_value={
             "final_response": "ok",
@@ -579,7 +579,7 @@ async def test_session_hygiene_informs_user_when_aux_model_fails_but_recovers(mo
     runner._pending_approvals = {}
     runner._session_db = None
     runner._is_user_authorized = lambda _source: True
-    runner._set_session_env = lambda _context: None
+    runner._set_session_env = lambda _context, event=None: None
     runner._run_agent = AsyncMock(
         return_value={
             "final_response": "ok",
@@ -708,7 +708,7 @@ async def test_session_hygiene_honors_configurable_hard_message_limit(
     runner._pending_approvals = {}
     runner._session_db = None
     runner._is_user_authorized = lambda _source: True
-    runner._set_session_env = lambda _context: None
+    runner._set_session_env = lambda _context, event=None: None
     runner._run_agent = AsyncMock(
         return_value={
             "final_response": "ok",
@@ -811,7 +811,7 @@ async def test_session_hygiene_default_hard_message_limit_does_not_fire_at_12_me
     runner._pending_approvals = {}
     runner._session_db = None
     runner._is_user_authorized = lambda _source: True
-    runner._set_session_env = lambda _context: None
+    runner._set_session_env = lambda _context, event=None: None
     runner._run_agent = AsyncMock(
         return_value={
             "final_response": "ok",

@@ -7,7 +7,45 @@ import types
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from tui_gateway import server
+
+
+@pytest.fixture(autouse=True)
+def _stop_tui_notification_watchers(monkeypatch):
+    """Prevent TUI session pollers from consuming later tests' global events."""
+    # Keep the actual registry object: a failure-path test temporarily replaces
+    # server._sessions with an exploding mapping, and monkeypatch restores it
+    # only after this fixture's teardown runs.
+    sessions = server._sessions
+    original_start = server._start_notification_poller
+    started = []
+
+    def tracked_start(*args, **kwargs):
+        stop = original_start(*args, **kwargs)
+        started.append(stop)
+        return stop
+
+    monkeypatch.setattr(server, "_start_notification_poller", tracked_start)
+    yield
+    for session in list(sessions.values()):
+        server._finalize_session(session)
+    for stop in started:
+        stop.set()
+    for stop in started:
+        thread = getattr(stop, "_thread", None)
+        if thread is not None and hasattr(thread, "join"):
+            thread.join(timeout=1.0)
+        if thread is not None and hasattr(thread, "is_alive"):
+            assert not thread.is_alive(), f"TUI notification poller leaked: {thread.name}"
+    sessions.clear()
+    leaked = [
+        thread.name
+        for thread in threading.enumerate()
+        if thread.name.startswith("hermes-tui-notification-")
+    ]
+    assert not leaked, f"TUI notification pollers leaked: {leaked}"
 
 
 class _ChunkyStdout:
@@ -401,10 +439,11 @@ def test_load_enabled_toolsets_rejects_disabled_mcp_env(monkeypatch, capsys):
         config_mod, "load_config", lambda: {"platform_toolsets": {"cli": ["memory"]}}
     )
 
-    # Sorted: ["kanban", "memory"]. `kanban` is auto-recovered by
-    # _get_platform_tools because it's a non-configurable platform toolset
+    # Sorted: ["inter_session", "kanban", "memory"]. The two base toolsets
+    # are auto-recovered by _get_platform_tools because they are
+    # non-configurable platform toolsets
     # whose tools live in hermes-cli's universe (see toolsets.py).
-    assert server._load_enabled_toolsets() == ["kanban", "memory"]
+    assert server._load_enabled_toolsets() == ["inter_session", "kanban", "memory"]
     err = capsys.readouterr().err
     assert "ignoring disabled MCP servers" in err
     assert "mcp-off" in err
@@ -425,7 +464,7 @@ def test_load_enabled_toolsets_falls_back_when_tui_env_invalid(monkeypatch, caps
         config_mod, "load_config", lambda: {"platform_toolsets": {"cli": ["memory"]}}
     )
 
-    assert server._load_enabled_toolsets() == ["kanban", "memory"]
+    assert server._load_enabled_toolsets() == ["inter_session", "kanban", "memory"]
     assert "using configured CLI toolsets" in capsys.readouterr().err
 
 

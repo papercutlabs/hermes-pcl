@@ -25,7 +25,6 @@ from gateway.replay import ReplayPlan, canonical_digest, canonical_json
 
 
 RUN_MANIFEST_VERSION = 1
-PROVIDER_CONFIRM_PROMOTE = "SWAP_TGG_TARGET"
 NON_DELIVERING_REPLAY_DELIVERY_MODES = {"capture", "drop"}
 
 
@@ -70,6 +69,15 @@ def _sha256_hex_manifest(value: Any) -> str:
 
 def _safe_id_part(value: str) -> str:
     return "".join(ch if ch.isalnum() or ch in "_.:-" else "-" for ch in value)
+
+
+def tenant_confirmation_token(prefix: str, tenant: str) -> str:
+    normalized = "".join(
+        ch if ch.isalnum() else "_" for ch in str(tenant).strip().upper()
+    ).strip("_")
+    if not normalized:
+        raise ValueError("tenant is required")
+    return f"{prefix}_{normalized}_TARGET"
 
 
 def mint_replay_run_id(prefix: str = "pa-replay") -> str:
@@ -210,7 +218,7 @@ class CheckResult:
 class ReplayTargetProviderConfig:
     provider_url: str
     admin_token: str
-    tenant: str = "tgg"
+    tenant: str
     timeout_seconds: float = 30.0
 
 
@@ -222,6 +230,8 @@ class ReplayTargetProviderClient:
             raise ValueError("provider_url is required")
         if not config.admin_token:
             raise ValueError("provider admin token is required")
+        if not config.tenant:
+            raise ValueError("tenant is required")
         self.config = config
 
     def _url(self, path: str, *, query: Mapping[str, Any] | None = None) -> str:
@@ -343,7 +353,9 @@ class ReplayTargetProviderClient:
                     "runId": run_id,
                     "targetDataDir": target_data_dir,
                     "prodDataDir": prod_data_dir,
-                    "confirm": PROVIDER_CONFIRM_PROMOTE,
+                    "confirm": tenant_confirmation_token(
+                        "SWAP", self.config.tenant
+                    ),
                 },
             )
         )
@@ -1169,7 +1181,7 @@ def provider_config_from_env(
     *,
     provider_url: str | None = None,
     admin_token: str | None = None,
-    tenant: str = "tgg",
+    tenant: str,
     timeout_seconds: float = 30.0,
 ) -> ReplayTargetProviderConfig:
     return ReplayTargetProviderConfig(
@@ -1180,6 +1192,6 @@ def provider_config_from_env(
         admin_token=admin_token
         or os.environ.get("PS_REPLAY_PROVIDER_ADMIN_TOKEN")
         or "",
-        tenant=tenant,
+        tenant=str(tenant or "").strip(),
         timeout_seconds=timeout_seconds,
     )

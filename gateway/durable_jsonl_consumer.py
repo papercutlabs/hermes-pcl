@@ -27,10 +27,12 @@ import sqlite3
 import sys
 import time
 import uuid
+from collections import Counter
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
+from zoneinfo import ZoneInfo
 
 import yaml
 
@@ -109,6 +111,10 @@ class ConsumerError(RuntimeError):
 
 class MediaRetentionError(ConsumerError):
     """Retryable failure before a claimed event reaches the model."""
+
+
+class PermanentMediaRefusal(ConsumerError):
+    """Terminal safety refusal that may reach the model as a refused attachment."""
 
 
 def _utc_now() -> str:
@@ -259,6 +265,26 @@ def _bridge_item(value: Any) -> dict[str, Any]:
     raise ConsumerError("durable JSONL record has no bridge messageId/chatId item")
 
 
+def _declared_document_mime(value: Any) -> str:
+    """Recover the provider-declared document MIME before normalizing the event."""
+    if not isinstance(value, Mapping):
+        return ""
+    document = value.get("documentMessage")
+    if isinstance(document, Mapping):
+        return str(
+            document.get("mimetype")
+            or document.get("mimeType")
+            or document.get("contentType")
+            or ""
+        ).split(";", 1)[0].strip().lower()
+    for nested in value.values():
+        if isinstance(nested, Mapping):
+            mime = _declared_document_mime(nested)
+            if mime:
+                return mime
+    return ""
+
+
 @dataclass(frozen=True)
 class InboxRecord:
     seq: int
@@ -270,22 +296,40 @@ class InboxRecord:
 
 
 def _initial_retention_state(item: Mapping[str, Any]) -> str:
-    """Classify obvious non-images without doing any retention I/O."""
+    """Classify media that needs content validation before model ingress."""
     coarse = str(item.get("mediaType") or item.get("mimeType") or "")
     if coarse.split("/", 1)[0].strip().lower() == "image":
         return "pending"
     values = item.get("mediaUrls") or item.get("media") or item.get("mediaPaths") or []
+    declared_mimes = item.get("mediaMimes") or []
+    if isinstance(declared_mimes, (str, bytes)):
+        declared_mimes = [declared_mimes]
     if isinstance(values, Mapping):
         values = [values]
     if isinstance(values, Sequence) and not isinstance(values, (str, bytes)):
-        for value in values:
-            if not isinstance(value, Mapping):
-                continue
-            mime = str(
-                value.get("mime") or value.get("mimeType")
-                or value.get("contentType") or ""
-            )
+        for index, value in enumerate(values):
+            mime = ""
+            if isinstance(value, Mapping):
+                mime = str(
+                    value.get("mime") or value.get("mimeType")
+                    or value.get("contentType") or ""
+                )
+            elif index < len(declared_mimes):
+                mime = str(declared_mimes[index] or "")
             if mime.split("/", 1)[0].strip().lower() == "image":
+                return "pending"
+            suffix = Path(
+                str(
+                    value.get("path")
+                    or value.get("filePath")
+                    or value.get("localPath")
+                    or value.get("url")
+                    or ""
+                )
+                if isinstance(value, Mapping)
+                else str(value or "")
+            ).suffix.lower()
+            if suffix in {".xlsx", ".csv", ".xlsm", ".xltm"}:
                 return "pending"
     return "bypassed"
 
@@ -485,6 +529,9 @@ class DurableInbox:
                         f"invalid JSONL at byte {start}: {exc.msg}"
                     ) from exc
                 item = _bridge_item(decoded)
+                declared_document_mime = _declared_document_mime(decoded)
+                if declared_document_mime and len(item.get("mediaUrls") or []) == 1:
+                    item["mediaMimes"] = [declared_document_mime]
                 message_id = str(item["messageId"])
                 staged.append((start, end, item))
                 last_message_id = message_id
@@ -645,6 +692,101 @@ class DurableInbox:
             if _record_ingress_timestamp(record) >= cutoff.astimezone(timezone.utc):
                 selected.append(record)
         return selected
+
+    def message_id_selection(self, message_ids: Sequence[str]) -> list[InboxRecord]:
+        """Return an exact existing-inbox message-id set, FIFO, with no claims."""
+        wanted = tuple(dict.fromkeys(str(value).strip() for value in message_ids if str(value).strip()))
+        if not wanted:
+            raise ConsumerError("bounded replay message-id selection is empty")
+        placeholders = ",".join("?" for _ in wanted)
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT seq,message_id,chat_id,start_offset,end_offset,raw_json "
+                f"FROM ingress_events WHERE message_id IN ({placeholders}) ORDER BY seq",
+                wanted,
+            ).fetchall()
+        found = {str(row["message_id"]) for row in rows}
+        missing = [value for value in wanted if value not in found]
+        if missing:
+            raise ConsumerError(
+                "bounded replay message ids missing from inbox: " + ",".join(missing[:10])
+            )
+        if len(rows) != len(wanted):
+            raise ConsumerError("bounded replay message-id selection is not one-to-one")
+        return [
+            InboxRecord(
+                seq=int(row["seq"]), message_id=str(row["message_id"]),
+                chat_id=str(row["chat_id"]), start_offset=int(row["start_offset"]),
+                end_offset=int(row["end_offset"]), raw=json.loads(row["raw_json"]),
+            )
+            for row in rows
+        ]
+
+    def requeue_selected_for_readjudication(
+        self,
+        records: Sequence[InboxRecord],
+        *,
+        before_image_path: Path,
+        run_id: str,
+        dry_run: bool,
+    ) -> dict[str, Any]:
+        """CAS-reset an exact selected set to pending with a durable before-image."""
+        if not records:
+            raise ConsumerError("readjudication reset requires selected records")
+        seqs = [record.seq for record in records]
+        placeholders = ",".join("?" for _ in seqs)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM ingress_events WHERE seq IN ({placeholders}) "
+                "ORDER BY seq",
+                seqs,
+            ).fetchall()
+        before = [dict(row) for row in rows]
+        if len(before) != len(records):
+            raise ConsumerError("readjudication before-image denominator mismatch")
+        processing = [row["message_id"] for row in before if row["status"] == "processing"]
+        if processing:
+            raise ConsumerError(
+                "readjudication refuses selected processing rows: "
+                + ",".join(str(value) for value in processing[:10])
+            )
+        image = {
+            "artifact_type": "tgg_readjudication_inbox_before_image",
+            "run_id": run_id,
+            "created_at": _utc_now(),
+            "selected_count": len(before),
+            "rows": before,
+        }
+        if not dry_run:
+            _atomic_write_json(before_image_path, image)
+            now = _utc_now()
+            with self.connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                changed = 0
+                for row in before:
+                    result = conn.execute(
+                        "UPDATE ingress_events SET status='pending',pa_turn_id=NULL,"
+                        "last_error=?,updated_at=? WHERE seq=? AND status=?",
+                        (
+                            f"readjudication:{run_id}", now,
+                            int(row["seq"]), str(row["status"]),
+                        ),
+                    )
+                    changed += int(result.rowcount)
+                if changed != len(before):
+                    conn.rollback()
+                    raise ConsumerError(
+                        "readjudication CAS reset mismatch: "
+                        f"expected={len(before)} changed={changed}"
+                    )
+                conn.commit()
+        return {
+            "selected": len(before),
+            "status_before": dict(Counter(str(row["status"]) for row in before)),
+            "cas_updated": 0 if dry_run else len(before),
+            "before_image": str(before_image_path),
+            "dry_run": dry_run,
+        }
 
     def window_statuses(self, records: Sequence[InboxRecord]) -> dict[str, str]:
         if not records:
@@ -943,6 +1085,7 @@ class DurableInbox:
         *,
         retained: int | None = None,
         bypassed: bool = False,
+        refusal: str | None = None,
         error: str | None = None,
     ) -> None:
         now = _utc_now()
@@ -961,9 +1104,15 @@ class DurableInbox:
             changed = conn.execute(
                 "UPDATE ingress_events SET retention_state=?,"
                 "retained_media_count=?,retention_attempts=retention_attempts+1,"
-                "retention_last_error=NULL,retention_updated_at=? "
+                "retention_last_error=?,retention_updated_at=? "
                 "WHERE seq=? AND retention_state IN ('pending','held')",
-                (state, max(0, int(retained or 0)), now, record.seq),
+                (
+                    state,
+                    max(0, int(retained or 0)),
+                    (refusal or "")[:2000] if refusal else None,
+                    now,
+                    record.seq,
+                ),
             ).rowcount
             if changed == 0:
                 row = conn.execute(
@@ -1268,17 +1417,66 @@ def _event_media(item: Mapping[str, Any]) -> list[tuple[Any, str | None]]:
     result: list[tuple[Any, str | None]] = []
     event_mime = item.get("mediaType") or item.get("mimeType")
     event_kind = str(event_mime or "").split("/", 1)[0].strip().lower()
-    if event_kind != "image":
-        return []
-    for value in values:
+    declared_mimes = item.get("mediaMimes") or []
+    if isinstance(declared_mimes, (str, bytes)):
+        declared_mimes = [declared_mimes]
+    for index, value in enumerate(values):
         mime = (
             value.get("mime") or value.get("mimeType") or value.get("contentType")
-            if isinstance(value, Mapping) else event_mime
+            if isinstance(value, Mapping)
+            else (
+                declared_mimes[index]
+                if index < len(declared_mimes)
+                else event_mime
+            )
         )
+        if not mime and event_kind == "image":
+            mime = event_mime
         declared = str(mime) if mime else None
         kind = str(declared or "").split("/", 1)[0].strip().lower()
         if kind != "image":
             continue
+        result.append((value, declared))
+    return result
+
+
+def _event_spreadsheets(item: Mapping[str, Any]) -> list[tuple[Any, str]]:
+    """Return spreadsheet-like documents with their provider-declared MIME."""
+    values = item.get("mediaUrls") or item.get("media") or item.get("mediaPaths") or []
+    if isinstance(values, (str, bytes, Mapping)):
+        values = [values]
+    if not isinstance(values, Sequence):
+        raise MediaRetentionError("event media collection is not a list")
+    declared_mimes = item.get("mediaMimes") or []
+    if isinstance(declared_mimes, (str, bytes)):
+        declared_mimes = [declared_mimes]
+    result: list[tuple[Any, str]] = []
+    for index, value in enumerate(values):
+        raw_path = (
+            value.get("path")
+            or value.get("filePath")
+            or value.get("localPath")
+            or value.get("url")
+            if isinstance(value, Mapping)
+            else value
+        )
+        suffix = Path(str(raw_path or "")).suffix.lower()
+        if suffix not in {".xlsx", ".csv", ".xlsm", ".xltm"}:
+            continue
+        declared = ""
+        if isinstance(value, Mapping):
+            declared = str(
+                value.get("mime")
+                or value.get("mimeType")
+                or value.get("contentType")
+                or ""
+            )
+        if not declared and index < len(declared_mimes):
+            declared = str(declared_mimes[index] or "")
+        if not declared:
+            raise PermanentMediaRefusal(
+                "PROVENANCE_DIVERGENCE: spreadsheet has no provider-declared MIME"
+            )
         result.append((value, declared))
     return result
 
@@ -1341,6 +1539,23 @@ def _retain_record_media_impl(
     if config is None:
         return {"retained": 0, "bytes": 0, "operation": False}
     item = _bridge_item(record.raw)
+    spreadsheets = _event_spreadsheets(item)
+    if spreadsheets:
+        from tools.pa_business_tools import validate_tgg_spreadsheet
+
+        for raw_path, declared_mime in spreadsheets:
+            source = _contained_existing_file(raw_path, config["source_roots"])
+            try:
+                validate_tgg_spreadsheet(source, declared_mime=declared_mime)
+            except ValueError as exc:
+                raise PermanentMediaRefusal(str(exc)) from exc
+        if not _event_media(item):
+            return {
+                "retained": 0,
+                "bytes": 0,
+                "operation": False,
+                "validated_spreadsheets": len(spreadsheets),
+            }
     media = _event_media(item)
     if not media:
         coarse_kind = str(
@@ -1453,6 +1668,16 @@ def ensure_record_media_retained(
         return durable
     try:
         result = retain_record_media(record, config_path=config_path)
+    except PermanentMediaRefusal as exc:
+        refusal = f"media-refused: {exc}"
+        inbox.record_retention(record, bypassed=True, refusal=refusal)
+        return {
+            "retained": 0,
+            "bytes": 0,
+            "operation": False,
+            "refused": True,
+            "reason": str(exc),
+        }
     except MediaRetentionError as exc:
         inbox.record_retention(record, error=f"media-retention-retry: {exc}")
         raise
@@ -2889,6 +3114,79 @@ def assert_bounded_selection(
             )
 
 
+def assert_message_id_selection(
+    records: Sequence[InboxRecord], *, expected_message_ids: Sequence[str],
+    expected_total: int,
+) -> None:
+    expected = tuple(dict.fromkeys(str(value).strip() for value in expected_message_ids if str(value).strip()))
+    actual = tuple(record.message_id for record in records)
+    if len(actual) != expected_total:
+        raise ConsumerError(
+            "bounded replay denominator mismatch: "
+            f"expected={expected_total} selected={len(actual)}"
+        )
+    if len(set(actual)) != len(actual):
+        raise ConsumerError("bounded replay selection contains duplicate message ids")
+    if set(actual) != set(expected):
+        raise ConsumerError("bounded replay exact message-id selection mismatch")
+
+
+def _read_id_file(path: Path) -> list[str]:
+    if not path.is_file():
+        raise ConsumerError(f"bounded replay id file is missing: {path}")
+    values = [line.strip() for line in path.read_text(encoding="utf-8").splitlines()]
+    return list(dict.fromkeys(value for value in values if value and not value.startswith("#")))
+
+
+def _read_message_groups(
+    path: Path, *, records: Sequence[InboxRecord]
+) -> list[tuple[str, list[InboxRecord]]]:
+    """Load a prior-turn grouping without changing the selected message set."""
+    if not path.is_file():
+        raise ConsumerError(f"bounded replay message-group file is missing: {path}")
+    by_id = {record.message_id: record for record in records}
+    groups: list[tuple[str, list[InboxRecord]]] = []
+    seen: set[str] = set()
+    for line_no, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ConsumerError(
+                f"bounded replay message-group JSON invalid at line {line_no}"
+            ) from exc
+        ids = [str(value).strip() for value in payload.get("message_ids") or []]
+        if not ids:
+            raise ConsumerError(f"bounded replay message-group {line_no} is empty")
+        duplicate = [value for value in ids if value in seen]
+        if duplicate:
+            raise ConsumerError(
+                f"bounded replay message-group duplicates message id {duplicate[0]}"
+            )
+        missing = [value for value in ids if value not in by_id]
+        if missing:
+            raise ConsumerError(
+                f"bounded replay message-group references unselected id {missing[0]}"
+            )
+        batch = [by_id[value] for value in ids]
+        chat_ids = {record.chat_id for record in batch}
+        declared_chat = str(payload.get("chat_id") or "")
+        if len(chat_ids) != 1 or (declared_chat and declared_chat not in chat_ids):
+            raise ConsumerError(
+                f"bounded replay message-group {line_no} crosses or misstates chat"
+            )
+        groups.append((next(iter(chat_ids)), batch))
+        seen.update(ids)
+    if seen != set(by_id):
+        omitted = sorted(set(by_id) - seen)
+        raise ConsumerError(
+            "bounded replay message-group partition omitted selected ids: "
+            + ",".join(omitted[:10])
+        )
+    return groups
+
+
 def assert_no_window_orphans(statuses: Mapping[str, str]) -> None:
     remaining = sum(1 for value in statuses.values() if value == "processing")
     if remaining:
@@ -2942,13 +3240,13 @@ def _business_audit_delta(path: Path, *, after_rowid: int) -> list[dict[str, Any
         if not exists:
             return []
         rows = conn.execute(
-            "SELECT rowid,id,action,target_kind,target_id,source_surface,ts "
+            "SELECT rowid AS audit_rowid,id,action,target_kind,target_id,source_surface,ts "
             "FROM ps_audit_log WHERE rowid>? ORDER BY rowid",
             (int(after_rowid),),
         ).fetchall()
         return [
             {
-                "rowid": int(row["rowid"]),
+                "rowid": int(row["audit_rowid"]),
                 "id": str(row["id"]),
                 "action": str(row["action"]),
                 "target_kind": str(row["target_kind"]),
@@ -2962,6 +3260,275 @@ def _business_audit_delta(path: Path, *, after_rowid: int) -> list[dict[str, Any
         conn.close()
 
 
+def _inject_bounded_source_evidence(
+    case_db: Path,
+    records: Sequence[InboxRecord],
+    *,
+    before_image_path: Path,
+    run_id: str,
+    dry_run: bool,
+) -> dict[str, Any]:
+    """Make exact bounded inbox rows citable by the Systems job-number gate.
+
+    The capture inbox is the durable source for these rows, while Systems' citation
+    gate reads ``bridge_message_log``.  This message-id-scoped convergence copies
+    only the selected source documents and records the complete pre-mutation image.
+    Existing identical source refs are preserved; divergent identities fail closed.
+    """
+    conn = sqlite3.connect(case_db)
+    conn.row_factory = sqlite3.Row
+    try:
+        columns = [
+            str(row[1])
+            for row in conn.execute("PRAGMA table_info(bridge_message_log)")
+        ]
+        required = {
+            "local_id", "source", "source_ref", "chat_jid", "chat_name",
+            "zone", "channel_type", "sender_id", "from_me", "ts", "sgt",
+            "text", "message_kind", "has_media", "media_refs", "quoted_text",
+            "reply_to_source_ref", "raw_json",
+        }
+        if not required.issubset(columns):
+            raise ConsumerError("bridge_message_log schema cannot accept source evidence")
+
+        refs = [record.message_id for record in records]
+        if len(refs) != len(set(refs)):
+            raise ConsumerError("bounded source evidence contains duplicate message ids")
+        existing: dict[str, dict[str, Any]] = {}
+        if refs:
+            placeholders = ",".join("?" for _ in refs)
+            for row in conn.execute(
+                f"SELECT * FROM bridge_message_log WHERE source_ref IN ({placeholders})",
+                refs,
+            ):
+                existing[str(row["source_ref"])] = dict(row)
+        _atomic_write_json(
+            before_image_path,
+            {
+                "artifact_type": "tgg_bounded_source_evidence_before_image",
+                "run_id": run_id,
+                "created_at": _utc_now(),
+                "selected_message_ids": refs,
+                "existing_rows": list(existing.values()),
+            },
+        )
+
+        rows: list[tuple[Any, ...]] = []
+        skipped = 0
+        sgt_zone = ZoneInfo("Asia/Singapore")
+        for record in records:
+            item = _bridge_item(record.raw)
+            raw_message_id = str(item.get("messageId") or "")
+            raw_chat_id = str(item.get("chatId") or "")
+            if raw_message_id != record.message_id or raw_chat_id != record.chat_id:
+                raise ConsumerError(
+                    "bounded source evidence identity diverges from inbox selection"
+                )
+            raw_json = json.dumps(record.raw, ensure_ascii=False, sort_keys=True)
+            prior = existing.get(record.message_id)
+            if prior is not None:
+                if str(prior.get("chat_jid")) != record.chat_id:
+                    raise ConsumerError(
+                        f"source evidence conflict for {record.message_id}"
+                    )
+                skipped += 1
+                continue
+            timestamp = int(_record_ingress_timestamp(record).timestamp())
+            sgt = datetime.fromtimestamp(timestamp, tz=sgt_zone).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+            media_refs = item.get("mediaUrls") or item.get("media") or []
+            if isinstance(media_refs, (str, bytes, Mapping)):
+                media_refs = [media_refs]
+            rows.append(
+                (
+                    "whatsapp-capture",
+                    record.message_id,
+                    record.chat_id,
+                    str(item.get("chatName") or record.chat_id),
+                    "",
+                    "group" if bool(item.get("isGroup", record.chat_id.endswith("@g.us"))) else "direct",
+                    str(item.get("senderId") or "") or None,
+                    int(bool(item.get("fromMe"))),
+                    timestamp,
+                    sgt,
+                    str(item.get("body") or item.get("text") or ""),
+                    str(item.get("mediaType") or ("media" if item.get("hasMedia") else "text")),
+                    int(bool(item.get("hasMedia") or media_refs)),
+                    json.dumps(list(media_refs), ensure_ascii=False, sort_keys=True),
+                    str(item.get("quotedText") or ""),
+                    str(item.get("quotedMessageId") or "") or None,
+                    raw_json,
+                )
+            )
+        if not dry_run and rows:
+            with conn:
+                conn.executemany(
+                    """
+                    INSERT INTO bridge_message_log
+                      (source,source_ref,chat_jid,chat_name,zone,channel_type,
+                       sender_id,from_me,ts,sgt,text,message_kind,has_media,
+                       media_refs,quoted_text,reply_to_source_ref,raw_json)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    rows,
+                )
+        return {
+            "selected": len(records),
+            "inserted": 0 if dry_run else len(rows),
+            "would_insert": len(rows),
+            "already_present": skipped,
+            "before_image": str(before_image_path),
+            "dry_run": dry_run,
+        }
+    finally:
+        conn.close()
+
+
+def _read_int_id_file(path: Path) -> list[int]:
+    values = _read_id_file(path)
+    try:
+        ids = [int(value) for value in values]
+    except ValueError as exc:
+        raise ConsumerError(f"draft id file contains a non-integer: {path}") from exc
+    if any(value <= 0 for value in ids):
+        raise ConsumerError(f"draft id file contains a non-positive id: {path}")
+    return ids
+
+
+def _transition_readjudication_drafts(
+    case_db: Path,
+    *,
+    readjudicated_ids: Sequence[int],
+    pending_manager_ids: Sequence[int],
+    manager_chat_id: str,
+    before_image_path: Path,
+    run_id: str,
+    dry_run: bool,
+    source_state: str = "draft",
+) -> dict[str, Any]:
+    """Close stale drafts or hold them for the manager, with row-level audit."""
+    readjudicated = tuple(dict.fromkeys(int(value) for value in readjudicated_ids))
+    pending_manager = tuple(dict.fromkeys(int(value) for value in pending_manager_ids))
+    if set(readjudicated) & set(pending_manager):
+        raise ConsumerError("readjudicated and pending-manager draft ids overlap")
+    all_ids = readjudicated + pending_manager
+    if not all_ids:
+        return {"readjudicated": 0, "pending_manager": 0, "dry_run": dry_run}
+    if not manager_chat_id.strip():
+        raise ConsumerError("manager chat id is required for pending-manager drafts")
+
+    uri = f"file:{case_db}?mode=ro" if dry_run else str(case_db)
+    conn = sqlite3.connect(uri, uri=dry_run)
+    conn.row_factory = sqlite3.Row
+    try:
+        placeholders = ",".join("?" for _ in all_ids)
+        rows = conn.execute(
+            f"SELECT * FROM draft_outbound WHERE id IN ({placeholders}) ORDER BY id",
+            all_ids,
+        ).fetchall()
+        if len(rows) != len(all_ids):
+            found = {int(row["id"]) for row in rows}
+            raise ConsumerError(
+                f"draft transition denominator mismatch: missing={sorted(set(all_ids) - found)}"
+            )
+        wrong_state = [
+            int(row["id"]) for row in rows if str(row["state"]) != source_state
+        ]
+        if wrong_state:
+            raise ConsumerError(
+                f"draft transition refuses rows outside {source_state}: {wrong_state}"
+            )
+        before = [dict(row) for row in rows]
+        before_payload = {
+            "version": 1,
+            "run_id": run_id,
+            "case_db": str(case_db),
+            "captured_at": _utc_now(),
+            "draft_outbound": before,
+            "planned": {
+                "readjudicated": list(readjudicated),
+                "pending_manager": list(pending_manager),
+                "manager_chat_id": manager_chat_id,
+            },
+        }
+        if dry_run:
+            return {
+                "readjudicated": len(readjudicated),
+                "pending_manager": len(pending_manager),
+                "dry_run": True,
+            }
+
+        _atomic_write_json(before_image_path, before_payload)
+        now = int(time.time())
+        before_by_id = {int(row["id"]): dict(row) for row in rows}
+        with conn:
+            for draft_id in readjudicated:
+                changed = conn.execute(
+                    "UPDATE draft_outbound SET state='readjudicated',recipient=NULL,updated_at=? "
+                    "WHERE id=? AND state=?",
+                    (now, draft_id, source_state),
+                ).rowcount
+                if changed != 1:
+                    raise ConsumerError(f"draft {draft_id} readjudication CAS failed")
+                after = dict(
+                    conn.execute(
+                        "SELECT * FROM draft_outbound WHERE id=?", (draft_id,)
+                    ).fetchone()
+                )
+                conn.execute(
+                    "INSERT INTO ps_audit_log "
+                    "(tenant_slug,actor_kind,actor,action,target_kind,target_id,"
+                    "before_json,after_json,source_surface,summary,ts) "
+                    "VALUES ('tgg','agent','christopher','clarification.readjudicated',"
+                    "'draft_outbound',?,?,?,?,?,?)",
+                    (
+                        str(draft_id),
+                        json.dumps(before_by_id[draft_id], sort_keys=True),
+                        json.dumps(after, sort_keys=True),
+                        f"bounded-backplay:{run_id}",
+                        "stale clarification closed after amended-constitution readjudication",
+                        now,
+                    ),
+                )
+            for draft_id in pending_manager:
+                changed = conn.execute(
+                    "UPDATE draft_outbound SET state='pending_manager',recipient=?,updated_at=? "
+                    "WHERE id=? AND state=?",
+                    (manager_chat_id, now, draft_id, source_state),
+                ).rowcount
+                if changed != 1:
+                    raise ConsumerError(f"draft {draft_id} pending-manager CAS failed")
+                after = dict(
+                    conn.execute(
+                        "SELECT * FROM draft_outbound WHERE id=?", (draft_id,)
+                    ).fetchone()
+                )
+                conn.execute(
+                    "INSERT INTO ps_audit_log "
+                    "(tenant_slug,actor_kind,actor,action,target_kind,target_id,"
+                    "before_json,after_json,source_surface,summary,ts) "
+                    "VALUES ('tgg','agent','christopher','clarification.pending_manager',"
+                    "'draft_outbound',?,?,?,?,?,?)",
+                    (
+                        str(draft_id),
+                        json.dumps(before_by_id[draft_id], sort_keys=True),
+                        json.dumps(after, sort_keys=True),
+                        f"bounded-backplay:{run_id}",
+                        "excluded from auto-create; awaiting manager clarification",
+                        now,
+                    ),
+                )
+        return {
+            "readjudicated": len(readjudicated),
+            "pending_manager": len(pending_manager),
+            "dry_run": False,
+            "before_image": str(before_image_path),
+        }
+    finally:
+        conn.close()
+
+
 async def run_bounded_backplay(args: argparse.Namespace) -> int:
     """One-shot, capture-only execution over an existing inbox window."""
     dry_run = bool(args.dry_run)
@@ -2970,8 +3537,25 @@ async def run_bounded_backplay(args: argparse.Namespace) -> int:
     case_db = Path(args.case_db).resolve()
     config_path = Path(args.config).resolve()
     audit_path = Path(args.audit).resolve()
-    chat_ids = tuple(dict.fromkeys(str(value) for value in args.chat_id))
-    cutoff = _parse_ingress_timestamp(args.cutoff)
+    chat_ids = tuple(dict.fromkeys(str(value) for value in (args.chat_id or ())))
+    message_id_file = getattr(args, "message_id_file", None)
+    exact_message_ids = (
+        _read_id_file(Path(message_id_file).resolve()) if message_id_file else []
+    )
+    readjudicated_draft_file = getattr(args, "readjudicated_draft_id_file", None)
+    pending_manager_draft_file = getattr(args, "pending_manager_draft_id_file", None)
+    message_group_file = getattr(args, "message_group_file", None)
+    readjudicated_draft_ids = (
+        _read_int_id_file(Path(readjudicated_draft_file).resolve())
+        if readjudicated_draft_file
+        else []
+    )
+    pending_manager_draft_ids = (
+        _read_int_id_file(Path(pending_manager_draft_file).resolve())
+        if pending_manager_draft_file
+        else []
+    )
+    cutoff = _parse_ingress_timestamp(args.cutoff) if args.cutoff else None
     expected_total = int(args.expected_total)
     batch_size = max(1, int(args.batch_size))
     run_id = str(args.run_id or f"bounded-{uuid.uuid4().hex[:12]}")
@@ -2986,14 +3570,28 @@ async def run_bounded_backplay(args: argparse.Namespace) -> int:
         # only after exclusivity is held so an ordinary consumer holding the
         # same lock sees zero state change from a refused bounded run.
         inbox = DurableInbox(inbox_path, read_only=dry_run)
-        selected = inbox.bounded_window(chat_ids=chat_ids, cutoff=cutoff)
+        if exact_message_ids:
+            selected = inbox.message_id_selection(exact_message_ids)
+        else:
+            if cutoff is None:
+                raise ConsumerError("bounded replay cutoff is required for chat-window mode")
+            selected = inbox.bounded_window(chat_ids=chat_ids, cutoff=cutoff)
         statuses_before = inbox.window_statuses(selected)
+        message_groups = (
+            _read_message_groups(Path(message_group_file).resolve(), records=selected)
+            if message_group_file
+            else []
+        )
         preflight = {
             "run_id": run_id,
             "mode": "dry-run" if dry_run else "capture-execute",
             "window": {
+                "selection_mode": "message-id-file" if exact_message_ids else "chat-cutoff",
                 "chat_ids": list(chat_ids),
-                "cutoff": cutoff.isoformat(),
+                "cutoff": cutoff.isoformat() if cutoff is not None else None,
+                "message_id_file": str(Path(message_id_file).resolve()) if message_id_file else None,
+                "message_group_file": str(Path(message_group_file).resolve()) if message_group_file else None,
+                "message_group_count": len(message_groups),
                 "selected_message_ids": [record.message_id for record in selected],
             },
             "selection": _window_counts(selected, statuses_before),
@@ -3021,12 +3619,19 @@ async def run_bounded_backplay(args: argparse.Namespace) -> int:
         row_total_before: int | None = None
         captured = 0
         try:
-            assert_bounded_selection(
-                selected,
-                chat_ids=chat_ids,
-                cutoff=cutoff,
-                expected_total=expected_total,
-            )
+            if exact_message_ids:
+                assert_message_id_selection(
+                    selected,
+                    expected_message_ids=exact_message_ids,
+                    expected_total=expected_total,
+                )
+            else:
+                assert_bounded_selection(
+                    selected,
+                    chat_ids=chat_ids,
+                    cutoff=cutoff,
+                    expected_total=expected_total,
+                )
             audit["service_token_hash"] = assert_service_token_hash(
                 Path(args.canonical_env).resolve(), args.service_token_env
             )
@@ -3035,6 +3640,50 @@ async def run_bounded_backplay(args: argparse.Namespace) -> int:
             audit["case_counts_before"] = case_before
             audit["business_audit_before"] = business_cursor_before
             row_total_before = inbox.total()
+
+            if getattr(args, "inject_source_evidence", False):
+                source_before_image = getattr(args, "source_before_image", None)
+                if not source_before_image:
+                    raise ConsumerError(
+                        "--source-before-image is required with --inject-source-evidence"
+                    )
+                audit["source_evidence_injection"] = _inject_bounded_source_evidence(
+                    case_db,
+                    selected,
+                    before_image_path=Path(source_before_image).resolve(),
+                    run_id=run_id,
+                    dry_run=dry_run,
+                )
+
+            if readjudicated_draft_ids or pending_manager_draft_ids:
+                draft_before_image = getattr(args, "draft_before_image", None)
+                if not draft_before_image:
+                    raise ConsumerError(
+                        "--draft-before-image is required with draft transitions"
+                    )
+                audit["draft_transition_preview"] = _transition_readjudication_drafts(
+                    case_db,
+                    readjudicated_ids=readjudicated_draft_ids,
+                    pending_manager_ids=pending_manager_draft_ids,
+                    manager_chat_id=str(getattr(args, "manager_chat_id", "") or ""),
+                    before_image_path=Path(draft_before_image).resolve(),
+                    run_id=run_id,
+                    dry_run=True,
+                    source_state=str(getattr(args, "draft_source_state", "draft")),
+                )
+
+            if getattr(args, "requeue_selected", False):
+                before_image = getattr(args, "before_image", None)
+                if not before_image:
+                    raise ConsumerError(
+                        "--before-image is required with --requeue-selected"
+                    )
+                audit["selected_reset"] = inbox.requeue_selected_for_readjudication(
+                    selected,
+                    before_image_path=Path(before_image).resolve(),
+                    run_id=run_id,
+                    dry_run=dry_run,
+                )
 
             reconciliation = inbox.reconcile_window_processing(
                 selected, state_db, dry_run=dry_run
@@ -3053,15 +3702,28 @@ async def run_bounded_backplay(args: argparse.Namespace) -> int:
                     for record in selected
                     if statuses.get(str(record.seq)) == "pending"
                 ]
-                grouped: dict[str, list[InboxRecord]] = {}
-                for record in pending:
-                    grouped.setdefault(record.chat_id, []).append(record)
-                ordered = sorted(grouped.items(), key=lambda item: item[1][0].seq)
+                if message_groups:
+                    pending_ids = {record.message_id for record in pending}
+                    ordered_batches = [
+                        (chat_id, [record for record in group if record.message_id in pending_ids])
+                        for chat_id, group in message_groups
+                    ]
+                    ordered_batches = [item for item in ordered_batches if item[1]]
+                else:
+                    grouped: dict[str, list[InboxRecord]] = {}
+                    for record in pending:
+                        grouped.setdefault(record.chat_id, []).append(record)
+                    ordered_batches = []
+                    for chat_id, chat_records in sorted(
+                        grouped.items(), key=lambda item: item[1][0].seq
+                    ):
+                        ordered_batches.extend(
+                            (chat_id, chat_records[start : start + batch_size])
+                            for start in range(0, len(chat_records), batch_size)
+                        )
                 with _runtime_config_context(config_path):
                     runner = _new_gateway_runner(config_path)
-                    for chat_id, chat_records in ordered:
-                        for start in range(0, len(chat_records), batch_size):
-                            batch = chat_records[start : start + batch_size]
+                    for chat_id, batch in ordered_batches:
                             inbox.claim(batch)
                             try:
                                 result = await process_live_records(
@@ -3148,6 +3810,18 @@ async def run_bounded_backplay(args: argparse.Namespace) -> int:
                                     }
                                 )
                                 raise
+
+            if readjudicated_draft_ids or pending_manager_draft_ids:
+                audit["draft_transitions"] = _transition_readjudication_drafts(
+                    case_db,
+                    readjudicated_ids=readjudicated_draft_ids,
+                    pending_manager_ids=pending_manager_draft_ids,
+                    manager_chat_id=str(args.manager_chat_id or ""),
+                    before_image_path=Path(args.draft_before_image).resolve(),
+                    run_id=run_id,
+                    dry_run=dry_run,
+                    source_state=str(getattr(args, "draft_source_state", "draft")),
+                )
 
             case_after = _sqlite_table_counts(case_db)
             row_total_after = inbox.total()
@@ -3262,8 +3936,21 @@ def build_parser() -> argparse.ArgumentParser:
     bounded.add_argument(
         "--service-token-env", default="CHRISTOPHER_TGG_PS_SERVICE_TOKEN"
     )
-    bounded.add_argument("--chat-id", action="append", required=True)
-    bounded.add_argument("--cutoff", required=True)
+    bounded.add_argument("--chat-id", action="append")
+    bounded.add_argument("--cutoff")
+    bounded.add_argument("--message-id-file")
+    bounded.add_argument("--message-group-file")
+    bounded.add_argument("--requeue-selected", action="store_true")
+    bounded.add_argument("--before-image")
+    bounded.add_argument("--inject-source-evidence", action="store_true")
+    bounded.add_argument("--source-before-image")
+    bounded.add_argument("--readjudicated-draft-id-file")
+    bounded.add_argument("--pending-manager-draft-id-file")
+    bounded.add_argument("--manager-chat-id")
+    bounded.add_argument(
+        "--draft-source-state", choices=("draft", "pending_manager"), default="draft"
+    )
+    bounded.add_argument("--draft-before-image")
     bounded.add_argument("--expected-total", type=int, required=True)
     bounded.add_argument("--batch-size", type=int, default=25)
     bounded.add_argument("--audit", required=True)

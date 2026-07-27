@@ -115,7 +115,7 @@ def test_tgg_management_defaults_to_operator_db_before_ilinked() -> None:
     brief = constitution.job_briefs["tgg_management"]
     prompt = "\n".join(brief.instructions)
 
-    assert "operation case_search" in prompt
+    assert "operation tgg_case_search" in prompt
     assert "receivedAgeLabel" in prompt
     assert "General lists should stay case-shaped" in prompt
     assert "job_work_costings" in prompt
@@ -143,7 +143,7 @@ def test_tgg_management_defaults_to_operator_db_before_ilinked() -> None:
     assert "serviceLine=maintenance or serviceLine=sprucing" in prompt
     assert "resultServiceLineSplit" in prompt
     assert "Do NOT infer totals by counting returned rows" in prompt
-    assert "Run separate case_search calls" in prompt
+    assert "Run separate tgg_case_search calls" in prompt
     assert "Sort each section by receivedAgeDays descending" in prompt
     assert "syntheticJobNo=true" in prompt
     assert "name-only lookups" in prompt
@@ -158,7 +158,7 @@ def test_tgg_management_defaults_to_operator_db_before_ilinked() -> None:
     assert {"/new", "/reset", "/approve", "/always"}.issubset(
         set(brief.response_policy["slash_commands"])
     )
-    assert "max_output_tokens" not in brief.response_policy
+    assert brief.response_policy["max_output_tokens"] == 8192
 
 
 def test_tgg_production_management_selectors_include_live_wa_groups() -> None:

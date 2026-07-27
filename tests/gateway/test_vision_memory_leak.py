@@ -23,6 +23,7 @@ def gateway_runner():
 
     class _Stub:
         _enrich_message_with_vision = GatewayRunner._enrich_message_with_vision
+        _vision_preanalysis_max_concurrency = GatewayRunner._vision_preanalysis_max_concurrency
 
     return _Stub()
 

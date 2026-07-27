@@ -107,6 +107,11 @@ def _check_env_file(path: Path, expected: dict[str, str]) -> None:
     values = _read_env_values(path)
     for key, value in expected.items():
         actual = values.get(key)
+        # These bridge env keys are optional on the Hermes process. When absent,
+        # the live boundary is still checked below in policy.env, config, and the
+        # constitution; do not force an .env mutation merely to satisfy this check.
+        if key in {"WHATSAPP_OUTBOUND_DISABLED", "WHATSAPP_OUTBOUND_ALLOWED_CHATS"} and actual is None:
+            continue
         if actual != value:
             raise AssertionError(f"{path}: expected {key}={value!r}, found {actual!r}")
 

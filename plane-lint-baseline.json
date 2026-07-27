@@ -1,0 +1,76 @@
+{
+  "tool": "plane_lint.py",
+  "generated": "2026-07-24T22:40:44+00:00",
+  "count": 23,
+  "entries": {
+    "gateway/durable_jsonl_consumer.py::client-token::tgg:christopher": {
+      "note": "content x3, first at line 3483"
+    },
+    "gateway/durable_jsonl_consumer.py::client-token::tgg:tgg": {
+      "note": "content x17, first at line 754"
+    },
+    "gateway/pa_observability.py::client-token::tgg:christopher": {
+      "note": "content x4, first at line 18"
+    },
+    "gateway/pa_observability.py::client-token::tgg:tgg": {
+      "note": "content x2, first at line 10"
+    },
+    "gateway/platforms/whatsapp.py::client-token::tgg:hdb": {
+      "note": "content x1, first at line 1054"
+    },
+    "gateway/platforms/whatsapp.py::client-token::tgg:tgg": {
+      "note": "content x6, first at line 586"
+    },
+    "gateway/replay.py::client-token::tgg:tgg": {
+      "note": "content x7, first at line 134"
+    },
+    "gateway/run.py::client-token::tgg:tgg": {
+      "note": "content x2, first at line 8315"
+    },
+    "tools/pa_business_tools.py::client-token::tgg:SK/JOB": {
+      "note": "content x9, first at line 542"
+    },
+    "tools/pa_business_tools.py::client-token::tgg:christopher": {
+      "note": "content x4, first at line 306"
+    },
+    "tools/pa_business_tools.py::client-token::tgg:hdb": {
+      "note": "content x15, first at line 31"
+    },
+    "tools/pa_business_tools.py::client-token::tgg:ilinked": {
+      "note": "content x23, first at line 28"
+    },
+    "tools/pa_business_tools.py::client-token::tgg:sprucing": {
+      "note": "content x2, first at line 2274"
+    },
+    "tools/pa_business_tools.py::client-token::tgg:tgg": {
+      "note": "content x173, first at line 311"
+    },
+    "tools/pa_photo_pair_classifier.py::client-token::tgg:sprucing": {
+      "note": "content x1, first at line 1"
+    },
+    "tools/tgg_ilinked_lookup.py::client-token::tgg:christopher": {
+      "note": "content x5, first at line 1"
+    },
+    "tools/tgg_ilinked_lookup.py::client-token::tgg:ilinked": {
+      "note": "path; content x32, first at line 1"
+    },
+    "tools/tgg_ilinked_lookup.py::client-token::tgg:tgg": {
+      "note": "path; content x7, first at line 3"
+    },
+    "tools/tgg_ilinked_reads.py::client-token::tgg:christopher": {
+      "note": "content x8, first at line 1"
+    },
+    "tools/tgg_ilinked_reads.py::client-token::tgg:ilinked": {
+      "note": "path; content x33, first at line 1"
+    },
+    "tools/tgg_ilinked_reads.py::client-token::tgg:tgg": {
+      "note": "path; content x7, first at line 19"
+    },
+    "toolsets.py::client-token::tgg:sprucing": {
+      "note": "content x1, first at line 210"
+    },
+    "toolsets.py::client-token::tgg:tgg": {
+      "note": "content x20, first at line 185"
+    }
+  }
+}

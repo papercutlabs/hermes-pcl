@@ -84,7 +84,7 @@ def test_run_job_selects_pa_brief_and_restricts_toolsets(tmp_path):
     assert final_response == "management summary"
     assert error is None
     kwargs = mock_agent_cls.call_args.kwargs
-    assert kwargs["enabled_toolsets"] == ["memory", "file", "web", "pa-business"]
+    assert kwargs["enabled_toolsets"] == ["memory", "file", "web", "custom"]
     assert kwargs["disabled_toolsets"] == ["cronjob", "messaging", "clarify", "shell"]
     assert "TGG Management Brief" in kwargs["ephemeral_system_prompt"]
     fake_db.record_pa_behavior_event.assert_called_once()

@@ -2111,21 +2111,32 @@ def _build_service_path_dirs(project_root: Path | None = None) -> list[str]:
     candidates = []
 
     venv_bin = project_root / "venv" / "bin"
-    if venv_bin.is_dir():
+    def _is_dir(path: Path) -> bool:
+        try:
+            return path.is_dir()
+        except PermissionError:
+            # System-unit generation can run as root while tests (and some
+            # constrained service installers) cannot traverse root's
+            # profile-aware Hermes home. An inaccessible optional PATH entry
+            # is equivalent to an absent one; target-user remapping happens
+            # later in unit generation.
+            return False
+
+    if _is_dir(venv_bin):
         candidates.append(str(venv_bin))
     elif sys.prefix != sys.base_prefix:
         candidates.append(str(Path(sys.prefix) / "bin"))
 
     node_bin = project_root / "node_modules" / ".bin"
-    if node_bin.is_dir():
+    if _is_dir(node_bin):
         candidates.append(str(node_bin))
 
     hermes_home = get_hermes_home()
     hermes_node = hermes_home / "node" / "bin"
-    if hermes_node.is_dir():
+    if _is_dir(hermes_node):
         candidates.append(str(hermes_node))
     hermes_nm = hermes_home / "node_modules" / ".bin"
-    if hermes_nm.is_dir():
+    if _is_dir(hermes_nm):
         candidates.append(str(hermes_nm))
 
     return candidates

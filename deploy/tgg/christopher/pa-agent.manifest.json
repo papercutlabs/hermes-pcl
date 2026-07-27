@@ -117,19 +117,19 @@
       "owner": "pclaw:pclaw"
     },
     {
-      "sourcePath": "pa-agent.manifest.json",
+      "sourcePath": "deploy/tgg/christopher/pa-agent.manifest.json",
       "targetPath": "home/pclaw/apps/hermes-pcl/pa-agent.manifest.json",
       "mode": "644",
       "owner": "pclaw:pclaw"
     },
     {
-      "sourcePath": "deploy/tgg/christopher/config.yaml",
+      "sourcePath": "deploy/tgg/christopher/runtime-slots/gpt-5.6-luna-low/config.yaml",
       "targetPath": "home/pclaw/.hermes-christopher-tgg/config.yaml",
       "mode": "600",
       "owner": "pclaw:pclaw"
     },
     {
-      "sourcePath": "deploy/tgg/christopher/christopher_tgg_constitution.yaml",
+      "sourcePath": "deploy/tgg/christopher/runtime-slots/gpt-5.6-luna-low/christopher_tgg_constitution.yaml",
       "targetPath": "home/pclaw/.hermes-christopher-tgg/christopher_tgg_constitution.yaml",
       "mode": "644",
       "owner": "pclaw:pclaw"
@@ -180,6 +180,60 @@
       "sourcePath": "deploy/tgg/christopher/SOUL.md",
       "targetPath": "home/pclaw/.hermes-christopher-tgg/SOUL.md",
       "mode": "600",
+      "owner": "pclaw:pclaw"
+    },
+    {
+      "sourcePath": "deploy/tgg/christopher/scripts/apply_engine_slot.py",
+      "targetPath": "home/pclaw/apps/hermes-pcl/deploy/tgg/christopher/scripts/apply_engine_slot.py",
+      "mode": "755",
+      "owner": "pclaw:pclaw"
+    },
+    {
+      "sourcePath": "deploy/tgg/christopher/runtime-slots/SHA256SUMS",
+      "targetPath": "home/pclaw/apps/hermes-pcl/deploy/tgg/christopher/runtime-slots/SHA256SUMS",
+      "mode": "644",
+      "owner": "pclaw:pclaw"
+    },
+    {
+      "sourcePath": "deploy/tgg/christopher/runtime-slots/gpt-5.4-mini/config.yaml",
+      "targetPath": "home/pclaw/apps/hermes-pcl/deploy/tgg/christopher/runtime-slots/gpt-5.4-mini/config.yaml",
+      "mode": "600",
+      "owner": "pclaw:pclaw"
+    },
+    {
+      "sourcePath": "deploy/tgg/christopher/runtime-slots/gpt-5.4-mini/christopher_tgg_constitution.yaml",
+      "targetPath": "home/pclaw/apps/hermes-pcl/deploy/tgg/christopher/runtime-slots/gpt-5.4-mini/christopher_tgg_constitution.yaml",
+      "mode": "644",
+      "owner": "pclaw:pclaw"
+    },
+    {
+      "sourcePath": "deploy/tgg/christopher/runtime-slots/gpt-5.6-luna/config.yaml",
+      "targetPath": "home/pclaw/apps/hermes-pcl/deploy/tgg/christopher/runtime-slots/gpt-5.6-luna/config.yaml",
+      "mode": "600",
+      "owner": "pclaw:pclaw"
+    },
+    {
+      "sourcePath": "deploy/tgg/christopher/runtime-slots/gpt-5.6-luna/christopher_tgg_constitution.yaml",
+      "targetPath": "home/pclaw/apps/hermes-pcl/deploy/tgg/christopher/runtime-slots/gpt-5.6-luna/christopher_tgg_constitution.yaml",
+      "mode": "644",
+      "owner": "pclaw:pclaw"
+    },
+    {
+      "sourcePath": "deploy/tgg/christopher/runtime-slots/gpt-5.6-luna-low/config.yaml",
+      "targetPath": "home/pclaw/apps/hermes-pcl/deploy/tgg/christopher/runtime-slots/gpt-5.6-luna-low/config.yaml",
+      "mode": "600",
+      "owner": "pclaw:pclaw"
+    },
+    {
+      "sourcePath": "deploy/tgg/christopher/runtime-slots/gpt-5.6-luna-low/christopher_tgg_constitution.yaml",
+      "targetPath": "home/pclaw/apps/hermes-pcl/deploy/tgg/christopher/runtime-slots/gpt-5.6-luna-low/christopher_tgg_constitution.yaml",
+      "mode": "644",
+      "owner": "pclaw:pclaw"
+    },
+    {
+      "sourcePath": "gateway/durable_jsonl_consumer.py",
+      "targetPath": "home/pclaw/apps/hermes-pcl/gateway/durable_jsonl_consumer.py",
+      "mode": "644",
       "owner": "pclaw:pclaw"
     }
   ],
@@ -234,11 +288,11 @@
     },
     {
       "name": "model-config",
-      "command": "grep -q 'default: gemini-3.1-flash-lite' /home/pclaw/.hermes-christopher-tgg/config.yaml"
+      "command": "grep -q 'default: gpt-5.6-luna' /home/pclaw/.hermes-christopher-tgg/config.yaml && grep -q 'reasoning_effort: low' /home/pclaw/.hermes-christopher-tgg/config.yaml"
     },
     {
       "name": "pa-job-runtime-model-routing",
-      "command": "cd /home/pclaw/apps/hermes-pcl && HERMES_HOME=/home/pclaw/.hermes-christopher-tgg /home/pclaw/apps/hermes-pcl/.venv/bin/python - <<'PY2'\nfrom agent.pa_constitution import resolve_context\nfrom gateway.run import _apply_pa_job_runtime\nconstitution_path = '/home/pclaw/.hermes-christopher-tgg/christopher_tgg_constitution.yaml'\nbase_runtime = {'provider': 'gemini', 'api_key': 'redacted', 'base_url': 'https://generativelanguage.googleapis.com/v1beta'}\nops = resolve_context({'constitution_path': constitution_path}, {'source': {'platform': 'whatsapp', 'chat_id': '120363403088884777@g.us'}})\nmgmt = resolve_context({'constitution_path': constitution_path}, {'source': {'platform': 'whatsapp', 'chat_id': '120363427897872447@g.us'}})\nlaunch_mgmt = resolve_context({'constitution_path': constitution_path}, {'source': {'platform': 'whatsapp', 'chat_id': '120363407903158826@g.us'}})\nassert ops is not None and ops.job_type == 'tgg_ops_ingest', ops\nassert mgmt is not None and mgmt.job_type == 'tgg_management', mgmt\nassert launch_mgmt is not None and launch_mgmt.job_type == 'tgg_management', launch_mgmt\nassert _apply_pa_job_runtime('gemini-3.1-flash-lite', base_runtime, ops)[0] == 'gemini-3.1-flash-lite'\nassert _apply_pa_job_runtime('gemini-3.1-flash-lite', base_runtime, mgmt)[0] == 'gemini-3.1-flash-lite'\nassert _apply_pa_job_runtime('gemini-3.1-flash-lite', base_runtime, launch_mgmt)[0] == 'gemini-3.1-flash-lite'\nPY2"
+      "command": "cd /home/pclaw/apps/hermes-pcl && HERMES_HOME=/home/pclaw/.hermes-christopher-tgg /home/pclaw/apps/hermes-pcl/.venv/bin/python - <<'PY2'\nfrom agent.pa_constitution import resolve_context\nfrom gateway.run import _apply_pa_job_runtime\nconstitution_path = '/home/pclaw/.hermes-christopher-tgg/christopher_tgg_constitution.yaml'\nbase_runtime = {'provider': 'openai-direct-primary', 'api_key': 'redacted', 'base_url': 'https://api.openai.com/v1'}\nops = resolve_context({'constitution_path': constitution_path}, {'source': {'platform': 'whatsapp', 'chat_id': '120363403088884777@g.us'}})\nmgmt = resolve_context({'constitution_path': constitution_path}, {'source': {'platform': 'whatsapp', 'chat_id': '120363427897872447@g.us'}})\nlaunch_mgmt = resolve_context({'constitution_path': constitution_path}, {'source': {'platform': 'whatsapp', 'chat_id': '120363407903158826@g.us'}})\nassert ops is not None and ops.job_type == 'tgg_ops_ingest', ops\nassert mgmt is not None and mgmt.job_type == 'tgg_management', mgmt\nassert launch_mgmt is not None and launch_mgmt.job_type == 'tgg_management', launch_mgmt\nassert _apply_pa_job_runtime('gpt-5.6-luna', base_runtime, ops)[0] == 'gpt-5.6-luna'\nassert _apply_pa_job_runtime('gpt-5.6-luna', base_runtime, mgmt)[0] == 'gpt-5.6-luna'\nassert _apply_pa_job_runtime('gpt-5.6-luna', base_runtime, launch_mgmt)[0] == 'gpt-5.6-luna'\nPY2"
     },
     {
       "name": "live-config-case-create",
