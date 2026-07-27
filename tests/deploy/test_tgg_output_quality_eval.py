@@ -47,20 +47,47 @@ def snapshot() -> dict:
         "cases": [{"id": 7, "job_no": "AM/JOB/2607/0001", "state": "completed"}],
     }
 
+def two_case_snapshot() -> dict:
+    value = snapshot()
+    value["events"].extend([completed(12, "wa-12"), completed(13, "wa-13")])
+    value["observations"].append(
+        {
+            "id": 3,
+            "case_id": 8,
+            "source_ref": None,
+            "fields": json.dumps({"source_refs": ["wa-12", "wa-13"]}),
+            "_matched_source_refs": ["wa-12", "wa-13"],
+        }
+    )
+    value["cases"].append(
+        {"id": 8, "job_no": "AM/JOB/2607/0002", "state": "in_progress"}
+    )
+    return value
+
 
 def judgment(checker: str = "judge-2") -> dict:
     registry = core.load_registry()
     values = ["pass", "fail", "unsure"]
-    return {
-        "checker_session_id": checker,
+    naive = {
         "source_to_page": "pass",
         "page_to_source": "fail",
         "manager_readability": "unsure",
         "summary": "One source fact is missing.",
+    }
+    registry_pass = {
         "checks": [
             {"id": item.id, "result": values[index % 3], "evidence": f"evidence {index}"}
             for index, item in enumerate(registry.checks)
-        ],
+        ]
+    }
+    return {
+        "checker_session_id": checker,
+        "naive_checker_session_id": "judge-naive",
+        "registry_checker_session_id": checker,
+        "naive_pass": naive,
+        "registry_pass": registry_pass,
+        **naive,
+        **registry_pass,
     }
 
 
@@ -119,6 +146,12 @@ def test_bundle_mapping_keeps_unmapped_completed_rows_visible():
     bundles, unmapped = core.make_bundles(value)
     assert [item["message_id"] for item in bundles[0]["messages"]] == ["wa-10", "wa-11"]
     assert unmapped == ["wa-unmapped"]
+
+def test_bundle_mapping_refuses_observation_without_case_row():
+    value = snapshot()
+    value["observations"][0]["case_id"] = 999
+    with pytest.raises(core.EvalError, match="missing case row"):
+        core.make_bundles(value)
 
 
 def test_exact_public_per_case_url():
@@ -249,33 +282,6 @@ def test_strict_judgment_preserves_unsure_and_rejects_maker():
         core.validate_judgment(broken, registry, "maker-1")
 
 
-def test_injected_judge_command_receives_paths_and_is_strict(tmp_path):
-    bundle = tmp_path / "bundle.json"
-    bundle.write_text("{}")
-    screen = tmp_path / "screen.png"
-    screen.write_bytes(b"x")
-    seen = {}
-
-    def command(argv, **kwargs):
-        seen["request"] = json.loads(kwargs["input"])
-        return subprocess.CompletedProcess(argv, 0, json.dumps(judgment()), "")
-
-    result = core.Judge(command=command, command_argv=["fixture-judge"]).judge(
-        bundle,
-        {
-            "screenshot": str(screen),
-            "portal_screenshot": str(screen),
-            "snapshot": str(bundle),
-            "portal_snapshot": str(bundle),
-            "url": core.case_url("AM/JOB/2607/0001"),
-        },
-        core.load_registry(),
-        "maker-1",
-    )
-    assert result["page_to_source"] == "fail"
-    assert seen["request"]["maker_session_id"] == "maker-1"
-
-
 def test_default_judge_starts_fresh_checker_thread(tmp_path, monkeypatch):
     bundle = tmp_path / "bundle.json"
     source_image = tmp_path / "source.jpg"
@@ -285,17 +291,34 @@ def test_default_judge_starts_fresh_checker_thread(tmp_path, monkeypatch):
     screen.write_bytes(b"png")
     monkeypatch.setenv("CODEX_THREAD_ID", "maker-thread")
     monkeypatch.setenv("MARSHAL_SESSION_ID", "maker-thread")
-    seen = {}
+    monkeypatch.setenv("TGG_OUTPUT_EVAL_JUDGE_COMMAND", "forbidden-single-pass")
+    seen = {"argv": [], "env": [], "prompts": []}
 
     def command(argv, **kwargs):
-        seen["argv"] = argv
-        seen["env"] = kwargs["env"]
+        seen["argv"].append(argv)
+        seen["env"].append(kwargs["env"])
+        seen["prompts"].append(kwargs["input"])
         output = Path(argv[argv.index("--output-last-message") + 1])
-        output.write_text(json.dumps(judgment("ignored-model-value")))
+        schema = Path(argv[argv.index("--output-schema") + 1]).name
+        if schema == "naive-judge-schema.json":
+            output.write_text(
+                json.dumps(
+                    {
+                        "source_to_page": "pass",
+                        "page_to_source": "fail",
+                        "manager_readability": "unsure",
+                        "summary": "cold manager read",
+                    }
+                )
+            )
+            checker = "fresh-naive-checker"
+        else:
+            output.write_text(json.dumps({"checks": judgment()["checks"]}))
+            checker = "fresh-registry-checker"
         return subprocess.CompletedProcess(
             argv,
             0,
-            json.dumps({"type": "thread.started", "thread_id": "fresh-checker"}) + "\n",
+            json.dumps({"type": "thread.started", "thread_id": checker}) + "\n",
             "",
         )
 
@@ -311,15 +334,96 @@ def test_default_judge_starts_fresh_checker_thread(tmp_path, monkeypatch):
         core.load_registry(),
         "maker-thread",
     )
-    assert result["checker_session_id"] == "fresh-checker"
-    assert "CODEX_THREAD_ID" not in seen["env"]
-    assert "MARSHAL_SESSION_ID" not in seen["env"]
+    assert result["checker_session_id"] == "fresh-registry-checker"
+    assert result["naive_checker_session_id"] == "fresh-naive-checker"
+    assert result["registry_checker_session_id"] == "fresh-registry-checker"
+    assert result["summary"] == "cold manager read"
+    assert len(seen["argv"]) == 2
+    assert "registry=" not in seen["prompts"][0]
+    assert "checklist" in seen["prompts"][0]
+    assert "registry=" in seen["prompts"][1]
+    assert "-C" in seen["argv"][0]
+    assert "--skip-git-repo-check" in seen["argv"][0]
+    for item in core.load_registry().checks:
+        assert item.id not in seen["prompts"][0]
+        assert item.statement not in seen["prompts"][0]
+    assert all("CODEX_THREAD_ID" not in env for env in seen["env"])
+    assert all("MARSHAL_SESSION_ID" not in env for env in seen["env"])
+    assert all(argv[0:2] == ["codex", "exec"] for argv in seen["argv"])
     image_args = [
-        seen["argv"][index + 1]
-        for index, value in enumerate(seen["argv"])
+        seen["argv"][0][index + 1]
+        for index, value in enumerate(seen["argv"][0])
         if value == "-i"
     ]
     assert str(source_image) in image_args
+
+
+def test_default_judge_rejects_malformed_pass_without_keyerror(tmp_path):
+    bundle = tmp_path / "bundle.json"
+    bundle.write_text("{}")
+    screen = tmp_path / "screen.png"
+    screen.write_bytes(b"png")
+
+    def command(argv, **_kwargs):
+        output = Path(argv[argv.index("--output-last-message") + 1])
+        output.write_text("{}")
+        return subprocess.CompletedProcess(
+            argv, 0, json.dumps({"type": "thread.started", "thread_id": "fresh"}) + "\n", ""
+        )
+
+    with pytest.raises(core.EvalError, match="naive judge pass has an invalid shape"):
+        core.Judge(command=command).judge(
+            bundle,
+            {
+                "screenshot": str(screen),
+                "portal_screenshot": str(screen),
+                "snapshot": str(bundle),
+                "portal_snapshot": str(bundle),
+                "url": "fixture://case",
+            },
+            core.load_registry(),
+            "maker",
+        )
+
+
+def test_default_judge_rejects_reused_pass_session(tmp_path):
+    bundle = tmp_path / "bundle.json"
+    bundle.write_text("{}")
+    screen = tmp_path / "screen.png"
+    screen.write_bytes(b"png")
+
+    def command(argv, **_kwargs):
+        output = Path(argv[argv.index("--output-last-message") + 1])
+        schema = Path(argv[argv.index("--output-schema") + 1]).name
+        output.write_text(
+            json.dumps(
+                {
+                    "source_to_page": "pass",
+                    "page_to_source": "pass",
+                    "manager_readability": "pass",
+                    "summary": "clear",
+                }
+                if schema == "naive-judge-schema.json"
+                else {"checks": judgment()["checks"]}
+            )
+        )
+        return subprocess.CompletedProcess(
+            argv, 0, json.dumps({"type": "thread.started", "thread_id": "same"}) + "\n", ""
+        )
+
+    with pytest.raises(core.EvalError, match="reused one checker session"):
+        core.Judge(command=command).judge(
+            bundle,
+            {
+                "screenshot": str(screen),
+                "portal_screenshot": str(screen),
+                "snapshot": str(bundle),
+                "portal_snapshot": str(bundle),
+                "url": "fixture://case",
+            },
+            core.load_registry(),
+            "maker",
+        )
 
 
 def test_defect_filing_dedupes_locally(tmp_path):
@@ -495,6 +599,15 @@ class FakeJudge:
             return json.loads((core.FIXTURE_DIR / "golden-judge.json").read_text())
         return judgment()
 
+class SecondCaseFailJudge(FakeJudge):
+    def judge(self, *args, **kwargs):
+        source = Path(args[0])
+        if source.name != "golden-source.json":
+            value = json.loads(source.read_text())
+            if value["case"]["job_no"] == "AM/JOB/2607/0002":
+                raise core.EvalError("second case broke")
+        return super().judge(*args, **kwargs)
+
 
 class FakeFiler:
     def __init__(self):
@@ -554,6 +667,40 @@ def test_successful_run_commits_cursor_after_artifacts_and_defects(tmp_path, mon
     assert json.loads(receipt.read_text())["completed_rows"] == 2
     second = evaluator.run(trigger="interval", maker_session_id="maker-1")
     assert second["ran"] is False
+
+def test_multi_case_run_judges_every_touched_case(tmp_path, monkeypatch):
+    monkeypatch.setattr(core, "pull_retained_media", lambda bundle, destination: [])
+    store = core.StateStore(tmp_path)
+    judge = FakeJudge()
+    result = core.Evaluator(
+        store,
+        collect=lambda _cursor: two_case_snapshot(),
+        browser=FakeBrowser(),
+        judge=judge,
+        filer=FakeFiler(),
+        clock=lambda: NOW,
+    ).run(trigger="deploy", maker_session_id="maker-1")
+    assert result["cases_evaluated"] == 2
+    assert result["committed_cursor"] == 13
+    assert judge.calls == 3  # golden plus both touched cases
+
+
+def test_multi_case_failure_keeps_cursor_and_files_nothing(tmp_path, monkeypatch):
+    monkeypatch.setattr(core, "pull_retained_media", lambda bundle, destination: [])
+    store = core.StateStore(tmp_path)
+    filer = FakeFiler()
+    evaluator = core.Evaluator(
+        store,
+        collect=lambda _cursor: two_case_snapshot(),
+        browser=FakeBrowser(),
+        judge=SecondCaseFailJudge(),
+        filer=filer,
+        clock=lambda: NOW,
+    )
+    with pytest.raises(core.EvalError, match="second case broke"):
+        evaluator.run(trigger="deploy", maker_session_id="maker-1")
+    assert store.load()["cursor"] == 0
+    assert filer.calls == []
 
 
 def test_successful_run_reconciles_prior_failed_occurrences(tmp_path, monkeypatch):
@@ -648,104 +795,6 @@ def test_run_cli_emits_top_level_health_metrics(tmp_path, monkeypatch, capsys):
     assert output["coverage_ratio"] == 1.0
     assert output["defect_trend"] == [{"defects": 1}]
     assert (output["human_caught"], output["loop_caught"]) == (2, 3)
-
-
-def test_external_finalize_strict_shape_commits_after_defect_filing(tmp_path):
-    batch = snapshot()
-    batch.update({"cursor_start": 9, "cursor_end": 11})
-    # Root's real collector serializes fields as objects, not JSON strings.
-    batch["observations"][0]["fields"] = {"source_refs": ["wa-10", "wa-11"]}
-    batch_path = tmp_path / "source-batch.json"
-    batch_path.write_text(json.dumps(batch))
-    registry = core.load_registry()
-    case_checks = []
-    for item in registry.checks:
-        if item.scope == "case":
-            case_checks.append(
-                {
-                    "check_id": item.id,
-                    "outcome": "unsure" if item.id == "photos-bound-to-correct-work-item" else "pass",
-                    "evidence_message_ids": ["wa-10"],
-                    "reason": "Grounded fixture evidence.",
-                    "page_evidence": "Case screenshot.",
-                }
-            )
-    external = {
-        "evaluator_session": "independent-judge",
-        "overall": "One photo association is uncertain.",
-        "cases": [
-            {
-                "case_id": 7,
-                "job_no": "AM/JOB/2607/0001",
-                "checks": case_checks,
-                "page_to_source": "pass",
-                "source_to_page": "pass",
-                "manager_sense": "pass",
-            }
-        ],
-        "portal_checks": [
-            {
-                "check_id": "filter-covers-badge-states",
-                "outcome": "fail",
-                "evidence_message_ids": [],
-                "reason": "New badge has no filter.",
-                "page_evidence": "Cases screenshot.",
-            }
-        ],
-    }
-    judge_path = tmp_path / "judge-result.json"
-    judge_path.write_text(json.dumps(external))
-    (tmp_path / "case-7.png").write_bytes(b"png")
-    (tmp_path / "portal-cases.png").write_bytes(b"portal")
-    filer = FakeFiler()
-    store = core.StateStore(tmp_path / "state")
-    core.initialize_cursor(store, 9, NOW)
-    result = core.finalize_external(
-        store,
-        batch_path=batch_path,
-        judgment_path=judge_path,
-        artifacts_dir=tmp_path,
-        maker_session_id="maker-1",
-        filer=filer,
-        golden_judge=FakeJudge(),
-        now=NOW,
-    )
-    assert result["committed_cursor"] == 11
-    assert store.load()["cursor"] == 11
-    assert len(filer.calls) == 2
-    assert filer.calls[0]["message_ids"] == ["wa-10"]
-    assert filer.calls[1]["screenshot"].endswith("portal-cases.png")
-    evidence_dir = tmp_path / "state" / "runs" / "external-10-11"
-    assert Path(filer.calls[0]["screenshot"]).parent == evidence_dir
-    assert Path(filer.calls[0]["judgment_path"]) == evidence_dir / "judge-result.json"
-    assert (evidence_dir / "source-batch.json").exists()
-    assert (evidence_dir / "case-7.png").exists()
-    assert (evidence_dir / "portal-cases.png").exists()
-    assert core.finalize_external(
-        store,
-        batch_path=batch_path,
-        judgment_path=judge_path,
-        artifacts_dir=tmp_path,
-        maker_session_id="maker-1",
-        filer=filer,
-        golden_judge=FakeJudge(),
-        now=NOW,
-    )["reason"] == "already-finalized"
-    external["evaluator_session"] = "maker-1"
-    judge_path.write_text(json.dumps(external))
-    fresh_store = core.StateStore(tmp_path / "fresh-state")
-    core.initialize_cursor(fresh_store, 9, NOW)
-    with pytest.raises(core.EvalError, match="equals maker"):
-        core.finalize_external(
-            fresh_store,
-            batch_path=batch_path,
-            judgment_path=judge_path,
-            artifacts_dir=tmp_path,
-            maker_session_id="maker-1",
-            filer=filer,
-            golden_judge=FakeJudge(),
-            now=NOW,
-        )
 
 
 def test_initialize_cursor_requires_pristine_state(tmp_path):

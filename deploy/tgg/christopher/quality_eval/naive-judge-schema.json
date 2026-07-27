@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["source_to_page", "page_to_source", "manager_readability", "summary"],
+  "properties": {
+    "source_to_page": {"enum": ["pass", "fail", "unsure"]},
+    "page_to_source": {"enum": ["pass", "fail", "unsure"]},
+    "manager_readability": {"enum": ["pass", "fail", "unsure"]},
+    "summary": {"type": "string", "minLength": 1}
+  }
+}

@@ -1,0 +1,131 @@
+{
+  "evidence_class": "live-two-pass-synthetic-golden",
+  "source_commit": "dc1e882f9f717285dc6c0d420cfce118e3fabcc3",
+  "working_tree_note": "live run exercised the pending final patch; final commit records this receipt and implementation together",
+  "started_at": "2026-07-27T14:23:44.282461+00:00",
+  "finished_at": "2026-07-27T14:24:38.756657+00:00",
+  "elapsed_seconds": 54.499,
+  "exit_code": 0,
+  "fixture": "tests/fixtures/clients/tgg/output-quality",
+  "maker_session_id": "synthetic-golden-maker",
+  "naive_argv_contract": [
+    "codex",
+    "exec",
+    "--json",
+    "--sandbox",
+    "read-only",
+    "--output-schema",
+    "naive-judge-schema.json",
+    "-C",
+    "<isolated-temp>/naive-root",
+    "--skip-git-repo-check",
+    "--ignore-rules"
+  ],
+  "registry_argv_contract": [
+    "codex",
+    "exec",
+    "--json",
+    "--sandbox",
+    "read-only",
+    "--output-schema",
+    "registry-judge-schema.json"
+  ],
+  "assertions": {
+    "naive_registry_exposed": false,
+    "checker_not_maker": true,
+    "passes_isolated": true,
+    "all_registry_checks_returned": true,
+    "unsure_class_observed": true
+  },
+  "result": {
+    "checker_session_id": "019fa3f6-43f3-7772-bc8e-0f0cea14166a",
+    "naive_checker_session_id": "019fa3f5-d430-7c01-9d50-9470b1c2c6ed",
+    "registry_checker_session_id": "019fa3f6-43f3-7772-bc8e-0f0cea14166a",
+    "naive_pass": {
+      "source_to_page": "fail",
+      "page_to_source": "fail",
+      "manager_readability": "fail",
+      "summary": "The page is visually legible but materially unreliable. The source says the case is in progress and the sender is Ali; the page instead shows conflicting New/Completed states and labels the sender Site worker. It also adds an unsupported contact emoji and claims Tenant approved variation even though the source explicitly says no such claim is present. Work-item, message, job number, contact name, and two photos are represented, but the status and attribution errors make all three judgments fail."
+    },
+    "registry_pass": {
+      "checks": [
+        {
+          "id": "sender-shows-real-name-not-site-worker",
+          "result": "fail",
+          "evidence": "Source sender is Ali, but the rendered message identifies the sender as Site worker."
+        },
+        {
+          "id": "no-contact-emoji-leak",
+          "result": "fail",
+          "evidence": "Source contact is Mdm Lee with no emoji, but the rendered contact is Mdm Lee 😘."
+        },
+        {
+          "id": "message-text-displayed-as-bubble-photos-underneath",
+          "result": "pass",
+          "evidence": "Kitchen tap done is rendered as the message bubble, with PHOTO A and PHOTO B directly underneath."
+        },
+        {
+          "id": "explicit-done-statement-moves-item-completed",
+          "result": "pass",
+          "evidence": "The source explicitly says Kitchen tap done, and the Kitchen tap work item is rendered as DONE."
+        },
+        {
+          "id": "cant-do-statement-surfaced-not-generic-pending",
+          "result": "unsure",
+          "evidence": "The source explicitly states cant_do_statement_present is false, so the triggering source fact is absent."
+        },
+        {
+          "id": "photos-bound-to-correct-work-item",
+          "result": "pass",
+          "evidence": "Both source photos belong to the Kitchen tap message and are rendered under the Kitchen tap site record."
+        },
+        {
+          "id": "filter-covers-badge-states",
+          "result": "fail",
+          "evidence": "Visible badge states are New and Completed, but selectable filters are All, Completed, and In-progress; there is no New filter."
+        }
+      ]
+    },
+    "source_to_page": "fail",
+    "page_to_source": "fail",
+    "manager_readability": "fail",
+    "summary": "The page is visually legible but materially unreliable. The source says the case is in progress and the sender is Ali; the page instead shows conflicting New/Completed states and labels the sender Site worker. It also adds an unsupported contact emoji and claims Tenant approved variation even though the source explicitly says no such claim is present. Work-item, message, job number, contact name, and two photos are represented, but the status and attribution errors make all three judgments fail.",
+    "checks": [
+      {
+        "id": "sender-shows-real-name-not-site-worker",
+        "result": "fail",
+        "evidence": "Source sender is Ali, but the rendered message identifies the sender as Site worker."
+      },
+      {
+        "id": "no-contact-emoji-leak",
+        "result": "fail",
+        "evidence": "Source contact is Mdm Lee with no emoji, but the rendered contact is Mdm Lee 😘."
+      },
+      {
+        "id": "message-text-displayed-as-bubble-photos-underneath",
+        "result": "pass",
+        "evidence": "Kitchen tap done is rendered as the message bubble, with PHOTO A and PHOTO B directly underneath."
+      },
+      {
+        "id": "explicit-done-statement-moves-item-completed",
+        "result": "pass",
+        "evidence": "The source explicitly says Kitchen tap done, and the Kitchen tap work item is rendered as DONE."
+      },
+      {
+        "id": "cant-do-statement-surfaced-not-generic-pending",
+        "result": "unsure",
+        "evidence": "The source explicitly states cant_do_statement_present is false, so the triggering source fact is absent."
+      },
+      {
+        "id": "photos-bound-to-correct-work-item",
+        "result": "pass",
+        "evidence": "Both source photos belong to the Kitchen tap message and are rendered under the Kitchen tap site record."
+      },
+      {
+        "id": "filter-covers-badge-states",
+        "result": "fail",
+        "evidence": "Visible badge states are New and Completed, but selectable filters are All, Completed, and In-progress; there is no New filter."
+      }
+    ]
+  }
+}

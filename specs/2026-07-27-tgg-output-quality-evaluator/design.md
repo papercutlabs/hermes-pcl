@@ -45,12 +45,15 @@ One Studio runner owns a durable local cursor and run ledger.
 4. Log into the public portal through the `tgg-pa-admin` agent-browser auth
    profile, open the case through the real Cases UI, and capture a full-page
    screenshot plus accessibility snapshot.
-5. Give screenshot + source bundle + versioned check registry to a
-   vision-capable judge. The judge must check both directions:
-   every page claim traces to source; every source fact is represented; the
-   page reads sensibly to a TGG manager. Each named check returns
-   `pass|fail|unsure`; uncertainty can never become a pass.
-6. Persist the judgment. For each `fail` or `unsure`, create or reuse one Edna
+5. Run two isolated vision passes in order for every touched case, with up to
+   three cases evaluated concurrently. Pass one is a cold, naive TGG
+   manager read with no registry or checklist exposure: every page claim must
+   trace to source, every source fact must be represented, and the page must
+   read sensibly. Pass two receives the versioned registry and runs every
+   named check as a regression floor. Each pass runs in a fresh checker
+   session; `unsure` can never become a pass.
+6. Persist both raw pass payloads and both checker session ids in the combined
+   judgment. For each `fail` or `unsure`, create or reuse one Edna
    WB defect row with screenshot path, message ids, case/job number, and check
    class.
 7. Record batch coverage and defect-origin metrics, then atomically advance

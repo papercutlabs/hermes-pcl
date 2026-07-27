@@ -141,7 +141,7 @@ try:
         ],
         text=True,
         capture_output=True,
-        timeout=1500,
+        timeout=3900,
         check=False,
     )
     pathlib.Path(stdout_name).write_text(result.stdout)
@@ -151,7 +151,7 @@ except subprocess.TimeoutExpired as exc:
     stdout = exc.stdout.decode(errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
     stderr = exc.stderr.decode(errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
     pathlib.Path(stdout_name).write_text(stdout)
-    pathlib.Path(stderr_name).write_text(stderr + "\nevaluator timed out after 1500 seconds\n")
+    pathlib.Path(stderr_name).write_text(stderr + "\nevaluator timed out after 3900 seconds\n")
     raise SystemExit(124)
 PY
 evaluator_rc=$?

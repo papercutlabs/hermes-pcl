@@ -5,12 +5,10 @@ import fcntl
 import hashlib
 import json
 import os
-import shlex
-import shutil
 import subprocess
-import sys
 import tempfile
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -23,7 +21,8 @@ import yaml
 ROOT = Path(__file__).resolve().parents[4]
 DEPLOY_DIR = Path(__file__).resolve().parents[1]
 REGISTRY_PATH = DEPLOY_DIR / "quality-checks.yaml"
-JUDGE_SCHEMA_PATH = Path(__file__).with_name("judge-schema.json")
+NAIVE_JUDGE_SCHEMA_PATH = Path(__file__).with_name("naive-judge-schema.json")
+REGISTRY_JUDGE_SCHEMA_PATH = Path(__file__).with_name("registry-judge-schema.json")
 FIXTURE_DIR = ROOT / "tests/fixtures/clients/tgg/output-quality"
 DEFAULT_STATE_DIR = Path.home() / ".marshal/state/tgg-output-quality-eval"
 PORTAL_BASE = "https://systems.papercut-labs.com/tgg"
@@ -327,6 +326,7 @@ def make_bundles(snapshot: dict[str, Any]) -> tuple[list[dict[str, Any]], list[s
     events = snapshot["events"]
     event_by_id = {str(item["message_id"]): item for item in events}
     event_ids = set(event_by_id)
+    case_ids = {int(item["id"]) for item in snapshot["cases"]}
     observations_by_case: dict[int, list[dict[str, Any]]] = {}
     mapped: set[str] = set()
     for observation in snapshot["observations"]:
@@ -355,6 +355,8 @@ def make_bundles(snapshot: dict[str, Any]) -> tuple[list[dict[str, Any]], list[s
                     stack.extend(value)
             observation = {**observation, "_matched_source_refs": sorted(refs & event_ids)}
         case_id = int(observation["case_id"])
+        if case_id not in case_ids:
+            raise EvalError(f"observation references missing case row: {case_id}")
         observations_by_case.setdefault(case_id, []).append(observation)
         mapped.update(str(item) for item in observation.get("_matched_source_refs", []))
     bundles: list[dict[str, Any]] = []
@@ -526,6 +528,10 @@ def validate_judgment(value: Any, registry: Registry, maker_session_id: str) -> 
         raise EvalError("judge response must be a JSON object")
     required = {
         "checker_session_id",
+        "naive_checker_session_id",
+        "registry_checker_session_id",
+        "naive_pass",
+        "registry_pass",
         "source_to_page",
         "page_to_source",
         "manager_readability",
@@ -539,12 +545,34 @@ def validate_judgment(value: Any, registry: Registry, maker_session_id: str) -> 
         raise EvalError("judge checker_session_id is missing")
     if checker == maker_session_id:
         raise EvalError("checker session equals maker session")
+    naive_checker = value["naive_checker_session_id"]
+    registry_checker = value["registry_checker_session_id"]
+    if not all(isinstance(item, str) and item for item in (naive_checker, registry_checker)):
+        raise EvalError("two-pass checker session ids are missing")
+    if maker_session_id in {naive_checker, registry_checker}:
+        raise EvalError("checker session equals maker session")
+    if naive_checker == registry_checker:
+        raise EvalError("naive and registry passes reused one checker session")
+    naive_pass = value["naive_pass"]
+    registry_pass = value["registry_pass"]
+    if not isinstance(naive_pass, dict) or set(naive_pass) != {
+        "source_to_page", "page_to_source", "manager_readability", "summary"
+    }:
+        raise EvalError("naive pass has an invalid shape")
+    if not isinstance(registry_pass, dict) or set(registry_pass) != {"checks"}:
+        raise EvalError("registry pass has an invalid shape")
     for axis in ("source_to_page", "page_to_source", "manager_readability"):
         if value[axis] not in RESULTS:
             raise EvalError(f"invalid {axis} result")
     if not isinstance(value["summary"], str) or not value["summary"].strip():
         raise EvalError("judge summary is empty")
     checks = value["checks"]
+    if any(value[axis] != naive_pass[axis] for axis in ("source_to_page", "page_to_source", "manager_readability")):
+        raise EvalError("combined axes diverge from naive pass")
+    if value["summary"] != naive_pass["summary"]:
+        raise EvalError("combined summary diverges from naive pass")
+    if checks != registry_pass["checks"]:
+        raise EvalError("combined checks diverge from registry pass")
     if not isinstance(checks, list):
         raise EvalError("judge checks must be an array")
     found: dict[str, dict[str, Any]] = {}
@@ -564,10 +592,8 @@ def validate_judgment(value: Any, registry: Registry, maker_session_id: str) -> 
 
 
 class Judge:
-    def __init__(self, command: Command = run_command, command_argv: Sequence[str] | None = None):
+    def __init__(self, command: Command = run_command):
         self.command = command
-        configured = os.environ.get("TGG_OUTPUT_EVAL_JUDGE_COMMAND")
-        self.command_argv = list(command_argv or (shlex.split(configured) if configured else []))
 
     def judge(
         self,
@@ -576,38 +602,27 @@ class Judge:
         registry: Registry,
         maker_session_id: str,
     ) -> dict[str, Any]:
-        prompt = (
+        naive_prompt = (
             "This is a bounded evaluation task, not repository development or durable-memory work. "
             "Return only the requested judgment JSON. You are an independent vision quality checker. "
-            "Read the source bundle and accessibility "
-            "snapshots named below and inspect both attached screenshots. Check both directions: every "
+            "Take the cold stance of a TGG manager seeing this page for the first time. Do not use, "
+            "infer, or search for a checklist. Read the source bundle and accessibility snapshots "
+            "named below and inspect both attached screenshots. Judge the general quality bar in both directions: every "
             "page claim must trace to source, every source fact must be represented, and the page must "
-            "read sensibly to a TGG manager. Run every registry check exactly once, using each "
-            "registry check id verbatim. A check whose triggering source fact is absent is unsure, not "
-            "pass. Use unsure whenever "
-            "evidence is insufficient; never silently pass uncertainty.\n"
+            "read sensibly to a TGG manager. Use unsure whenever evidence is insufficient; never "
+            "silently pass uncertainty.\n"
+            f"source_bundle={bundle_path}\ncase_snapshot={captures['snapshot']}\n"
+            f"portal_snapshot={captures['portal_snapshot']}\n"
+        )
+        registry_prompt = (
+            "This is the second, regression-floor pass. Return only the requested judgment JSON. "
+            "Read the source bundle, accessibility snapshots, screenshots, and named registry. Run "
+            "every registry check exactly once using its id verbatim. A check whose triggering source "
+            "fact is absent is unsure, not pass. Never silently pass uncertainty.\n"
             f"source_bundle={bundle_path}\ncase_snapshot={captures['snapshot']}\n"
             f"portal_snapshot={captures['portal_snapshot']}\nregistry={REGISTRY_PATH}\n"
         )
-        if self.command_argv:
-            request = {
-                "prompt": prompt,
-                "bundle_path": str(bundle_path),
-                "captures": captures,
-                "registry": [item.__dict__ for item in registry.checks],
-                "maker_session_id": maker_session_id,
-            }
-            result = self.command(self.command_argv, input=json_dump(request), capture_output=True)
-            if result.returncode:
-                raise EvalError(f"injected judge command failed: {result.stderr.strip()}")
-            try:
-                value = json.loads(result.stdout)
-            except json.JSONDecodeError as exc:
-                raise EvalError("injected judge command returned invalid JSON") from exc
-            return validate_judgment(value, registry, maker_session_id)
-
         with tempfile.TemporaryDirectory(prefix="tgg-output-judge-") as tmp:
-            output = Path(tmp) / "result.json"
             try:
                 source_bundle = json.loads(bundle_path.read_text())
             except (OSError, json.JSONDecodeError) as exc:
@@ -620,31 +635,15 @@ class Judge:
                 and Path(item["local_path"]).is_file()
             ][:20]
             if source_images:
-                prompt += (
+                attachment_note = (
                     "\nAttachment order: image 1 is the rendered case page; image 2 is the portal "
                     "case list; subsequent images are retained source media in this exact order:\n"
                     + "\n".join(f"- {path}" for path in source_images)
                     + "\nUse the bundle's retained_media mapping to correlate each source image. "
                     "If more source media is referenced than attached, mark affected checks unsure.\n"
                 )
-            argv = [
-                "codex",
-                "exec",
-                "--json",
-                "--sandbox",
-                "read-only",
-                "--output-schema",
-                str(JUDGE_SCHEMA_PATH),
-                "--output-last-message",
-                str(output),
-                "-i",
-                captures["screenshot"],
-                "-i",
-                captures["portal_screenshot"],
-            ]
-            for source_image in source_images:
-                argv.extend(["-i", source_image])
-            argv.append("-")
+                naive_prompt += attachment_note
+                registry_prompt += attachment_note
             # `codex exec` inherits CODEX_THREAD_ID in managed sessions and
             # otherwise resumes the maker's thread. Remove only session
             # bindings so the checker is a genuinely fresh vision seat while
@@ -660,24 +659,85 @@ class Judge:
                 "CLAUDE_CODE_CHILD_SESSION",
             ):
                 checker_env.pop(key, None)
-            result = self.command(argv, input=prompt, capture_output=True, env=checker_env)
-            if result.returncode:
-                raise EvalError(f"vision judge failed: {result.stderr.strip()}")
-            checker_id = None
-            for line in result.stdout.splitlines():
+
+            def run_pass(
+                prompt: str, schema: Path, output_name: str, *, isolated: bool = False
+            ) -> tuple[dict[str, Any], str]:
+                output = Path(tmp) / output_name
+                argv = [
+                    "codex", "exec", "--json", "--sandbox", "read-only",
+                    "--output-schema", str(schema),
+                    "--output-last-message", str(output),
+                    "-i", captures["screenshot"],
+                    "-i", captures["portal_screenshot"],
+                ]
+                if isolated:
+                    naive_root = Path(tmp) / "naive-root"
+                    naive_root.mkdir(exist_ok=True)
+                    argv.extend(["-C", str(naive_root), "--skip-git-repo-check", "--ignore-rules"])
+                for source_image in source_images:
+                    argv.extend(["-i", source_image])
+                argv.append("-")
                 try:
-                    event = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if event.get("type") == "thread.started":
-                    checker_id = event.get("thread_id")
-            if not checker_id:
-                raise EvalError("vision judge did not expose its checker session id")
-            try:
-                value = json.loads(output.read_text())
-            except (OSError, json.JSONDecodeError) as exc:
-                raise EvalError("vision judge did not write strict JSON") from exc
-            value["checker_session_id"] = checker_id
+                    result = self.command(
+                        argv, input=prompt, capture_output=True, env=checker_env, timeout=120
+                    )
+                except subprocess.TimeoutExpired as exc:
+                    raise EvalError(f"vision judge timed out: {output_name}") from exc
+                if result.returncode:
+                    raise EvalError(f"vision judge failed: {result.stderr.strip()}")
+                checker_id = None
+                for line in result.stdout.splitlines():
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if event.get("type") == "thread.started":
+                        checker_id = event.get("thread_id")
+                if not checker_id:
+                    raise EvalError("vision judge did not expose its checker session id")
+                try:
+                    value = json.loads(output.read_text())
+                except (OSError, json.JSONDecodeError) as exc:
+                    raise EvalError("vision judge did not write strict JSON") from exc
+                if schema == NAIVE_JUDGE_SCHEMA_PATH:
+                    required = {
+                        "source_to_page", "page_to_source", "manager_readability", "summary"
+                    }
+                    if not isinstance(value, dict) or set(value) != required:
+                        raise EvalError("naive judge pass has an invalid shape")
+                    if any(value[axis] not in RESULTS for axis in required - {"summary"}):
+                        raise EvalError("naive judge pass has an invalid result")
+                    if not isinstance(value["summary"], str) or not value["summary"].strip():
+                        raise EvalError("naive judge pass has an empty summary")
+                elif (
+                    not isinstance(value, dict)
+                    or set(value) != {"checks"}
+                    or not isinstance(value["checks"], list)
+                ):
+                    raise EvalError("registry judge pass has an invalid shape")
+                return value, str(checker_id)
+
+            naive, naive_checker = run_pass(
+                naive_prompt, NAIVE_JUDGE_SCHEMA_PATH, "naive.json", isolated=True
+            )
+            registry_result, registry_checker = run_pass(
+                registry_prompt, REGISTRY_JUDGE_SCHEMA_PATH, "registry.json"
+            )
+            if maker_session_id in {naive_checker, registry_checker}:
+                raise EvalError("checker session equals maker session")
+            value = {
+                "checker_session_id": registry_checker,
+                "naive_checker_session_id": naive_checker,
+                "registry_checker_session_id": registry_checker,
+                "naive_pass": naive,
+                "registry_pass": registry_result,
+                "source_to_page": naive["source_to_page"],
+                "page_to_source": naive["page_to_source"],
+                "manager_readability": naive["manager_readability"],
+                "summary": naive["summary"],
+                "checks": registry_result["checks"],
+            }
             return validate_judgment(value, registry, maker_session_id)
 
 
@@ -921,6 +981,7 @@ class Evaluator:
         captures = self.browser.capture(run_id, bundles, run_dir)
         new_defects = 0
         defects: list[dict[str, Any]] = []
+        prepared: list[tuple[dict[str, Any], str, Path]] = []
         for bundle in bundles:
             job_no = str(bundle["case"]["job_no"])
             bundle_path = run_dir / f"bundle-{hashlib.sha256(job_no.encode()).hexdigest()[:12]}.json"
@@ -929,7 +990,23 @@ class Evaluator:
                 run_dir / "media" / hashlib.sha256(job_no.encode()).hexdigest()[:12],
             )
             bundle_path.write_text(json.dumps(bundle, ensure_ascii=False, indent=2), encoding="utf-8")
-            judgment = self.judge.judge(bundle_path, captures[job_no], registry, maker_session_id)
+            prepared.append((bundle, job_no, bundle_path))
+        judgments: dict[str, dict[str, Any]] = {}
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            futures = {
+                executor.submit(
+                    self.judge.judge,
+                    bundle_path,
+                    captures[job_no],
+                    registry,
+                    maker_session_id,
+                ): job_no
+                for _bundle, job_no, bundle_path in prepared
+            }
+            for future in as_completed(futures):
+                judgments[futures[future]] = future.result()
+        for bundle, job_no, bundle_path in prepared:
+            judgment = judgments[job_no]
             judgment_path = bundle_path.with_name(bundle_path.stem + ".judgment.json")
             judgment_path.write_text(json.dumps(judgment, ensure_ascii=False, indent=2), encoding="utf-8")
             message_ids = [str(item["message_id"]) for item in bundle["messages"]]
@@ -979,242 +1056,6 @@ class Evaluator:
         atomic_json(run_dir / "receipt.json", receipt)
         append_jsonl(self.store.runs_path, receipt)
         return {"ok": True, "ran": True, **receipt}
-
-
-def _external_result(value: Any) -> str:
-    if isinstance(value, str):
-        result = value.lower().strip().replace(" ", "_")
-    elif isinstance(value, dict):
-        result = str(value.get("outcome") or value.get("result") or "").lower().strip()
-    else:
-        result = ""
-    aliases = {"passed": "pass", "failed": "fail", "uncertain": "unsure", "unknown": "unsure"}
-    result = aliases.get(result, result)
-    if result not in RESULTS:
-        raise EvalError(f"external judge emitted invalid outcome: {value!r}")
-    return result
-
-
-def _external_evidence(item: dict[str, Any]) -> str:
-    value = item.get("reason") or item.get("evidence") or item.get("page_evidence")
-    if isinstance(value, list):
-        value = "; ".join(str(part) for part in value)
-    if not isinstance(value, str) or not value.strip():
-        raise EvalError("external judge check has no reason/page evidence")
-    return value.strip()
-
-
-def finalize_external(
-    store: StateStore,
-    *,
-    batch_path: Path,
-    judgment_path: Path,
-    artifacts_dir: Path,
-    maker_session_id: str,
-    filer: DefectFiler | None = None,
-    golden_judge: Judge | None = None,
-    now: datetime | None = None,
-) -> dict[str, Any]:
-    """Finalize a pre-collected real batch after an independent judge returns.
-
-    This is deliberately separate from collection so a long-running independent
-    vision clone can finish without holding the cursor transaction open. The
-    cursor advances only after every non-pass result has a durable WB id.
-    """
-    if not isinstance(maker_session_id, str) or not maker_session_id.strip():
-        raise EvalError("maker_session_id is required")
-    now = now or utc_now()
-    registry = load_registry()
-    batch = json.loads(batch_path.read_text())
-    raw_judgment = json.loads(judgment_path.read_text())
-    if not isinstance(raw_judgment, dict):
-        raise EvalError("external judge result must be an object")
-    checker = raw_judgment.get("evaluator_session") or raw_judgment.get("checker_session_id")
-    if not isinstance(checker, str) or not checker:
-        raise EvalError("external judge result has no evaluator_session")
-    if checker == maker_session_id:
-        raise EvalError("checker session equals maker session")
-    case_results = raw_judgment.get("cases")
-    portal_results = raw_judgment.get("portal_checks", [])
-    if not isinstance(case_results, list) or not isinstance(portal_results, list):
-        raise EvalError("external judge cases and portal_checks must be arrays")
-    bundles, unmapped = make_bundles(batch)
-    bundle_by_job = {str(item["case"]["job_no"]): item for item in bundles}
-    result_by_job: dict[str, dict[str, Any]] = {}
-    for item in case_results:
-        if not isinstance(item, dict):
-            raise EvalError("external judge case entry must be an object")
-        job_no = str(item.get("job_no") or "")
-        if not job_no or job_no in result_by_job:
-            raise EvalError(f"external judge has missing or duplicate job_no: {job_no!r}")
-        result_by_job[job_no] = item
-    if set(result_by_job) != set(bundle_by_job):
-        missing = sorted(set(bundle_by_job) - set(result_by_job))
-        extra = sorted(set(result_by_job) - set(bundle_by_job))
-        raise EvalError(f"external judge case coverage mismatch; missing={missing}, extra={extra}")
-    expected_case_ids = {item.id for item in registry.checks if item.scope == "case"}
-    expected_portal_ids = {item.id for item in registry.checks if item.scope == "portal"}
-    portal_normalized: list[dict[str, Any]] = []
-    for item in portal_results:
-        check_id = item.get("check_id") or item.get("id")
-        portal_normalized.append(
-            {
-                "id": check_id,
-                "result": _external_result(item.get("outcome") or item.get("result")),
-                "evidence": _external_evidence(item),
-                "message_ids": [str(value) for value in item.get("evidence_message_ids", [])],
-            }
-        )
-    if {item["id"] for item in portal_normalized} != expected_portal_ids:
-        raise EvalError("external judge portal check ids do not exactly match the registry")
-    state = store.load()
-    cursor_start = int(batch.get("cursor_start", 0))
-    cursor_end = int(batch.get("cursor_end") or max(int(item["seq"]) for item in batch["events"]))
-    if int(state.get("cursor", 0)) > cursor_end:
-        raise EvalError("local cursor is ahead of the external batch")
-    if int(state.get("cursor", 0)) == cursor_end:
-        return {"ok": True, "ran": False, "reason": "already-finalized", "cursor": state["cursor"]}
-    if int(state.get("cursor", 0)) != cursor_start:
-        raise EvalError("local cursor does not match the external batch start")
-    run_id = f"external-{cursor_start + 1}-{cursor_end}"
-    evidence_dir = store.root / "runs" / run_id
-    evidence_dir.mkdir(parents=True, exist_ok=True)
-    durable_batch = evidence_dir / "source-batch.json"
-    durable_judgment = evidence_dir / "judge-result.json"
-    shutil.copy2(batch_path, durable_batch)
-    shutil.copy2(judgment_path, durable_judgment)
-    if state.get("registry_hash") != registry.digest:
-        Evaluator(store, judge=golden_judge or Judge())._golden(registry, maker_session_id)
-    filer = filer or DefectFiler(store)
-    defects: list[dict[str, Any]] = []
-    for job_no, bundle in bundle_by_job.items():
-        item = result_by_job[job_no]
-        raw_checks = item.get("checks")
-        if not isinstance(raw_checks, list):
-            raise EvalError(f"external judge checks missing for {job_no}")
-        normalized: list[dict[str, Any]] = []
-        for check in raw_checks:
-            check_id = check.get("check_id") or check.get("id")
-            normalized.append(
-                {
-                    "id": check_id,
-                    "result": _external_result(check.get("outcome") or check.get("result")),
-                    "evidence": _external_evidence(check),
-                    "message_ids": [str(value) for value in check.get("evidence_message_ids", [])],
-                }
-            )
-        if {check["id"] for check in normalized} != expected_case_ids:
-            raise EvalError(f"external judge check ids do not exactly match registry for {job_no}")
-        directional = item.get("directional_judgment")
-        if not isinstance(directional, dict):
-            directional = {}
-        directional_reason = str(
-            directional.get("reason")
-            or item.get("manager_sense_reason")
-            or raw_judgment.get("overall")
-            or "External bidirectional judgment."
-        )
-        axes = [
-            {
-                "id": "source_to_page",
-                "result": _external_result(item.get("source_to_page") or directional.get("source_to_page")),
-                "evidence": str(item.get("source_to_page_reason") or directional_reason),
-                "message_ids": [],
-            },
-            {
-                "id": "page_to_source",
-                "result": _external_result(item.get("page_to_source") or directional.get("page_to_source")),
-                "evidence": str(item.get("page_to_source_reason") or directional_reason),
-                "message_ids": [],
-            },
-            {
-                "id": "manager_readability",
-                "result": _external_result(
-                    item.get("manager_sense")
-                    or item.get("manager_readability")
-                    or directional.get("manager_sense")
-                    or directional.get("manager_readability")
-                ),
-                "evidence": directional_reason,
-                "message_ids": [],
-            },
-        ]
-        case_id = int(bundle["case"]["id"])
-        slug = job_no.lower().replace("/", "-")
-        screenshot_candidates = [artifacts_dir / f"case-{case_id}.png", artifacts_dir / f"{slug}.png"]
-        screenshot = next((path for path in screenshot_candidates if path.exists()), None)
-        if screenshot is None:
-            raise EvalError(f"no screenshot found for {job_no}")
-        durable_screenshot = evidence_dir / screenshot.name
-        shutil.copy2(screenshot, durable_screenshot)
-        all_message_ids = [str(message["message_id"]) for message in bundle["messages"]]
-        for check in [*normalized, *axes]:
-            if check["result"] == "pass":
-                continue
-            evidence_ids = check["message_ids"] or all_message_ids
-            wb_id, created = filer.file(
-                job_no=job_no,
-                check=check,
-                screenshot=str(durable_screenshot),
-                message_ids=evidence_ids,
-                judgment_path=str(durable_judgment),
-            )
-            defects.append({"wb_id": wb_id, "created": created, "job_no": job_no, **check})
-    preferred_portal = artifacts_dir / "portal-cases.png"
-    portal_screenshot = (
-        preferred_portal
-        if preferred_portal.exists()
-        else next(iter(sorted(artifacts_dir.glob("portal*.png"))), None)
-    )
-    if portal_screenshot is None:
-        raise EvalError("external batch has no screenshot evidence")
-    durable_portal_screenshot = evidence_dir / portal_screenshot.name
-    shutil.copy2(portal_screenshot, durable_portal_screenshot)
-    for check in portal_normalized:
-        if check["result"] == "pass":
-            continue
-        wb_id, created = filer.file(
-            job_no="TGG portal",
-            check=check,
-            screenshot=str(durable_portal_screenshot),
-            message_ids=check["message_ids"],
-            judgment_path=str(durable_judgment),
-        )
-        defects.append({"wb_id": wb_id, "created": created, "job_no": "TGG portal", **check})
-    occurrence_key = f"{cursor_start + 1}:{cursor_end}"
-    occurrences = list(state.get("occurred_batch_keys", []))
-    if occurrence_key not in occurrences:
-        state["batches_occurred"] = int(state.get("batches_occurred", 0)) + 1
-        occurrences.append(occurrence_key)
-        state["occurred_batch_keys"] = occurrences[-100:]
-    state["cursor"] = cursor_end
-    state["last_success_at"] = iso(now)
-    state["registry_hash"] = registry.digest
-    state["batches_evaluated"] = int(state.get("batches_occurred", 0))
-    created_count = sum(int(item["created"]) for item in defects)
-    state["loop_caught"] = int(state.get("loop_caught", 0)) + created_count
-    state["last_completed_rows"] = len(batch["events"])
-    state["last_unmapped_count"] = len(unmapped)
-    trend = list(state.get("defect_trend", []))
-    trend.append({"run_id": run_id, "at": iso(now), "defects": len(defects), "new_defects": created_count})
-    state["defect_trend"] = trend[-30:]
-    store.save(state)
-    receipt = {
-        "run_id": run_id,
-        "trigger": "external-independent-judge",
-        "checker_session_id": checker,
-        "started_cursor": cursor_start,
-        "committed_cursor": cursor_end,
-        "completed_rows": len(batch["events"]),
-        "cases_evaluated": len(bundles),
-        "unmapped_message_ids": unmapped,
-        "defects": defects,
-        "registry_hash": registry.digest,
-        "completed_at": iso(now),
-    }
-    append_jsonl(store.runs_path, receipt)
-    atomic_json(artifacts_dir / "finalize-receipt.json", receipt)
-    return {"ok": True, "ran": True, **receipt}
 
 
 def health(store: StateStore, now: datetime | None = None) -> dict[str, Any]:
@@ -1271,11 +1112,6 @@ def build_parser() -> argparse.ArgumentParser:
     human = sub.add_parser("record-human-catch", help="Record a human catch only after its named check exists.")
     human.add_argument("--check-id", required=True)
     human.add_argument("--evidence", required=True)
-    finalize = sub.add_parser("finalize", help="Finalize an externally collected batch and independent judgment.")
-    finalize.add_argument("--batch", type=Path, required=True)
-    finalize.add_argument("--judge-result", type=Path, required=True)
-    finalize.add_argument("--artifacts-dir", type=Path, required=True)
-    finalize.add_argument("--maker-session-id", default=os.environ.get("MARSHAL_SESSION_ID", ""))
     initialize = sub.add_parser("initialize-cursor", help="Set the first cursor on pristine local evaluator state.")
     initialize.add_argument("--cursor", type=int, required=True)
     return parser
@@ -1300,15 +1136,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             store.save(state)
             append_jsonl(store.human_path, {"at": iso(utc_now()), "check_id": args.check_id, "evidence": args.evidence})
             result = {"ok": True, "check_id": args.check_id}
-        elif args.command_name == "finalize":
-            with store.exclusive_run():
-                result = finalize_external(
-                    store,
-                    batch_path=args.batch,
-                    judgment_path=args.judge_result,
-                    artifacts_dir=args.artifacts_dir,
-                    maker_session_id=args.maker_session_id,
-                )
         elif args.command_name == "initialize-cursor":
             result = initialize_cursor(store, args.cursor)
         else:
