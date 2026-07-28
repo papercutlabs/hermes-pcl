@@ -859,12 +859,24 @@ class DefectFiler:
                     str(desc),
                     "--dod-file",
                     str(dod),
+                    # Clone-scoped work with a non-empty DoD requires both flags
+                    # (BUILD_WORK_REQUIREMENTS_UNMET). A defect row is evidence for a
+                    # later fix, not the fix itself, so `classify` is the honest
+                    # contract and is exempt from the rollback-policy requirement.
+                    "--completion-contract",
+                    "classify",
+                    "--runtime",
+                    "cc",
                     "--dispatch-now",
                 ],
                 capture_output=True,
             )
         if result.returncode:
-            raise EvalError(f"defect filing failed: {result.stderr.strip()}")
+            # pcl writes its error envelope to STDOUT, not stderr. Reporting stderr
+            # here turned every refusal into "defect filing failed: " with nothing
+            # after the colon, which hid a CLI contract change for as long as it ran.
+            detail = (result.stdout or "").strip() or (result.stderr or "").strip()
+            raise EvalError(f"defect filing failed: {detail}")
         wb_id = result.stdout.strip()
         if not wb_id:
             raise EvalError("defect filing returned no WB id")
