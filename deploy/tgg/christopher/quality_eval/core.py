@@ -7,6 +7,7 @@ import json
 import os
 import subprocess
 import tempfile
+import threading
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -30,6 +31,12 @@ SSH_TARGET = "tgg-app-1"
 INBOX_DB = "/home/pclaw/.hermes-christopher-tgg/runtime/capture-inbox.db"
 TENANT_DB = "/home/pclaw/.systems-pcl/data/tenants/tgg.db"
 RESULTS = {"pass", "fail", "unsure"}
+# The measured 176-case backlog took 985 seconds end-to-end (5.60s/case)
+# while doing 161 serial media pulls and judging three cases concurrently.
+# That mean is concurrency-smoothed and cannot bound an individual case's two
+# sequential judge passes.  Under a hard 120-second runner ceiling, one case
+# is therefore the only positive cap that cannot multiply the measured tail.
+MAX_CASES_PER_RUN = 1
 MEDIA_ROOTS = (
     "/var/lib/tgg-capture/",
     "/home/pclaw/.hermes-christopher-tgg/",
@@ -157,6 +164,7 @@ class StateStore:
                 "occurred_batch_keys": [],
                 "last_completed_rows": 0,
                 "last_unmapped_count": 0,
+                "pending_cases": 0,
             }
         return json.loads(self.state_path.read_text())
 
@@ -385,6 +393,76 @@ def make_bundles(snapshot: dict[str, Any]) -> tuple[list[dict[str, Any]], list[s
     return bundles, unmapped
 
 
+def select_case_batch(
+    snapshot: dict[str, Any],
+    *,
+    max_cases: int = MAX_CASES_PER_RUN,
+) -> tuple[list[dict[str, Any]], list[str], int, int, int]:
+    """Select a bounded case batch and its safely committable event prefix.
+
+    Cases are ordered by their first source event.  When the batch is capped,
+    the cursor stops immediately before the first event belonging to an
+    unjudged case.  A selected case may have later source events beyond that
+    boundary; judging it early is harmless, while advancing over the unjudged
+    case would lose the exact defects this evaluator exists to surface.
+    """
+    if max_cases <= 0:
+        raise EvalError("max_cases must be positive")
+    bundles, all_unmapped = make_bundles(snapshot)
+    events = snapshot["events"]
+    if not events:
+        raise EvalError("case batch selection requires at least one event")
+
+    def first_seq(bundle: dict[str, Any]) -> int:
+        seqs = [int(message["seq"]) for message in bundle["messages"]]
+        if not seqs:
+            raise EvalError("case bundle has no matched source events")
+        return min(seqs)
+
+    ordered = sorted(
+        bundles,
+        key=lambda bundle: (
+            first_seq(bundle),
+            int(bundle["case"]["id"]),
+        ),
+    )
+    selected = ordered[:max_cases]
+    # One source event can legitimately fan out into multiple case records.
+    # The cursor cannot split an event, so its first-sequence tie group is the
+    # indivisible boundary: include the whole group rather than either skip an
+    # unjudged case or wedge forever on an empty safe prefix. The global judge
+    # semaphore below still bounds checker fan-out.
+    if selected and len(ordered) > len(selected):
+        boundary_seq = first_seq(selected[-1])
+        selected.extend(
+            bundle
+            for bundle in ordered[len(selected):]
+            if first_seq(bundle) == boundary_seq
+        )
+    selected_ids = {int(bundle["case"]["id"]) for bundle in selected}
+    remainder = [
+        bundle for bundle in ordered if int(bundle["case"]["id"]) not in selected_ids
+    ]
+    if remainder:
+        first_unjudged_seq = min(
+            int(message["seq"])
+            for bundle in remainder
+            for message in bundle["messages"]
+        )
+        committable = [
+            event for event in events if int(event["seq"]) < first_unjudged_seq
+        ]
+    else:
+        committable = list(events)
+    if not committable:
+        raise EvalError("case cap could not form a progress-safe cursor prefix")
+
+    committed_cursor = max(int(event["seq"]) for event in committable)
+    committable_ids = {str(event["message_id"]) for event in committable}
+    unmapped = [message_id for message_id in all_unmapped if message_id in committable_ids]
+    return selected, unmapped, committed_cursor, len(committable), len(remainder)
+
+
 def pull_retained_media(
     bundle: dict[str, Any],
     destination: Path,
@@ -594,6 +672,9 @@ def validate_judgment(value: Any, registry: Registry, maker_session_id: str) -> 
 class Judge:
     def __init__(self, command: Command = run_command):
         self.command = command
+        # Evaluator workers and the two independent passes are nested. Keep the
+        # actual Codex process population at the measured three-wide ceiling.
+        self._pass_slots = threading.BoundedSemaphore(3)
 
     def judge(
         self,
@@ -675,13 +756,23 @@ class Judge:
                     naive_root = Path(tmp) / "naive-root"
                     naive_root.mkdir(exist_ok=True)
                     argv.extend(["-C", str(naive_root), "--skip-git-repo-check", "--ignore-rules"])
+                else:
+                    # The registry pass keeps repo rules, so it must run inside a
+                    # trusted git directory. Without an explicit -C it inherited the
+                    # caller's cwd: green when a human ran it from a checkout, and
+                    # "Not inside a trusted directory" every time the check runner
+                    # fired from its own cwd. Pin it to the repo root so the pass is
+                    # cwd-independent and keeps the rules that distinguish it from
+                    # the isolated naive pass.
+                    argv.extend(["-C", str(ROOT)])
                 for source_image in source_images:
                     argv.extend(["-i", source_image])
                 argv.append("-")
                 try:
-                    result = self.command(
-                        argv, input=prompt, capture_output=True, env=checker_env, timeout=120
-                    )
+                    with self._pass_slots:
+                        result = self.command(
+                            argv, input=prompt, capture_output=True, env=checker_env, timeout=120
+                        )
                 except subprocess.TimeoutExpired as exc:
                     raise EvalError(f"vision judge timed out: {output_name}") from exc
                 if result.returncode:
@@ -718,12 +809,25 @@ class Judge:
                     raise EvalError("registry judge pass has an invalid shape")
                 return value, str(checker_id)
 
-            naive, naive_checker = run_pass(
-                naive_prompt, NAIVE_JUDGE_SCHEMA_PATH, "naive.json", isolated=True
-            )
-            registry_result, registry_checker = run_pass(
-                registry_prompt, REGISTRY_JUDGE_SCHEMA_PATH, "registry.json"
-            )
+            # The two passes are independent: separate prompts, schemas,
+            # outputs, and fresh checker sessions. Running them serially made
+            # even a one-case batch exceed the check runner's hard ceiling.
+            with ThreadPoolExecutor(max_workers=2) as pass_executor:
+                naive_future = pass_executor.submit(
+                    run_pass,
+                    naive_prompt,
+                    NAIVE_JUDGE_SCHEMA_PATH,
+                    "naive.json",
+                    isolated=True,
+                )
+                registry_future = pass_executor.submit(
+                    run_pass,
+                    registry_prompt,
+                    REGISTRY_JUDGE_SCHEMA_PATH,
+                    "registry.json",
+                )
+                naive, naive_checker = naive_future.result()
+                registry_result, registry_checker = registry_future.result()
             if maker_session_id in {naive_checker, registry_checker}:
                 raise EvalError("checker session equals maker session")
             value = {
@@ -914,6 +1018,7 @@ class Evaluator:
         judge: Judge | None = None,
         filer: DefectFiler | None = None,
         clock: Callable[[], datetime] = utc_now,
+        max_cases_per_run: int = MAX_CASES_PER_RUN,
     ):
         self.store = store
         self.collect = collect
@@ -921,6 +1026,7 @@ class Evaluator:
         self.judge = judge or Judge()
         self.filer = filer or DefectFiler(store)
         self.clock = clock
+        self.max_cases_per_run = max_cases_per_run
 
     def _golden(self, registry: Registry, maker_session_id: str) -> None:
         source = FIXTURE_DIR / "golden-source.json"
@@ -972,18 +1078,55 @@ class Evaluator:
         )
         if not due:
             return {"ok": True, "ran": False, "reason": reason, "new_completions": len(events)}
-        occurrence_key = f"{events[0]['seq']}:{events[-1]['seq']}"
+        try:
+            (
+                bundles,
+                unmapped,
+                committed_cursor,
+                committed_events_count,
+                capped_out_cases,
+            ) = select_case_batch(snapshot, max_cases=self.max_cases_per_run)
+        except EvalError:
+            # Mapping/selection failures are still real occurrences. Record
+            # them before re-raising so health cannot report full coverage over
+            # a batch that never reached judging.
+            failure_key = f"{events[0]['seq']}:{events[-1]['seq']}"
+            occurrence_keys = list(state.get("occurred_batch_keys", []))
+            if failure_key not in occurrence_keys:
+                state["batches_occurred"] = int(state.get("batches_occurred", 0)) + 1
+                occurrence_keys.append(failure_key)
+                state["occurred_batch_keys"] = occurrence_keys[-100:]
+                self.store.save(state)
+            raise
+        if state.get("registry_hash") != registry.digest:
+            # Golden validation is its own bounded run. Combining its measured
+            # ~54.5s with the measured 90.5s one-case run would exceed the
+            # consumer's 120s ceiling and pin the cursor after every registry
+            # edit. Persist the validated hash, then let the next trigger judge
+            # live work in a fresh budget window.
+            self._golden(registry, maker_session_id)
+            completed_at = self.clock()
+            state["registry_hash"] = registry.digest
+            state["last_success_at"] = iso(completed_at)
+            state["pending_cases"] = len(bundles) + capped_out_cases
+            self.store.save(state)
+            return {
+                "ok": True,
+                "ran": False,
+                "reason": "golden-regression-completed",
+                "registry_hash": registry.digest,
+                "pending_cases": state["pending_cases"],
+                "new_completions": len(events),
+            }
+        occurrence_key = f"{events[0]['seq']}:{committed_cursor}"
         occurrence_keys = list(state.get("occurred_batch_keys", []))
         if occurrence_key not in occurrence_keys:
             state["batches_occurred"] = int(state.get("batches_occurred", 0)) + 1
             occurrence_keys.append(occurrence_key)
             state["occurred_batch_keys"] = occurrence_keys[-100:]
         self.store.save(state)
-        if state.get("registry_hash") != registry.digest:
-            self._golden(registry, maker_session_id)
-        bundles, unmapped = make_bundles(snapshot)
         start_cursor = int(state["cursor"])
-        run_id = f"cursor-{start_cursor + 1}-{events[-1]['seq']}"
+        run_id = f"cursor-{start_cursor + 1}-{committed_cursor}"
         run_dir = self.store.root / "runs" / run_id
         # A failed attempt deliberately keeps its evidence. Retrying the same
         # cursor window resumes that stable run directory rather than inventing
@@ -1039,7 +1182,7 @@ class Evaluator:
                 new_defects += int(created)
                 defects.append({"wb_id": wb_id, "created": created, **check})
         completed_at = self.clock()
-        state["cursor"] = max(int(item["seq"]) for item in events)
+        state["cursor"] = committed_cursor
         state["last_success_at"] = iso(completed_at)
         state["registry_hash"] = registry.digest
         # The committed cursor covers every overlapping occurrence window
@@ -1047,8 +1190,9 @@ class Evaluator:
         # end sequence is now included.
         state["batches_evaluated"] = int(state.get("batches_occurred", 0))
         state["loop_caught"] = int(state.get("loop_caught", 0)) + new_defects
-        state["last_completed_rows"] = len(events)
+        state["last_completed_rows"] = committed_events_count
         state["last_unmapped_count"] = len(unmapped)
+        state["pending_cases"] = capped_out_cases
         trend = list(state.get("defect_trend", []))
         trend.append({"run_id": run_id, "at": iso(completed_at), "defects": len(defects), "new_defects": new_defects})
         state["defect_trend"] = trend[-30:]
@@ -1058,8 +1202,9 @@ class Evaluator:
             "trigger": reason,
             "started_cursor": start_cursor,
             "committed_cursor": state["cursor"],
-            "completed_rows": len(events),
+            "completed_rows": committed_events_count,
             "cases_evaluated": len(bundles),
+            "cases_capped_out": capped_out_cases,
             "unmapped_message_ids": unmapped,
             "defects": defects,
             "registry_hash": registry.digest,
@@ -1095,6 +1240,7 @@ def health(store: StateStore, now: datetime | None = None) -> dict[str, Any]:
         "loop_caught": int(state.get("loop_caught", 0)),
         "last_completed_rows": int(state.get("last_completed_rows", 0)),
         "last_unmapped_count": int(state.get("last_unmapped_count", 0)),
+        "pending_cases": int(state.get("pending_cases", 0)),
     }
 
 
@@ -1169,6 +1315,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "loop_caught",
                         "last_completed_rows",
                         "last_unmapped_count",
+                        "pending_cases",
                     )
                 }
             )
