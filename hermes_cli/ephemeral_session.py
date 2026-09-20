@@ -25,19 +25,26 @@ def _remove_ephemeral_session_files(sessions_dir: Path, session_id: str) -> None
 def run_ephemeral_session(*, prompt: str, system_prompt: str, model: str,
                           max_iterations: int, allowed_tool_names: list[str],
                           provider: str | None = None,
+                          explicit_api_key: str | None = None,
                           session_prefix: str = "ephemeral") -> tuple[dict[str, Any], dict[str, Any]]:
     """Run one canonical-provider turn and erase its session/transcript.
 
     This is deliberately not a gateway or delivery carrier.  The audit holds
     only non-sensitive identity/hash/lifecycle facts, never the prompt or
     tool arguments.
+
+    ``explicit_api_key`` is optional and only forwarded to
+    ``resolve_oneshot_runtime``.  Omitting it resolves exactly as before.  The
+    value is never placed in the audit, the returned lifecycle or a log: the
+    audit below carries identity, hashes and lifecycle facts only, and that is
+    unchanged by this argument.
     """
     from hermes_constants import get_hermes_home
     from hermes_state import SessionDB
     from run_agent import AIAgent
     from hermes_cli.oneshot import _oneshot_clarify_callback, resolve_oneshot_runtime
 
-    _cfg, effective_model, runtime = resolve_oneshot_runtime(model, provider)
+    _cfg, effective_model, runtime = resolve_oneshot_runtime(model, provider, explicit_api_key)
     session_id = f"{session_prefix}-{uuid.uuid4().hex}"
     db = SessionDB()
     agent = None

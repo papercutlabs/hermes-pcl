@@ -215,8 +215,21 @@ def _create_session_db_for_oneshot():
         return None
 
 
-def resolve_oneshot_runtime(model: Optional[str] = None, provider: Optional[str] = None):
-    """Canonical CLI/oneshot model+provider resolution, reusable by ephemeral turns."""
+def resolve_oneshot_runtime(model: Optional[str] = None, provider: Optional[str] = None,
+                            explicit_api_key: Optional[str] = None):
+    """Canonical CLI/oneshot model+provider resolution, reusable by ephemeral turns.
+
+    ``explicit_api_key`` is optional and forwarded unchanged to the existing
+    resolver, which already accepts one and already decides what to do with it
+    per provider. Omitting it takes exactly the previous path: the resolver's
+    own default is None, so a caller that passes nothing cannot behave
+    differently from before this argument existed.
+
+    Nothing here reads an environment variable, a file or an auth store for a
+    credential, and no new provider, loader or lookup is introduced. This is
+    forwarding only: it lets a caller that already holds a credential hand it
+    to the resolver instead of having no way to say so.
+    """
     from hermes_cli.config import load_config
     from hermes_cli.models import detect_provider_for_model
     from hermes_cli.runtime_provider import resolve_runtime_provider
@@ -237,7 +250,7 @@ def resolve_oneshot_runtime(model: Optional[str] = None, provider: Optional[str]
             cfg_provider = str(model_cfg.get("provider") or "").strip().lower() if isinstance(model_cfg, dict) else ""
             detected = detect_provider_for_model(explicit_model, cfg_provider or os.getenv("HERMES_INFERENCE_PROVIDER", "").strip().lower() or "auto")
             if detected: effective_provider, effective_model = detected
-    return cfg, effective_model, resolve_runtime_provider(requested=effective_provider, target_model=effective_model or None, explicit_base_url=explicit_base_url_from_alias)
+    return cfg, effective_model, resolve_runtime_provider(requested=effective_provider, target_model=effective_model or None, explicit_base_url=explicit_base_url_from_alias, explicit_api_key=explicit_api_key)
 
 
 def _run_agent(
