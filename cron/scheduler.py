@@ -124,6 +124,15 @@ def _merge_cron_pa_toolsets(
     job_disabled = list(getattr(job_brief, "disabled_toolsets", ()) or ())
     next_enabled = job_enabled if job_enabled else enabled_toolsets
     next_disabled = list(disabled_toolsets or [])
+    # The TGG Management capability supplies a dedicated read-only child
+    # surface. Honor its explicit delegation selection at this PA boundary;
+    # the generic cron default must not silently contradict that brief.
+    if (
+        getattr(pa_context, "job_type", None) == "tgg_management"
+        and "tgg-management-readonly-investigation" in job_enabled
+        and "delegation" in job_enabled
+    ):
+        next_disabled = [name for name in next_disabled if name != "delegation"]
     next_disabled.extend(job_disabled)
 
     def _dedupe(values: list[str] | None) -> list[str] | None:
@@ -1662,9 +1671,9 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         set_session_pa_job_type(getattr(pa_resolved_context, "job_type", None))
         cron_enabled_toolsets, cron_disabled_toolsets = _merge_cron_pa_toolsets(
             _resolve_cron_enabled_toolsets(job, _cfg),
-            # A scheduled PA turn is the already-confirmed unit of work.  A
-            # child would lose the resolved management business surface and
-            # turn a simple report into an unbound second workflow.
+            # Generic cron exclusions remain the default. The PA toolset
+            # adapter can honor an explicitly configured read-only TGG
+            # delegation route without reopening messaging or scheduling.
             ["cronjob", "messaging", "clarify", "delegation"],
             pa_resolved_context,
         )
