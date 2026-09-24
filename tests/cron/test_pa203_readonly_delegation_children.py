@@ -1,9 +1,11 @@
-"""PA-203: a delegated child on the Management route can never write.
+"""PA-203: a delegated child on the Management route receives only two toolsets.
 
 Native delegation builds every child from the parent agent's
 ``enabled_toolsets``.  The PA layer scopes that attribute on the Management
 route (interactive Management turns and scheduled ``tgg_management`` jobs) to
-the capability's read-only investigation toolset.  These tests drive the real
+the capability's read-only investigation toolset and its explicit case-edit
+toolset (the same reads plus ``tgg_whatsapp_case_record_result``).  No other
+write tool can reach a child.  These tests drive the real
 cron ``run_job`` and gateway ``_run_agent`` construction paths, then build the
 child with the real ``tools.delegate_tool._build_child_agent``.
 """
@@ -23,6 +25,7 @@ import yaml
 import gateway.run as gateway_run
 import toolsets as toolsets_module
 from agent.pa_delegation import (
+    MANAGEMENT_EXPLICIT_EDIT_CHILD_TOOLSET,
     MANAGEMENT_READONLY_CHILD_TOOLSET,
     delegation_child_toolsets,
     scope_delegation_children,
@@ -35,6 +38,9 @@ from tools.delegate_tool import _build_child_agent
 
 FIXTURE = Path(__file__).parents[1] / "fixtures" / "pa" / "bobby_tgg_constitution.yaml"
 READONLY = MANAGEMENT_READONLY_CHILD_TOOLSET
+EXPLICIT = MANAGEMENT_EXPLICIT_EDIT_CHILD_TOOLSET
+BOTH = [READONLY, EXPLICIT]
+RECORD = "tgg_whatsapp_case_record_result"
 
 # The Management brief's enabled toolsets in the PA-203 capability candidate.
 MANAGEMENT_ENABLED = [
@@ -51,6 +57,7 @@ MANAGEMENT_ENABLED = [
     "tgg-per-case-whatsapp",
     "tgg-management-skill-readonly",
     READONLY,
+    EXPLICIT,
     "delegation",
 ]
 
@@ -84,7 +91,11 @@ WRITE_REQUEST = [
     "cronjob",
     "python-sandbox",
     "report-operations",
+    "tgg-whatsapp-evidence",
 ]
+
+# The capability's explicit case-edit child toolset (per-case investigator profile).
+EXPLICIT_TOOLS = [*READONLY_TOOLS, RECORD]
 
 WRITE_TOOLS = {
     "pa_business_write",
@@ -95,6 +106,8 @@ WRITE_TOOLS = {
     "tgg_whatsapp_case_record_result",
     "tgg_whatsapp_case_submit",
     "tgg_file_return",
+    "tgg_human_resolution_document_append",
+    "tgg_contractor_update_policy_set",
     "python_sandbox",
     "write_file",
     "patch",
@@ -110,6 +123,23 @@ def capability_toolsets(monkeypatch):
         toolsets_module.TOOLSETS,
         READONLY,
         {"description": "read-only investigation", "tools": list(READONLY_TOOLS), "includes": []},
+    )
+    monkeypatch.setitem(
+        toolsets_module.TOOLSETS,
+        EXPLICIT,
+        {"description": "explicit case edit", "tools": list(EXPLICIT_TOOLS), "includes": []},
+    )
+    monkeypatch.setitem(
+        toolsets_module.TOOLSETS,
+        "tgg-whatsapp-evidence",
+        {
+            "description": "evidence (stand-in with its write tools)",
+            "tools": [
+                "tgg_whatsapp_source_query", RECORD, "tgg_file_return",
+                "tgg_human_resolution_document_append", "tgg_contractor_update_policy_set",
+            ],
+            "includes": [],
+        },
     )
     monkeypatch.setitem(
         toolsets_module.TOOLSETS,
@@ -178,15 +208,17 @@ def _tools(toolset_names) -> set[str]:
 
 
 def test_policy_scopes_only_the_management_route():
-    assert delegation_child_toolsets(_context(), MANAGEMENT_ENABLED) == [READONLY]
-    assert delegation_child_toolsets(_context(), None) == [READONLY]
+    assert delegation_child_toolsets(_context(), MANAGEMENT_ENABLED) == BOTH
+    assert delegation_child_toolsets(_context(), None) == BOTH
+    assert delegation_child_toolsets(_context(), ["file", READONLY]) == [READONLY]
+    assert delegation_child_toolsets(_context(), ["file", EXPLICIT]) == [EXPLICIT]
     assert delegation_child_toolsets(_context("tgg_ops_ingest"), MANAGEMENT_ENABLED) is None
     assert delegation_child_toolsets(_context(None), MANAGEMENT_ENABLED) is None
     assert delegation_child_toolsets(None, MANAGEMENT_ENABLED) is None
 
 
-def test_management_parent_without_the_readonly_toolset_gives_children_nothing():
-    enabled = [name for name in MANAGEMENT_ENABLED if name != READONLY]
+def test_management_parent_without_either_child_toolset_gives_children_nothing():
+    enabled = [name for name in MANAGEMENT_ENABLED if name not in BOTH]
     assert delegation_child_toolsets(_context(), enabled) == []
 
     parent = _parent(list(enabled))
@@ -194,20 +226,57 @@ def test_management_parent_without_the_readonly_toolset_gives_children_nothing()
 
     assert _child_toolsets(parent, None) == []
     assert _child_toolsets(parent, WRITE_REQUEST) == []
+    assert _child_toolsets(parent, [EXPLICIT]) == []
 
 
-# ── (a) omitted toolsets → read-only only ─────────────────────────────────
+# ── (a) omitted toolsets → only the two allowed toolsets ──────────────────
 
 
-def test_omitted_toolsets_give_the_child_only_the_readonly_toolset():
+def test_omitted_toolsets_give_the_child_only_the_two_allowed_toolsets():
     parent = _parent(list(MANAGEMENT_ENABLED))
     scope_delegation_children(parent, list(MANAGEMENT_ENABLED), _context())
 
     child = _child_toolsets(parent, None)
 
+    assert child == BOTH
+    assert _tools(child) == set(EXPLICIT_TOOLS)
+    # The result recorder is the only recording tool; no other write arrives.
+    assert _tools(child) & WRITE_TOOLS == {RECORD}
+
+
+def test_named_readonly_child_gets_exactly_the_readonly_set():
+    parent = _parent(list(MANAGEMENT_ENABLED))
+    scope_delegation_children(parent, list(MANAGEMENT_ENABLED), _context())
+
+    child = _child_toolsets(parent, [READONLY])
+
     assert child == [READONLY]
     assert _tools(child) == set(READONLY_TOOLS)
     assert not (_tools(child) & WRITE_TOOLS)
+
+
+def test_explicit_edit_child_gets_exactly_the_explicit_edit_set():
+    """The per-case investigator profile names only the explicit-edit toolset."""
+    parent = _parent(list(MANAGEMENT_ENABLED))
+    scope_delegation_children(parent, list(MANAGEMENT_ENABLED), _context())
+
+    child = _child_toolsets(parent, [EXPLICIT])
+
+    assert child == [EXPLICIT]
+    assert _tools(child) == set(EXPLICIT_TOOLS)
+    assert _tools(child) & WRITE_TOOLS == {RECORD}
+
+
+def test_old_investigator_profile_request_loses_every_write_but_the_recorder():
+    """The pre-integration profile (evidence, vision, file) gains nothing it may not have."""
+    parent = _parent(list(MANAGEMENT_ENABLED))
+    scope_delegation_children(parent, list(MANAGEMENT_ENABLED), _context())
+
+    child = _child_toolsets(parent, ["tgg-whatsapp-evidence", "vision", "file"])
+
+    assert "tgg-whatsapp-evidence" not in child
+    assert "file" not in child
+    assert _tools(child) <= set(EXPLICIT_TOOLS)
 
 
 # ── (b) explicit write request → stripped ─────────────────────────────────
@@ -224,6 +293,30 @@ def test_explicit_write_request_is_stripped_to_nothing():
     assert "tgg-per-case-whatsapp" not in child
 
 
+@pytest.mark.parametrize(
+    "requested",
+    [
+        ["pa-business"],
+        ["pa_business_write"],
+        ["tgg_case_create", "tgg_case_update_state"],
+        ["pa-business", READONLY],
+        ["pa-business", EXPLICIT],
+    ],
+)
+def test_business_write_or_case_create_update_request_gains_nothing_extra(requested):
+    parent = _parent(list(MANAGEMENT_ENABLED))
+    scope_delegation_children(parent, list(MANAGEMENT_ENABLED), _context())
+
+    child = _child_toolsets(parent, requested)
+
+    assert set(child) <= set(BOTH)
+    tools = _tools(child)
+    assert not tools & {"pa_business_write", "tgg_case_create", "tgg_case_update_state",
+                        "tgg_case_observation", "tgg_whatsapp_case_submit",
+                        "tgg_whatsapp_case_prepare"}
+    assert tools <= set(EXPLICIT_TOOLS)
+
+
 def test_explicit_mixed_request_keeps_only_the_readonly_part():
     parent = _parent(list(MANAGEMENT_ENABLED))
     scope_delegation_children(parent, list(MANAGEMENT_ENABLED), _context())
@@ -234,6 +327,7 @@ def test_explicit_mixed_request_keeps_only_the_readonly_part():
     )
 
     assert READONLY in child
+    assert EXPLICIT not in child
     assert "tgg-management-skill-readonly" in child
     assert _tools(child) <= set(READONLY_TOOLS)
     assert not (_tools(child) & WRITE_TOOLS)
@@ -245,7 +339,7 @@ def test_scoping_does_not_change_the_parent_constructor_list():
     scope_delegation_children(parent, enabled, _context())
 
     assert enabled == MANAGEMENT_ENABLED
-    assert parent.enabled_toolsets == [READONLY]
+    assert parent.enabled_toolsets == BOTH
 
 
 # ── (c) non-Management routes unchanged ───────────────────────────────────
@@ -284,6 +378,7 @@ def _readonly_management_constitution(tmp_path: Path) -> Path:
     management["enabled_toolsets"] = [
         *management["enabled_toolsets"],
         READONLY,
+        EXPLICIT,
         "delegation",
     ]
     path = tmp_path / "readonly-management-constitution.yaml"
@@ -335,9 +430,10 @@ def test_scheduled_management_job_children_are_readonly(tmp_path):
     assert READONLY in kwargs["enabled_toolsets"]
     assert "delegation" in kwargs["enabled_toolsets"]
     assert "delegation" not in (kwargs["disabled_toolsets"] or [])
-    # Its children do not.
-    assert parent.enabled_toolsets == [READONLY]
-    assert _child_toolsets(parent, None) == [READONLY]
+    # Its children get only the two allowed toolsets.
+    assert parent.enabled_toolsets == BOTH
+    assert _child_toolsets(parent, None) == BOTH
+    assert _child_toolsets(parent, [EXPLICIT]) == [EXPLICIT]
     assert not (_tools(_child_toolsets(parent, WRITE_REQUEST)) & WRITE_TOOLS)
 
 
@@ -494,9 +590,10 @@ async def test_interactive_management_turn_children_are_readonly(gateway_runner,
     agent = _TurnAgent.instances[0]
     # The parent was constructed with the whole Management brief.
     assert agent.constructed_enabled_toolsets == MANAGEMENT_ENABLED
-    # During its turn, delegation sees only the read-only child scope.
-    assert agent.child_scopes == [[READONLY]]
-    assert _child_toolsets(agent, None) == [READONLY]
+    # During its turn, delegation sees only the two allowed child toolsets.
+    assert agent.child_scopes == [BOTH]
+    assert _child_toolsets(agent, None) == BOTH
+    assert _child_toolsets(agent, [EXPLICIT]) == [EXPLICIT]
     stripped = _child_toolsets(agent, WRITE_REQUEST)
     assert not (_tools(stripped) & WRITE_TOOLS)
 
