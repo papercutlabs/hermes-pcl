@@ -481,3 +481,205 @@ def test_per_participant_group_sessions_have_no_conversation_folder(home):
     (home / "config.yaml").write_text(yaml.safe_dump(config))
 
     assert _resolve_cron_pa_workspace_owner(_job()) is None
+
+
+# Review fix 2 ----------------------------------------------------------------
+# Publication never deletes the kept copy when the run's copy is unreadable or
+# not a regular file, and a file replaced by a directory (or the reverse)
+# keeps both versions.  Each case is reported in the result.
+
+
+def _retained(tmp_path, files: dict[str, str]):
+    work = tmp_path / "hermes" / "sandbox_workspaces" / ("s_" + "c" * 64) / "work"
+    work.mkdir(parents=True)
+    for name, text in files.items():
+        (work / name).parent.mkdir(parents=True, exist_ok=True)
+        (work / name).write_text(text)
+    base = sandbox._work_manifest(work)
+    output = tmp_path / "output"
+    shutil.copytree(work, output)
+    return work, base, output
+
+
+def _publish(tmp_path, work, base, output):
+    return sandbox._publish_workspace(
+        output, work, base, run_id="r_0000000e", hermes_home=tmp_path / "hermes"
+    )
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can read a mode-0 file")
+def test_unreadable_run_copy_keeps_the_retained_file(tmp_path):
+    work, base, output = _retained(tmp_path, {"report.xlsx": "47 blanks"})
+    (output / "report.xlsx").chmod(0)
+    try:
+        result = _publish(tmp_path, work, base, output)
+    finally:
+        (output / "report.xlsx").chmod(0o600)
+
+    assert (work / "report.xlsx").read_text() == "47 blanks"
+    assert result["kept"] == ["report.xlsx"]
+    assert result["unpublished"] == ["report.xlsx"]
+
+
+def test_file_replaced_by_a_directory_keeps_both_versions(tmp_path):
+    work, base, output = _retained(tmp_path, {"a": "the file"})
+    (output / "a").unlink()
+    (output / "a").mkdir()
+    (output / "a" / "b").write_text("the directory's file")
+
+    result = _publish(tmp_path, work, base, output)
+
+    assert (work / "a").read_text() == "the file"
+    saved = result["renamed"]["a/b"]
+    assert saved == "a.r_0000000e/b"
+    assert (work / saved).read_text() == "the directory's file"
+    assert result["kept"] == ["a"]
+    assert result["unpublished"] == []
+
+
+def test_directory_replaced_by_a_file_keeps_both_versions(tmp_path):
+    work, base, output = _retained(tmp_path, {"a/x.txt": "inside the directory"})
+    shutil.rmtree(output / "a")
+    (output / "a").write_text("now a file")
+
+    result = _publish(tmp_path, work, base, output)
+
+    assert (work / "a" / "x.txt").read_text() == "inside the directory"
+    saved = result["renamed"]["a"]
+    assert (work / saved).read_text() == "now a file"
+    assert result["kept"] == ["a/x.txt"]
+
+
+def test_file_replaced_by_a_symlink_keeps_the_retained_file_and_reports_it(tmp_path):
+    work, base, output = _retained(tmp_path, {"report.xlsx": "47 blanks"})
+    (output / "report.xlsx").unlink()
+    (output / "report.xlsx").symlink_to("/etc/hosts")
+
+    result = _publish(tmp_path, work, base, output)
+
+    assert (work / "report.xlsx").read_text() == "47 blanks"
+    assert not (work / "report.xlsx").is_symlink()
+    assert result["kept"] == ["report.xlsx"]
+
+
+def test_a_real_deletion_is_still_published(tmp_path):
+    work, base, output = _retained(tmp_path, {"old.txt": "x", "dir/y.txt": "y"})
+    (output / "old.txt").unlink()
+    shutil.rmtree(output / "dir")
+
+    result = _publish(tmp_path, work, base, output)
+
+    assert not (work / "old.txt").exists()
+    assert not (work / "dir" / "y.txt").exists()
+    assert result["kept"] == []
+
+
+def test_type_change_is_reported_in_the_tool_result(home):
+    _live_turn(_write("a", "the file"))
+    code = (
+        "(WORK / 'a').unlink()\n"
+        "(WORK / 'a').mkdir()\n"
+        "(WORK / 'a' / 'b').write_text('inside')\n"
+    )
+    result = _live_turn(code, session_id="live-session-2")
+
+    [renamed] = result["workspace_renamed"]
+    assert renamed["written"] == "work/a/b"
+    assert renamed["saved_as"] == f"work/a.{result['run_id']}/b"
+    assert result["workspace_kept"] == ["work/a"]
+    assert "workspace_kept_note" in result
+    work = home / "sandbox_workspaces" / sandbox._workspace_key(LIVE_KEY) / "work"
+    assert (work / "a").read_text() == "the file"
+
+
+# Review fix 6: scheduled delivery attachments ---------------------------------
+
+
+def test_scheduled_run_records_the_files_it_published(home):
+    _live_turn(_write("older.xlsx", "an older Management workbook"))
+
+    _observed, delivered = _run_scheduled(_job(), _write("report.xlsx", "scheduled review"))
+
+    assert delivered["published_paths"] == {"report.xlsx"}
+
+
+def _bridge(job, chat_id, media, allowed, monkeypatch):
+    from cron.scheduler import _deliver_whatsapp_via_tgg_reply_bridge
+
+    sent = []
+
+    class Response:
+        status = 200
+
+        def read(self):
+            return b'{"success":true}'
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setenv("TGG_REPLY_BRIDGE_URL", "http://bridge.test")
+    with patch(
+        "urllib.request.urlopen",
+        side_effect=lambda req, timeout: sent.append(json.loads(req.data)) or Response(),
+    ):
+        error = _deliver_whatsapp_via_tgg_reply_bridge(
+            job, chat_id, "", [(media, False)],
+            workspace_owner=LIVE_KEY, allowed_work_paths=allowed,
+        )
+    return error, sent
+
+
+def test_non_origin_delivery_attaches_only_files_the_job_made(home, monkeypatch):
+    _live_turn(_write("older.xlsx", "an older Management workbook"))
+    _live_turn(_write("report.xlsx", "job output"), session_id="live-session-3")
+
+    refused, sent = _bridge(_job(), OPS_CHAT, "work/older.xlsx", {"report.xlsx"}, monkeypatch)
+    assert refused and "did not produce" in refused
+    assert sent == []
+
+    allowed, sent = _bridge(_job(), OPS_CHAT, "work/report.xlsx", {"report.xlsx"}, monkeypatch)
+    assert allowed is None
+    assert [item["fileName"] for item in sent] == ["report.xlsx"]
+
+
+def test_origin_delivery_may_attach_any_file_of_the_conversation_folder(home, monkeypatch):
+    _live_turn(_write("older.xlsx", "an older Management workbook"))
+
+    error, sent = _bridge(_job(), MANAGEMENT_CHAT, "work/older.xlsx", None, monkeypatch)
+
+    assert error is None
+    assert [item["fileName"] for item in sent] == ["older.xlsx"]
+
+
+@pytest.mark.parametrize(
+    ("deliver", "restricted"),
+    [("origin", False), (f"whatsapp:{OPS_CHAT}", True)],
+)
+def test_deliver_result_restricts_only_non_origin_targets(deliver, restricted):
+    from cron import scheduler
+    from gateway.config import Platform
+
+    pconfig = MagicMock()
+    pconfig.enabled = False
+    config = MagicMock()
+    config.platforms = {Platform.WHATSAPP: pconfig}
+    seen = {}
+
+    def bridge(job, chat_id, text, media, **kwargs):
+        seen["allowed"] = kwargs.get("allowed_work_paths")
+        return None
+
+    job = _job(deliver=deliver)
+    with patch.dict(os.environ, {"TGG_REPLY_BRIDGE_URL": "http://bridge.test"}), \
+         patch("gateway.config.load_gateway_config", return_value=config), \
+         patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+         patch("cron.scheduler._deliver_whatsapp_via_tgg_reply_bridge", side_effect=bridge):
+        assert scheduler._deliver_result(
+            job, "done\nMEDIA:work/report.xlsx",
+            workspace_owner=LIVE_KEY, published_paths={"report.xlsx"},
+        ) is None
+
+    assert seen["allowed"] == ({"report.xlsx"} if restricted else None)

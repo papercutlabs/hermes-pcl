@@ -72,6 +72,9 @@ _WORKSPACE_LOCK_FILE = ".publish.lock"
 _EXPORT_COMPLETE = ".hermes-export-complete"
 # A runtime-derived workspace owner bound by trusted scheduler code.  It is
 # never a tool argument, so the model cannot select another conversation.
+_BOUND_PUBLISHED: contextvars.ContextVar[set | None] = contextvars.ContextVar(
+    "HERMES_SANDBOX_PUBLISHED_COLLECTOR", default=None
+)
 _BOUND_WORKSPACE_OWNER: contextvars.ContextVar[str] = contextvars.ContextVar(
     "HERMES_SANDBOX_WORKSPACE_OWNER", default=""
 )
@@ -877,6 +880,19 @@ def reset_workspace_owner(token: contextvars.Token) -> None:
     _BOUND_WORKSPACE_OWNER.reset(token)
 
 
+def bind_published_collector(collector: set) -> contextvars.Token:
+    """Collect the ``work/`` paths this task's sandbox runs publish.
+
+    The PA scheduler binds one set per scheduled run, so delivery to a chat
+    other than the job's origin can attach only files the job itself made.
+    """
+    return _BOUND_PUBLISHED.set(collector)
+
+
+def reset_published_collector(token: contextvars.Token) -> None:
+    _BOUND_PUBLISHED.reset(token)
+
+
 def current_workspace_owner(fallback: str | None = None) -> str:
     """Return the owner of the retained workspace for this task.
 
@@ -927,34 +943,50 @@ def _workspace_lock(session_id: str, workspace: Path) -> Iterator[None]:
                 os.close(fd)
 
 
-def _work_manifest(work: Path) -> dict[str, str]:
+def _work_manifest(
+    work: Path, irregular: dict[str, str] | None = None
+) -> dict[str, str]:
     """Map each regular retained file under ``work`` to its SHA-256.
 
     ``result.json`` is the per-invocation return channel, never workspace
-    state, and symlinks or special files are never retained.
+    state, and symlinks or special files are never retained.  When
+    ``irregular`` is given, every entry that is present but is not hashed is
+    recorded there: ``"not_regular"`` for a symlink or special file and
+    ``"unreadable"`` for a file that could not be read.  Publication uses it
+    so that such an entry is never mistaken for a deletion.
     """
     manifest: dict[str, str] = {}
     if not work.is_dir() or work.is_symlink():
         return manifest
     for current, dirnames, filenames in os.walk(work, topdown=True, followlinks=False):
         current_path = Path(current)
-        dirnames[:] = [
-            name for name in dirnames if not (current_path / name).is_symlink()
-        ]
+        kept_dirs = []
+        for name in dirnames:
+            if (current_path / name).is_symlink():
+                if irregular is not None:
+                    irregular[(current_path / name).relative_to(work).as_posix()] = "not_regular"
+            else:
+                kept_dirs.append(name)
+        dirnames[:] = kept_dirs
         for name in filenames:
             if name == "result.json":
                 continue
             path = current_path / name
+            relative = path.relative_to(work).as_posix()
             try:
                 if not stat.S_ISREG(path.lstat().st_mode):
+                    if irregular is not None:
+                        irregular[relative] = "not_regular"
                     continue
                 digest = hashlib.sha256()
                 with path.open("rb") as handle:
                     for chunk in iter(lambda: handle.read(1024 * 1024), b""):
                         digest.update(chunk)
             except OSError:
+                if irregular is not None:
+                    irregular[relative] = "unreadable"
                 continue
-            manifest[path.relative_to(work).as_posix()] = digest.hexdigest()
+            manifest[relative] = digest.hexdigest()
     return manifest
 
 
@@ -992,6 +1024,31 @@ def _alternate_name(relative: str, run_id: str, taken: set[str]) -> str:
     raise RuntimeError("could not choose a distinct workspace name")
 
 
+def _free_name(
+    destination: Path, relative: str, run_id: str, taken: set[str]
+) -> str:
+    """A name beside ``relative`` that no file, directory or plan uses yet."""
+    for index in range(1000):
+        candidate = _alternate_name(relative, f"{run_id}-{index}" if index else run_id, set())
+        if candidate not in taken and not os.path.lexists(destination / candidate):
+            return candidate
+    raise RuntimeError("could not choose a distinct workspace name")
+
+
+def _blocked_prefix(root: Path, relative_parent: Path) -> str | None:
+    """First ancestor of a target that exists in ``root`` but is not a real directory."""
+    current = root
+    for index, part in enumerate(relative_parent.parts):
+        current = current / part
+        try:
+            mode = current.lstat().st_mode
+        except FileNotFoundError:
+            return None
+        if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
+            return Path(*relative_parent.parts[: index + 1]).as_posix()
+    return None
+
+
 def _real_directory_chain(root: Path, relative_parent: Path) -> bool:
     current = root
     for part in relative_parent.parts:
@@ -1025,27 +1082,52 @@ def _publish_workspace(
       another writer changed the same path since the seed: then the other
       writer's file keeps its name and this run's file is installed beside it
       under a distinct name, reported back as ``renamed``;
-    * a seed file this run deleted is removed only if nobody changed it since.
+    * a seed file this run deleted is removed only if nobody changed it since,
+      and only if the run's tree really lacks it: a retained file the run
+      replaced with a directory, symlink or special file, or whose run copy
+      could not be read, is kept and reported as ``kept``;
+    * where the run replaced a file with a directory (or a directory with a
+      file), both versions survive: the run's entry is installed under a
+      distinct name and reported as ``renamed``;
+    * a run file that could not be read is reported as ``unpublished``.
 
     Every installed file receives the configured reader ACL before it becomes
     visible under its final name.
     """
-    out = _work_manifest(source)
+    irregular: dict[str, str] = {}
+    out = _work_manifest(source, irregular)
     destination.mkdir(parents=True, exist_ok=True, mode=0o700)
     current = _work_manifest(destination)
     taken = set(current) | set(out)
     installs: list[tuple[str, str]] = []  # (source relative, destination relative)
+    produced: list[str] = []  # run-written files already present with equal bytes
     renamed: dict[str, str] = {}
-    unpublished: list[str] = []
+    unpublished: list[str] = sorted(
+        relative for relative, reason in irregular.items() if reason == "unreadable"
+    )
+    prefix_moves: dict[str, str] = {}  # blocked destination prefix -> its free name
     for relative, digest in sorted(out.items()):
-        if base.get(relative) == digest or current.get(relative) == digest:
+        if base.get(relative) == digest:
+            continue
+        if current.get(relative) == digest:
+            produced.append(relative)
             continue
         target = relative
         occupied_by_directory = (destination / relative).is_dir()
         if occupied_by_directory or (
             relative in current and current[relative] != base.get(relative)
         ):
-            target = _alternate_name(relative, run_id, taken)
+            target = _free_name(destination, relative, run_id, taken)
+            taken.add(target)
+            renamed[relative] = target
+        blocked = _blocked_prefix(destination, Path(target).parent)
+        if blocked is not None:
+            # A retained file (or symlink) sits where this run has a directory:
+            # keep it, and move this run's directory beside it under one name.
+            if blocked not in prefix_moves:
+                prefix_moves[blocked] = _free_name(destination, blocked, run_id, taken)
+                taken.add(prefix_moves[blocked])
+            target = prefix_moves[blocked] + target[len(blocked):]
             taken.add(target)
             renamed[relative] = target
         if not _real_directory_chain(destination, Path(target).parent):
@@ -1054,11 +1136,20 @@ def _publish_workspace(
             continue
         installs.append((relative, target))
 
-    removals = [
-        relative
-        for relative, digest in base.items()
-        if relative not in out and current.get(relative) == digest
-    ]
+    removals: list[str] = []
+    kept: list[str] = []
+    for relative, digest in base.items():
+        if relative in out or current.get(relative) != digest:
+            continue
+        if os.path.lexists(source / relative) or not _real_directory_chain(
+            source, Path(relative).parent
+        ):
+            # The run still has something at this path (a directory, symlink,
+            # special or unreadable file), or replaced a parent directory with
+            # a file.  That is not a deletion: keep the retained copy.
+            kept.append(relative)
+            continue
+        removals.append(relative)
 
     parent = destination.parent
     staged = parent / f".work-{uuid.uuid4().hex}.tmp"
@@ -1096,7 +1187,12 @@ def _publish_workspace(
         os.utime(parent, None)
     finally:
         shutil.rmtree(staged, ignore_errors=True)
-    return {"renamed": renamed, "unpublished": unpublished}
+    return {
+        "renamed": renamed,
+        "unpublished": unpublished,
+        "kept": sorted(kept),
+        "produced": sorted(produced + [target for _relative, target in installs]),
+    }
 
 
 def _prune_workspaces(
@@ -1434,7 +1530,7 @@ def _run_python_sandbox(
     duration = round(time.monotonic() - started, 3)
     export_complete = work / _EXPORT_COMPLETE
     publication_error: SandboxReaderPolicyError | None = None
-    publication: dict[str, Any] = {"renamed": {}, "unpublished": []}
+    publication: dict[str, Any] = {"renamed": {}, "unpublished": [], "kept": []}
     if export_complete.exists():
         export_complete.unlink()
         if workspace is not None:
@@ -1448,6 +1544,9 @@ def _run_python_sandbox(
                         hermes_home=hermes_home,
                         reader_uid=reader_uid,
                     )
+                collector = _BOUND_PUBLISHED.get()
+                if collector is not None:
+                    collector.update(publication.get("produced") or [])
             except SandboxReaderPolicyError as exc:
                 logger.exception("Could not apply sandbox reader ACL before publication")
                 publication_error = exc
@@ -1502,13 +1601,24 @@ def _run_python_sandbox(
         ]
         payload["workspace_note"] = (
             "Another task in this conversation changed a file with the same "
-            "name while this run executed. That file keeps its name; this "
-            "run's file was saved as saved_as. Use files[].path exactly."
+            "name while this run executed, or the folder already holds a "
+            "different kind of entry at that name. The existing entry keeps "
+            "its name; this run's file was saved as saved_as. Use "
+            "files[].path exactly."
         )
     if publication.get("unpublished"):
         payload["workspace_unpublished"] = [
             f"work/{relative}" for relative in publication["unpublished"]
         ]
+    if publication.get("kept"):
+        payload["workspace_kept"] = [
+            f"work/{relative}" for relative in publication["kept"]
+        ]
+        payload["workspace_kept_note"] = (
+            "This run replaced these files with a directory, link or special "
+            "file, or its copy could not be read. The conversation folder "
+            "keeps the previous file under the same name."
+        )
     payload = _sanitize_value(payload)
     meta = {
         "run_id": run_id,

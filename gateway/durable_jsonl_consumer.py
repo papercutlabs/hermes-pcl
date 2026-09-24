@@ -5094,8 +5094,42 @@ async def process_management_document_canary_event(
     }
 
 
+def _loaded_catalog_status() -> Mapping[str, Any]:
+    """What this process has actually loaded: plugins and registered tools.
+
+    Read-only view of the in-process plugin manager and tool registry, so a
+    release readback can check the running service rather than a fresh
+    process.  It never triggers plugin discovery itself.
+    """
+    try:
+        from hermes_cli.plugins import get_plugin_manager
+        from tools.registry import registry
+
+        manager = get_plugin_manager()
+        return {
+            "pid": os.getpid(),
+            "plugins_discovered": bool(getattr(manager, "_discovered", False)),
+            "plugins": sorted(
+                name
+                for name, plugin in getattr(manager, "_plugins", {}).items()
+                if getattr(plugin, "enabled", False)
+            ),
+            "tools": sorted(getattr(registry, "_tools", {})),
+        }
+    except Exception as exc:  # status must never fail the consumer
+        return {"pid": os.getpid(), "error": f"{type(exc).__name__}: {exc}"[:300]}
+
+
 def _write_status(path: Path, payload: Mapping[str, Any]) -> None:
-    _atomic_write_json(path, {"version": 1, "updated_at": _utc_now(), **dict(payload)})
+    _atomic_write_json(
+        path,
+        {
+            "version": 1,
+            "updated_at": _utc_now(),
+            **dict(payload),
+            "loaded_catalog": _loaded_catalog_status(),
+        },
+    )
 
 
 def _management_continuation_status(

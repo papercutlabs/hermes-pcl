@@ -635,6 +635,7 @@ def _deliver_whatsapp_via_tgg_reply_bridge(
     media_files: list,
     *,
     workspace_owner: str | None = None,
+    allowed_work_paths: set[str] | None = None,
 ) -> Optional[str]:
     """Deliver Christopher cron output through the durable consumer bridge.
 
@@ -657,6 +658,13 @@ def _deliver_whatsapp_via_tgg_reply_bridge(
         if text.startswith(("work/", "/work/")):
             from tools.python_sandbox_tool import resolve_sandbox_work_path
 
+            if allowed_work_paths is not None:
+                relative = text[len("/work/"):] if text.startswith("/work/") else text[len("work/"):]
+                if relative not in allowed_work_paths:
+                    raise ValueError(
+                        "this scheduled job did not produce that file; outside its "
+                        "origin chat it may attach only files it made"
+                    )
             return resolve_sandbox_work_path(text, str(workspace_owner or ""))
         candidate = Path(text)
         # Promoted refs are absolute-looking `/media/...` handles; every
@@ -737,9 +745,15 @@ def _deliver_result(
     loop=None,
     *,
     workspace_owner: str | None = None,
+    published_paths: set[str] | None = None,
 ) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
+
+    ``published_paths`` (PA-203) is set when the job worked in its origin
+    conversation's persistent folder.  A delivery to that origin chat may
+    attach any file of the folder; a delivery to any other target may attach
+    only the files this run's sandbox calls published.
 
     When ``adapters`` and ``loop`` are provided (gateway is running), tries to
     use the live adapter first — this supports E2EE rooms (e.g. Matrix) where
@@ -828,12 +842,20 @@ def _deliver_result(
         pconfig = config.platforms.get(platform)
         if not pconfig or not pconfig.enabled:
             if platform == Platform.WHATSAPP and os.environ.get("TGG_REPLY_BRIDGE_URL", "").strip():
+                origin_target = _resolve_origin(job) or {}
+                to_origin = (
+                    str(origin_target.get("platform") or "").lower() == platform_name.lower()
+                    and str(origin_target.get("chat_id") or "") == str(chat_id)
+                )
                 error = _deliver_whatsapp_via_tgg_reply_bridge(
                     job,
                     chat_id,
                     cleaned_delivery_content,
                     media_files,
                     workspace_owner=workspace_owner,
+                    allowed_work_paths=(
+                        None if published_paths is None or to_origin else set(published_paths)
+                    ),
                 )
                 if error:
                     logger.error("Job '%s': %s", job["id"], error)
@@ -1522,7 +1544,16 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     # so approvals, business-operation provenance and session tools still see
     # an internal scheduled run.  tick() resolves it once and passes it in so
     # delivery resolves attachments from the same folder.
-    from tools.python_sandbox_tool import bind_workspace_owner, reset_workspace_owner
+    from tools.python_sandbox_tool import (
+        bind_published_collector,
+        bind_workspace_owner,
+        reset_published_collector,
+        reset_workspace_owner,
+    )
+    _published = job.get("_runtime_published")
+    _published_token = (
+        bind_published_collector(_published) if isinstance(_published, set) else None
+    )
     _workspace_owner = (
         str(job.get("_runtime_workspace_owner") or "")
         or _resolve_cron_pa_workspace_owner(job)
@@ -1949,6 +1980,8 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         clear_session_vars(_ctx_tokens)
         try:
             reset_workspace_owner(_workspace_owner_token)
+            if _published_token is not None:
+                reset_published_collector(_published_token)
         except ValueError:
             # Reset from a different context; the tick's per-job copied
             # context is discarded after the job anyway.
@@ -2072,6 +2105,10 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                     _resolve_cron_pa_workspace_owner(job) or cron_session_id
                 )
                 run_input["_runtime_workspace_owner"] = workspace_owner
+                # Files this run's sandbox calls publish.  A delivery to any
+                # chat other than the job's origin may attach only these.
+                published: set[str] = set()
+                run_input["_runtime_published"] = published
                 success, output, final_response, error = run_job(run_input)
 
                 output_file = save_job_output(job["id"], output)
@@ -2096,6 +2133,9 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                             adapters=adapters,
                             loop=loop,
                             workspace_owner=workspace_owner,
+                            published_paths=(
+                                published if workspace_owner != cron_session_id else None
+                            ),
                         )
                     except Exception as de:
                         delivery_error = str(de)
