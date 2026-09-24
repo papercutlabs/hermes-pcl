@@ -3199,7 +3199,7 @@ async def process_live_records(
         # engine change starts a fresh session instead of producing an audit
         # mismatch and suppressing reply delivery.
         replay_namespace=(
-            f"agent:live-drain:persistent-chat:{provider}:{model}"
+            persistent_chat_namespace(provider, model)
             if persistent_session
             else None
         ),
@@ -3279,6 +3279,57 @@ async def process_live_records(
         "outbound_sent": 0,
         "submitted_message_ids": [record.message_id for record in records],
     }
+
+
+def persistent_chat_namespace(provider: str, model: str) -> str:
+    """Session namespace of the ordinary live drain: one conversation per chat."""
+    return f"agent:live-drain:persistent-chat:{provider}:{model}"
+
+
+def management_conversation_session_key(
+    config_path: Path, *, platform: str, chat_id: str
+) -> str | None:
+    """Stable session key of one configured Management chat's live conversation.
+
+    This is the key the ordinary live drain gives that chat's turns, so it
+    also owns the chat's persistent sandbox workspace (PA-129) and survives
+    compaction.  A scheduled job created from that chat uses it to work in
+    the same folder (PA-203).  Returns ``None`` when the chat is not a
+    configured WhatsApp Management chat, when its ordinary turns run in
+    isolated nightly sessions, or when per-participant group sessions mean no
+    single chat-level conversation exists.
+    """
+    chat = str(chat_id or "").strip()
+    if str(platform or "").strip().lower() != "whatsapp" or not chat:
+        return None
+    if chat not in _management_selector_chats(config_path):
+        return None
+    if chat in _nightly_selector_chats(config_path):
+        return None
+    from gateway.config import Platform, load_gateway_config
+    from gateway.replay import namespace_session_key
+    from gateway.session import SessionSource, build_session_key
+
+    gateway_config = load_gateway_config()
+    group_sessions_per_user = bool(
+        getattr(gateway_config, "group_sessions_per_user", True)
+    )
+    is_group = chat.endswith("@g.us")
+    if is_group and group_sessions_per_user:
+        return None
+    base_key = build_session_key(
+        SessionSource(
+            platform=Platform.WHATSAPP,
+            chat_id=chat,
+            chat_type="group" if is_group else "dm",
+        ),
+        group_sessions_per_user=group_sessions_per_user,
+        thread_sessions_per_user=bool(
+            getattr(gateway_config, "thread_sessions_per_user", False)
+        ),
+    )
+    provider, model = configured_engine(config_path)
+    return namespace_session_key(base_key, persistent_chat_namespace(provider, model))
 
 
 def _management_selector_chats(config_path: Path) -> frozenset[str]:

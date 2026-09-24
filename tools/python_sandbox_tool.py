@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextvars
 import hashlib
 import importlib.util
 import json
@@ -19,13 +20,19 @@ import sys
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Iterator, Mapping
 
 try:
     import resource
 except ImportError:  # pragma: no cover - Windows availability is fail-closed
     resource = None
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows availability is fail-closed
+    fcntl = None
 
 from hermes_constants import get_hermes_home
 from tools.path_security import validate_within_dir
@@ -61,7 +68,13 @@ _PROBE: tuple[float, bool, str] | None = None
 _PROBE_TTL = 30.0
 _WORKSPACE_LOCKS: dict[str, threading.Lock] = {}
 _WORKSPACE_LOCKS_GUARD = threading.Lock()
+_WORKSPACE_LOCK_FILE = ".publish.lock"
 _EXPORT_COMPLETE = ".hermes-export-complete"
+# A runtime-derived workspace owner bound by trusted scheduler code.  It is
+# never a tool argument, so the model cannot select another conversation.
+_BOUND_WORKSPACE_OWNER: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "HERMES_SANDBOX_WORKSPACE_OWNER", default=""
+)
 
 _SUPERVISOR_SOURCE = r"""\
 import ctypes
@@ -849,10 +862,241 @@ def resolve_sandbox_work_path(raw_path: Any, workspace_owner: str) -> Path:
     return resolved
 
 
-def _workspace_lock(session_id: str) -> threading.Lock:
+def bind_workspace_owner(owner: str | None) -> contextvars.Token:
+    """Bind a runtime-derived sandbox workspace owner for the current task.
+
+    Only trusted runtime code calls this: the PA scheduler binds the
+    originating Management conversation's stable session key so a scheduled
+    job works in that conversation's persistent folder.  The value is never a
+    model-facing argument.
+    """
+    return _BOUND_WORKSPACE_OWNER.set(str(owner or "").strip())
+
+
+def reset_workspace_owner(token: contextvars.Token) -> None:
+    _BOUND_WORKSPACE_OWNER.reset(token)
+
+
+def current_workspace_owner(fallback: str | None = None) -> str:
+    """Return the owner of the retained workspace for this task.
+
+    Precedence: a scheduler-bound owner, then the gateway's stable
+    ``HERMES_SESSION_KEY`` (survives compaction), then the caller's fallback.
+    """
+    bound = _BOUND_WORKSPACE_OWNER.get().strip()
+    if bound:
+        return bound
+    from gateway.session_context import get_session_env
+
+    return (
+        get_session_env("HERMES_SESSION_KEY", "").strip()
+        or str(fallback or "").strip()
+    )
+
+
+@contextmanager
+def _workspace_lock(session_id: str, workspace: Path) -> Iterator[None]:
+    """Hold one workspace's publication lock across threads and processes.
+
+    The lock covers only the short seed snapshot and the per-file publication,
+    never the sandbox run itself, so a scheduled job and a live turn sharing
+    one conversation folder do not wait on each other's execution.  The
+    thread lock orders callers in this process; ``flock`` on a file inside the
+    workspace orders separate processes (scheduler, gateway, maintenance).
+    """
     key = _workspace_key(session_id)
     with _WORKSPACE_LOCKS_GUARD:
-        return _WORKSPACE_LOCKS.setdefault(key, threading.Lock())
+        thread_lock = _WORKSPACE_LOCKS.setdefault(key, threading.Lock())
+    with thread_lock:
+        workspace.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if fcntl is None:  # pragma: no cover - sandbox is Linux-only
+            yield
+            return
+        fd = os.open(
+            workspace / _WORKSPACE_LOCK_FILE,
+            os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+
+
+def _work_manifest(work: Path) -> dict[str, str]:
+    """Map each regular retained file under ``work`` to its SHA-256.
+
+    ``result.json`` is the per-invocation return channel, never workspace
+    state, and symlinks or special files are never retained.
+    """
+    manifest: dict[str, str] = {}
+    if not work.is_dir() or work.is_symlink():
+        return manifest
+    for current, dirnames, filenames in os.walk(work, topdown=True, followlinks=False):
+        current_path = Path(current)
+        dirnames[:] = [
+            name for name in dirnames if not (current_path / name).is_symlink()
+        ]
+        for name in filenames:
+            if name == "result.json":
+                continue
+            path = current_path / name
+            try:
+                if not stat.S_ISREG(path.lstat().st_mode):
+                    continue
+                digest = hashlib.sha256()
+                with path.open("rb") as handle:
+                    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                        digest.update(chunk)
+            except OSError:
+                continue
+            manifest[path.relative_to(work).as_posix()] = digest.hexdigest()
+    return manifest
+
+
+def _snapshot_workspace(work: Path, snapshot: Path) -> dict[str, str]:
+    """Copy the retained work tree to a private per-run seed; return its manifest.
+
+    The caller holds the workspace lock, so the manifest is exactly the state
+    this run starts from.  It is the merge base for publication.
+    """
+    snapshot.mkdir(parents=True, exist_ok=True, mode=0o700)
+    manifest = _work_manifest(work)
+    for relative in manifest:
+        source = work / relative
+        target = snapshot / relative
+        target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        # Content and times only: host ownership and reader ACLs stay on the
+        # retained folder and are never copied into the private run tree.
+        shutil.copyfile(source, target, follow_symlinks=False)
+        metadata = source.stat(follow_symlinks=False)
+        os.utime(target, ns=(metadata.st_atime_ns, metadata.st_mtime_ns))
+    # A copied file may have changed between hashing and copying only if a
+    # writer bypassed the lock; hash the snapshot itself so the base is exact.
+    return _work_manifest(snapshot)
+
+
+def _alternate_name(relative: str, run_id: str, taken: set[str]) -> str:
+    path = Path(relative)
+    suffix = "".join(path.suffixes[-1:])
+    stem = path.name[: len(path.name) - len(suffix)] if suffix else path.name
+    for index in range(1000):
+        tag = run_id if index == 0 else f"{run_id}-{index}"
+        candidate = (path.parent / f"{stem}.{tag}{suffix}").as_posix()
+        if candidate not in taken:
+            return candidate
+    raise RuntimeError("could not choose a distinct workspace name")
+
+
+def _real_directory_chain(root: Path, relative_parent: Path) -> bool:
+    current = root
+    for part in relative_parent.parts:
+        current = current / part
+        try:
+            mode = current.lstat().st_mode
+        except FileNotFoundError:
+            return True
+        if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
+            return False
+    return True
+
+
+def _publish_workspace(
+    source: Path,
+    destination: Path,
+    base: Mapping[str, str],
+    *,
+    run_id: str,
+    hermes_home: Path,
+    reader_uid: str | None = None,
+) -> dict[str, Any]:
+    """Merge one completed run into its retained workspace, file by file.
+
+    The caller holds the workspace lock.  The retained folder is never removed
+    or replaced as a whole, so a file another writer published while this run
+    executed is kept.  Three-way rules against the run's seed ``base``:
+
+    * a file this run did not change is left as the workspace has it now;
+    * a file this run created or changed is installed atomically, unless
+      another writer changed the same path since the seed: then the other
+      writer's file keeps its name and this run's file is installed beside it
+      under a distinct name, reported back as ``renamed``;
+    * a seed file this run deleted is removed only if nobody changed it since.
+
+    Every installed file receives the configured reader ACL before it becomes
+    visible under its final name.
+    """
+    out = _work_manifest(source)
+    destination.mkdir(parents=True, exist_ok=True, mode=0o700)
+    current = _work_manifest(destination)
+    taken = set(current) | set(out)
+    installs: list[tuple[str, str]] = []  # (source relative, destination relative)
+    renamed: dict[str, str] = {}
+    unpublished: list[str] = []
+    for relative, digest in sorted(out.items()):
+        if base.get(relative) == digest or current.get(relative) == digest:
+            continue
+        target = relative
+        occupied_by_directory = (destination / relative).is_dir()
+        if occupied_by_directory or (
+            relative in current and current[relative] != base.get(relative)
+        ):
+            target = _alternate_name(relative, run_id, taken)
+            taken.add(target)
+            renamed[relative] = target
+        if not _real_directory_chain(destination, Path(target).parent):
+            unpublished.append(relative)
+            renamed.pop(relative, None)
+            continue
+        installs.append((relative, target))
+
+    removals = [
+        relative
+        for relative, digest in base.items()
+        if relative not in out and current.get(relative) == digest
+    ]
+
+    parent = destination.parent
+    staged = parent / f".work-{uuid.uuid4().hex}.tmp"
+    try:
+        staged.mkdir(mode=0o700)
+        for relative, target in installs:
+            staged_file = staged / target
+            staged_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            shutil.copy2(source / relative, staged_file, follow_symlinks=False)
+        for directory in sorted(
+            path.relative_to(source)
+            for path in source.rglob("*")
+            if path.is_dir() and not path.is_symlink()
+        ):
+            if _real_directory_chain(destination, directory):
+                (destination / directory).mkdir(
+                    parents=True, exist_ok=True, mode=0o700
+                )
+        for _relative, target in installs:
+            (destination / target).parent.mkdir(
+                parents=True, exist_ok=True, mode=0o700
+            )
+        if reader_uid is not None:
+            # Files are opened in staging; new directories are opened in place
+            # before any file is renamed into them.
+            grant_reader_work_access(hermes_home, staged, reader_uid)
+            grant_reader_work_access(hermes_home, destination, reader_uid)
+        for _relative, target in installs:
+            os.replace(staged / target, destination / target)
+        for relative in removals:
+            try:
+                (destination / relative).unlink()
+            except FileNotFoundError:
+                pass
+        os.utime(parent, None)
+    finally:
+        shutil.rmtree(staged, ignore_errors=True)
+    return {"renamed": renamed, "unpublished": unpublished}
 
 
 def _prune_workspaces(
@@ -887,29 +1131,6 @@ def _prune_workspaces(
             shutil.rmtree(path, ignore_errors=True)
         else:
             kept += 1
-
-
-def _replace_workspace(
-    source: Path,
-    destination: Path,
-    *,
-    hermes_home: Path,
-    reader_uid: str | None = None,
-) -> None:
-    """Mirror one completed run into its retained session workspace."""
-    parent = destination.parent
-    parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    staged = parent / f".work-{uuid.uuid4().hex}.tmp"
-    try:
-        shutil.copytree(source, staged, ignore=shutil.ignore_patterns("result.json"))
-        if reader_uid is not None:
-            grant_reader_work_access(hermes_home, staged, reader_uid)
-        if destination.exists():
-            shutil.rmtree(destination)
-        os.replace(staged, destination)
-        os.utime(parent, None)
-    finally:
-        shutil.rmtree(staged, ignore_errors=True)
 
 
 def _kill_group(proc: subprocess.Popen, grace: float = 5.0) -> None:
@@ -971,15 +1192,16 @@ def python_sandbox(
                     "result": None,
                 }
             )
-        with _workspace_lock(session_id):
-            return _run_python_sandbox(
-                code,
-                datasets,
-                input_json,
-                timeout_seconds,
-                config=config,
-                session_id=session_id,
-            )
+        # Runs sharing one workspace execute concurrently; _run_python_sandbox
+        # locks only the seed snapshot and the per-file merge publication.
+        return _run_python_sandbox(
+            code,
+            datasets,
+            input_json,
+            timeout_seconds,
+            config=config,
+            session_id=session_id,
+        )
     return _run_python_sandbox(
         code,
         datasets,
@@ -1053,17 +1275,34 @@ def _run_python_sandbox(
         return json.dumps(
             {"status": status, "error": error, "run_id": run_id, "result": None}
         )
+    seed_base: dict[str, str] = {}
     if workspace is not None:
         _prune_workspaces(workspace_root, config, exclude=workspace)
-        seed_work = workspace / "work"
-        seed_work.mkdir(parents=True, exist_ok=True, mode=0o700)
-        if reader_uid is not None:
+        retained_work = workspace / "work"
+        seed_work = run / "seed"
+        with _workspace_lock(session_id, workspace):
+            retained_work.mkdir(parents=True, exist_ok=True, mode=0o700)
+            if reader_uid is not None:
+                try:
+                    grant_reader_work_access(hermes_home, retained_work, reader_uid)
+                except SandboxReaderPolicyError as exc:
+                    logger.exception(
+                        "Could not apply sandbox reader ACL before execution"
+                    )
+                    return json.dumps(
+                        {"status": "error", "error": str(exc), "result": None}
+                    )
             try:
-                grant_reader_work_access(hermes_home, seed_work, reader_uid)
-            except SandboxReaderPolicyError as exc:
-                logger.exception("Could not apply sandbox reader ACL before execution")
+                seed_base = _snapshot_workspace(retained_work, seed_work)
+            except OSError as exc:
+                logger.exception("Could not snapshot the sandbox workspace")
+                shutil.rmtree(run, ignore_errors=True)
                 return json.dumps(
-                    {"status": "error", "error": str(exc), "result": None}
+                    {
+                        "status": "error",
+                        "error": f"workspace snapshot failed: {exc.strerror or exc}",
+                        "result": None,
+                    }
                 )
 
     limits = _limits(config)
@@ -1195,16 +1434,20 @@ def _run_python_sandbox(
     duration = round(time.monotonic() - started, 3)
     export_complete = work / _EXPORT_COMPLETE
     publication_error: SandboxReaderPolicyError | None = None
+    publication: dict[str, Any] = {"renamed": {}, "unpublished": []}
     if export_complete.exists():
         export_complete.unlink()
         if workspace is not None:
             try:
-                _replace_workspace(
-                    work,
-                    workspace / "work",
-                    hermes_home=hermes_home,
-                    reader_uid=reader_uid,
-                )
+                with _workspace_lock(session_id, workspace):
+                    publication = _publish_workspace(
+                        work,
+                        workspace / "work",
+                        seed_base,
+                        run_id=run_id,
+                        hermes_home=hermes_home,
+                        reader_uid=reader_uid,
+                    )
             except SandboxReaderPolicyError as exc:
                 logger.exception("Could not apply sandbox reader ACL before publication")
                 publication_error = exc
@@ -1247,6 +1490,25 @@ def _run_python_sandbox(
         payload["error"] = (
             payload.get("stderr") or "sandbox process failed"
         ).strip().splitlines()[-1]
+    renamed = publication.get("renamed") or {}
+    if renamed:
+        for item in payload.get("files") or []:
+            relative = str(item.get("path") or "")[len("work/"):]
+            if relative in renamed:
+                item["path"] = f"work/{renamed[relative]}"
+        payload["workspace_renamed"] = [
+            {"written": f"work/{written}", "saved_as": f"work/{saved}"}
+            for written, saved in sorted(renamed.items())
+        ]
+        payload["workspace_note"] = (
+            "Another task in this conversation changed a file with the same "
+            "name while this run executed. That file keeps its name; this "
+            "run's file was saved as saved_as. Use files[].path exactly."
+        )
+    if publication.get("unpublished"):
+        payload["workspace_unpublished"] = [
+            f"work/{relative}" for relative in publication["unpublished"]
+        ]
     payload = _sanitize_value(payload)
     meta = {
         "run_id": run_id,
@@ -1259,6 +1521,7 @@ def _run_python_sandbox(
     (run / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
     shutil.rmtree(inputs, ignore_errors=True)
     shutil.rmtree(run / "jail", ignore_errors=True)
+    shutil.rmtree(run / "seed", ignore_errors=True)
     _prune_runs(root, config)
     if workspace is not None:
         _prune_workspaces(workspace_root, config, exclude=workspace)
@@ -1274,9 +1537,7 @@ def _handle_python_sandbox(
     available, reason = _probe(force=True)
     if not available:
         return _unavailable(reason)
-    from gateway.session_context import get_session_env
-
-    workspace_owner = get_session_env("HERMES_SESSION_KEY", "").strip() or session_id
+    workspace_owner = current_workspace_owner(session_id)
     return python_sandbox(
         args.get("code", ""),
         args.get("datasets"),

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -127,7 +128,7 @@ def test_work_policy_refuses_symlink_escape_before_any_acl_change(tmp_path, monk
     assert calls == []
 
 
-def test_workspace_replacement_applies_policy_before_publish_across_runs(
+def test_workspace_publication_applies_policy_before_files_are_visible_across_runs(
     tmp_path, monkeypatch
 ):
     home = tmp_path / "home"
@@ -136,12 +137,12 @@ def test_workspace_replacement_applies_policy_before_publish_across_runs(
     (destination / "old.txt").write_text("retained", encoding="utf-8")
     observed = []
 
-    def record_policy(_home: Path, staged: Path, uid: str) -> None:
+    def record_policy(_home: Path, tree: Path, uid: str) -> None:
         observed.append(
             (
                 uid,
-                staged.name,
-                sorted(path.name for path in staged.rglob("*")),
+                tree.name,
+                sorted(path.name for path in tree.rglob("*") if path.is_file()),
                 sorted(path.name for path in destination.rglob("*") if path.is_file()),
             )
         )
@@ -149,32 +150,41 @@ def test_workspace_replacement_applies_policy_before_publish_across_runs(
 
     monkeypatch.setattr(sandbox, "grant_reader_work_access", record_policy)
     for index in (1, 2):
+        base = sandbox._work_manifest(destination)
         source = tmp_path / f"source-{index}"
-        (source / "nested").mkdir(parents=True)
+        shutil.copytree(destination, source)
+        (source / "nested").mkdir(exist_ok=True)
         (source / "nested" / f"file-{index}.txt").write_text(
             f"run-{index}", encoding="utf-8"
         )
-        sandbox._replace_workspace(
+        sandbox._publish_workspace(
             source,
             destination,
+            base,
+            run_id=f"r_0000000{index}",
             hermes_home=home,
             reader_uid="999",
         )
 
-    assert len(observed) == 2
-    assert observed[0][3] == ["old.txt"]
-    assert observed[1][3] == ["file-1.txt"]
-    assert not (destination / "old.txt").exists()
+    staged = [entry for entry in observed if entry[1].startswith(".work-")]
+    assert [entry[2] for entry in staged] == [["file-1.txt"], ["file-2.txt"]]
+    # Each new file is opened while still staged, before it is visible.
+    assert "file-1.txt" not in staged[0][3]
+    assert "file-2.txt" not in staged[1][3]
+    assert all(entry[0] == "999" for entry in observed)
+    assert (destination / "old.txt").read_text(encoding="utf-8") == "retained"
+    assert (destination / "nested" / "file-1.txt").read_text(encoding="utf-8") == "run-1"
     assert (destination / "nested" / "file-2.txt").read_text(encoding="utf-8") == "run-2"
 
 
-def test_workspace_replacement_acl_failure_keeps_previous_publication(
+def test_workspace_publication_acl_failure_keeps_previous_publication(
     tmp_path, monkeypatch
 ):
     home = tmp_path / "home"
     destination = home / "sandbox_workspaces" / WORKSPACE / "work"
     destination.mkdir(parents=True)
     (destination / "current.txt").write_text("current", encoding="utf-8")
+    base = sandbox._work_manifest(destination)
     source = tmp_path / "source"
     source.mkdir()
     (source / "candidate.txt").write_text("candidate", encoding="utf-8")
@@ -184,9 +194,11 @@ def test_workspace_replacement_acl_failure_keeps_previous_publication(
 
     monkeypatch.setattr(sandbox, "grant_reader_work_access", fail_policy)
     with pytest.raises(access.SandboxReaderPolicyError):
-        sandbox._replace_workspace(
+        sandbox._publish_workspace(
             source,
             destination,
+            base,
+            run_id="r_00000001",
             hermes_home=home,
             reader_uid="999",
         )

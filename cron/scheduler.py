@@ -150,6 +150,49 @@ def _merge_cron_pa_toolsets(
     return _dedupe(next_enabled), _dedupe(next_disabled)
 
 
+def _resolve_cron_pa_workspace_owner(job: dict) -> str | None:
+    """Return the originating Management conversation's workspace owner.
+
+    A scheduled job created from a TGG Management conversation works in that
+    conversation's persistent sandbox folder, so a later turn in the same
+    conversation simply has the files the job produced.  The owner is the
+    runtime-derived stable session key of the job's recorded origin chat,
+    never a model-supplied value.  Any other job keeps its per-run folder.
+    """
+    if str(job.get("pa_job_type") or "").strip() != "tgg_management":
+        return None
+    origin = _resolve_origin(job)
+    if not origin:
+        return None
+    config_path = _get_hermes_home() / "config.yaml"
+    try:
+        import yaml
+
+        raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        pa_config = raw.get("pa") if isinstance(raw, Mapping) else None
+        if not isinstance(pa_config, Mapping) or not is_truthy_value(
+            pa_config.get("enabled"), default=False
+        ):
+            return None
+        from gateway.durable_jsonl_consumer import (
+            management_conversation_session_key,
+        )
+
+        return management_conversation_session_key(
+            config_path,
+            platform=str(origin.get("platform") or ""),
+            chat_id=str(origin.get("chat_id") or ""),
+        )
+    except Exception as exc:
+        logger.warning(
+            "Job '%s': could not resolve its Management conversation workspace; "
+            "using a per-run workspace: %s",
+            job.get("id"),
+            exc,
+        )
+        return None
+
+
 def _render_cron_pa_ephemeral_prompt(pa_context: Any) -> str:
     if pa_context is None:
         return ""
@@ -1473,6 +1516,19 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         session_key=_cron_session_id,
         session_id=_cron_session_id,
     )
+    # Sandbox workspace owner (PA-203): a job created from a Management
+    # conversation works in that conversation's persistent folder.  This binds
+    # only the python_sandbox owner; HERMES_SESSION_KEY stays the cron run's,
+    # so approvals, business-operation provenance and session tools still see
+    # an internal scheduled run.  tick() resolves it once and passes it in so
+    # delivery resolves attachments from the same folder.
+    from tools.python_sandbox_tool import bind_workspace_owner, reset_workspace_owner
+    _workspace_owner = (
+        str(job.get("_runtime_workspace_owner") or "")
+        or _resolve_cron_pa_workspace_owner(job)
+        or _cron_session_id
+    )
+    _workspace_owner_token = bind_workspace_owner(_workspace_owner)
     _cron_delivery_vars = (
         "HERMES_CRON_AUTO_DELIVER_PLATFORM",
         "HERMES_CRON_AUTO_DELIVER_CHAT_ID",
@@ -1887,6 +1943,12 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 os.environ["TERMINAL_CWD"] = _prior_terminal_cwd
         # Clean up ContextVar session/delivery state for this job.
         clear_session_vars(_ctx_tokens)
+        try:
+            reset_workspace_owner(_workspace_owner_token)
+        except ValueError:
+            # Reset from a different context; the tick's per-job copied
+            # context is discarded after the job anyway.
+            pass
         for _var_name in _cron_delivery_vars:
             _VAR_MAP[_var_name].set("")
         if _session_db:
@@ -2000,6 +2062,12 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                 )
                 run_input = dict(job)
                 run_input["_runtime_session_id"] = cron_session_id
+                # One owner for the whole scheduled run: the job's sandbox
+                # work and its attachment delivery use the same folder.
+                workspace_owner = (
+                    _resolve_cron_pa_workspace_owner(job) or cron_session_id
+                )
+                run_input["_runtime_workspace_owner"] = workspace_owner
                 success, output, final_response, error = run_job(run_input)
 
                 output_file = save_job_output(job["id"], output)
@@ -2023,7 +2091,7 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                             deliver_content,
                             adapters=adapters,
                             loop=loop,
-                            workspace_owner=cron_session_id,
+                            workspace_owner=workspace_owner,
                         )
                     except Exception as de:
                         delivery_error = str(de)

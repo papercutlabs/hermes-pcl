@@ -1205,11 +1205,16 @@ def _materialize_large_tgg_query_result(
             configured_reader_uid,
             grant_reader_work_access,
         )
-        from tools.python_sandbox_tool import _load_config, _workspace_key
+        from tools.python_sandbox_tool import (
+            _load_config,
+            _workspace_key,
+            current_workspace_owner,
+        )
 
-        workspace_owner = (
-            get_session_env("HERMES_SESSION_KEY", "").strip()
-            or get_session_env("HERMES_SESSION_ID", "").strip()
+        # Same owner rule as python_sandbox: a scheduler-bound conversation
+        # owner, then the stable gateway session key, then the session ID.
+        workspace_owner = current_workspace_owner(
+            get_session_env("HERMES_SESSION_ID", "")
         )
         if not workspace_owner:
             return result
