@@ -18103,6 +18103,10 @@ class GatewayRunner:
             agent.request_overrides = turn_route.get("request_overrides") or {}
             agent.max_tokens = pa_max_output_tokens
             agent.tenant_slug = pa_tenant_slug
+            # A delegated child of a Management turn gets only the read-only
+            # investigation toolset, whatever the parent asks for.
+            from agent.pa_delegation import scope_delegation_children
+            scope_delegation_children(agent, enabled_toolsets, pa_resolved_context)
             if management_attachment_validation_enabled:
                 from gateway.durable_jsonl_consumer import (
                     build_management_attachment_response_validator,

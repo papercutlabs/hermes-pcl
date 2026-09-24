@@ -1774,6 +1774,10 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             gateway_session_key=_cron_session_id,
             session_db=_session_db,
         )
+        # A delegated child of a scheduled Management job gets only the
+        # read-only investigation toolset, whatever the parent asks for.
+        from agent.pa_delegation import scope_delegation_children
+        scope_delegation_children(agent, cron_enabled_toolsets, pa_resolved_context)
         
         # Run the agent with an *inactivity*-based timeout: the job can run
         # for hours if it's actively calling tools / receiving stream tokens,

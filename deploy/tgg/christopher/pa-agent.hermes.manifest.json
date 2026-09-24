@@ -117,6 +117,7 @@
     "agent/pa_case_runtime.py",
     "agent/pa_client_overlay.py",
     "agent/pa_constitution.py",
+    "agent/pa_delegation.py",
     "agent/pa_output_assembly.py",
     "agent/plugin_llm.py",
     "agent/portal_tags.py",
