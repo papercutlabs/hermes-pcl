@@ -638,3 +638,58 @@ async def test_cached_agent_gets_its_own_list_back_on_another_route(gateway_runn
     constructed = sorted(["file", "web", READONLY, "delegation"])
     assert agent.child_scopes == [[READONLY], constructed]
     assert agent.enabled_toolsets == constructed
+
+
+# ── Guard: the overwritten parent list has one reader (review finding 7) ──
+#
+# The PA layer overwrites a Management parent's ``enabled_toolsets`` after the
+# parent is built.  That is safe only while native child construction is the
+# sole post-construction reader of an agent's attribute: a new reader would
+# silently narrow the parent itself.  This test pins every read site in the
+# runtime source.  A new read, anywhere, fails it and must be reviewed.
+
+import re
+import subprocess as _subprocess
+
+_RUNTIME_ROOT = Path(__file__).resolve().parents[2]
+_READ = re.compile(
+    r"\.enabled_toolsets\b(?!\s*=[^=])"
+    r"|getattr\([^)]*[\"']enabled_toolsets[\"']"
+)
+
+# file -> (read count, why it is not a post-construction reader of a TGG agent)
+_ALLOWED_READS = {
+    "tools/delegate_tool.py": (2, "child construction reads the parent; a diagnostic reads the child"),
+    "agent/pa_constitution.py": (4, "JobBrief fields and a config path string, not an agent"),
+    "cron/scheduler.py": (1, "the job brief's declared list, before the agent exists"),
+    "gateway/run.py": (2, "the job brief's declared list, before the agent exists"),
+    "cli.py": (16, "the interactive CLI's own attribute and its own agent; not the TGG gateway"),
+    "acp_adapter/server.py": (2, "editor ACP sessions; not the TGG gateway"),
+    "tui_gateway/server.py": (4, "TUI session display and tool listing; not the TGG gateway"),
+}
+
+
+def test_only_known_code_reads_an_agent_enabled_toolsets():
+    files = _subprocess.run(
+        ["git", "ls-files", "*.py"], cwd=_RUNTIME_ROOT, text=True,
+        capture_output=True, check=True,
+    ).stdout.split()
+    found: dict[str, int] = {}
+    for relative in files:
+        if relative.startswith("tests/"):
+            continue
+        text = (_RUNTIME_ROOT / relative).read_text(encoding="utf-8", errors="replace")
+        count = len(_READ.findall(text))
+        if count:
+            found[relative] = count
+    expected = {path: count for path, (count, _why) in _ALLOWED_READS.items()}
+    assert found == expected, (
+        "A read of .enabled_toolsets changed. agent/pa_delegation.py overwrites a "
+        "Management parent's list after construction; any new post-construction "
+        f"reader of an agent's list narrows the parent itself. found={found}"
+    )
+
+
+def test_the_agent_itself_never_rereads_its_list_after_construction():
+    text = (_RUNTIME_ROOT / "run_agent.py").read_text(encoding="utf-8")
+    assert re.findall(r"self\.enabled_toolsets\b(?!\s*=[^=])", text) == []
