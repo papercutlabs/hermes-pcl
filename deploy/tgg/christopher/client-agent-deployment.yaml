@@ -129,9 +129,10 @@ spec:
       - gpt-5.6-luna-xhigh
       - gpt-5.6-terra-medium
       - gpt-5.6-terra-high
+      - gpt-6-sol-medium
     slotManifest: deploy/tgg/christopher/runtime-slots/SHA256SUMS
     slotStatePath: /home/pclaw/.hermes-christopher-tgg/runtime/engine-slot
-    switchCommand: /home/pclaw/apps/hermes-pcl/deploy/tgg/christopher/scripts/switch_engine_slot.sh
+    switchCommand: /opt/tgg-christopher/runtime/current/deploy/tgg/christopher/scripts/switch_engine_slot.sh
     switchRequiresCodeRedeploy: false
     auxiliary:
       provider: openai-direct-primary

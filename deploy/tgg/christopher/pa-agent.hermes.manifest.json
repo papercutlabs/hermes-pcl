@@ -200,6 +200,8 @@
     "deploy/tgg/christopher/runtime-slots/gpt-5.6-terra-high/config.yaml",
     "deploy/tgg/christopher/runtime-slots/gpt-5.6-terra-medium/christopher_tgg_constitution.yaml",
     "deploy/tgg/christopher/runtime-slots/gpt-5.6-terra-medium/config.yaml",
+    "deploy/tgg/christopher/runtime-slots/gpt-6-sol-medium/christopher_tgg_constitution.yaml",
+    "deploy/tgg/christopher/runtime-slots/gpt-6-sol-medium/config.yaml",
     "deploy/tgg/christopher/scripts/WHERE-THE-CEREMONY-LIVES.md",
     "deploy/tgg/christopher/scripts/activate_processing.py",
     "deploy/tgg/christopher/scripts/apply_engine_slot.py",

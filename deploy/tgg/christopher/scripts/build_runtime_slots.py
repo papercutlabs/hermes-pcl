@@ -45,6 +45,7 @@ SLOTS: dict[str, dict] = {
     "gpt-5.6-luna-xhigh": {"model": "gpt-5.6-luna", "reasoning_effort": "xhigh"},
     "gpt-5.6-terra-medium": {"model": "gpt-5.6-terra", "reasoning_effort": "medium"},
     "gpt-5.6-terra-high": {"model": "gpt-5.6-terra", "reasoning_effort": "high"},
+    "gpt-6-sol-medium": {"model": "gpt-6-sol", "reasoning_effort": "medium"},
 }
 
 MEMORY_BLOCK = (

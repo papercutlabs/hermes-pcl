@@ -26,12 +26,14 @@ SLOT_MODELS = {
     "gpt-5.6-luna-xhigh": "gpt-5.6-luna",
     "gpt-5.6-terra-medium": "gpt-5.6-terra",
     "gpt-5.6-terra-high": "gpt-5.6-terra",
+    "gpt-6-sol-medium": "gpt-6-sol",
 }
 SLOT_REASONING_EFFORT = {
     "gpt-5.6-luna-low": "low",
     "gpt-5.6-luna-xhigh": "xhigh",
     "gpt-5.6-terra-medium": "medium",
     "gpt-5.6-terra-high": "high",
+    "gpt-6-sol-medium": "medium",
 }
 ALLOWED_SLOTS = tuple(SLOT_MODELS)
 DEFAULT_SLOT = ALLOWED_SLOTS[0]
@@ -270,6 +272,17 @@ def _apply_slot_runtime_contract(
         (slot_root / "christopher_tgg_constitution.yaml").read_text(encoding="utf-8")
     )
     config["model"] = slot_config["model"]
+    # The slot owns every auxiliary task that runs on the main model, so an
+    # engine switch moves compression, session search, titles and vision too.
+    for task, slot_task in (slot_config.get("auxiliary") or {}).items():
+        live_task = (config.get("auxiliary") or {}).get(task)
+        if (
+            isinstance(live_task, dict)
+            and isinstance(slot_task, dict)
+            and live_task.get("provider") == "main"
+            and "model" in slot_task
+        ):
+            live_task["model"] = slot_task["model"]
     config["pa"]["media_retention"] = slot_config["pa"]["media_retention"]
     config["agent"].pop("reasoning_effort", None)
     if "reasoning_effort" in slot_config["agent"]:
