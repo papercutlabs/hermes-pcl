@@ -510,11 +510,33 @@ class WorkflowRunner:
             self.store.finish_run(run_id, status="completed", output=output, error=None)
         except RunStopped as exc:
             if exc.reason != "paused":
-                self.store.finish_run(run_id, status="failed", output=None, error=f"stopped: {exc.reason}")
+                self._end_with_finished_work(run_id, f"stopped: {exc.reason}", status="failed")
             # A paused run stays unfinished; the host resumes it later.
-        except Exception as exc:  # script, limit or kind errors end the run failed
-            self.store.finish_run(run_id, status="failed", output=None, error=f"{type(exc).__name__}: {exc}")
+        except Exception as exc:  # script, limit or kind errors
+            self._end_with_finished_work(run_id, f"{type(exc).__name__}: {exc}")
         return self.store.run_status(run_id)
+
+    def _end_with_finished_work(self, run_id: str, error: str, *, status: str | None = None) -> None:
+        """End a run that stopped early without discarding any finished helper.
+
+        Helper results that already came back are the run's output, with the
+        error reported beside them (r2e replays: 39 finished helpers were lost
+        to a script error after they ran).  A run with no finished helper ends
+        failed.
+        """
+        finished = [
+            _Execution._result(child) for child in self.store.children(run_id).values()
+            if child["status"] in ("ok", "failed")
+        ]
+        if not finished:
+            self.store.finish_run(run_id, status="failed", output=None, error=error)
+            return
+        output = {
+            "partial": True,
+            "script_error": error,
+            "results": finished,
+        }
+        self.store.finish_run(run_id, status=status or "completed", output=output, error=error)
 
     def _attempt_child(self, run_id: str, key: str, kind: str, prompt: str, schema: dict, prior_attempts: int) -> dict:
         attempts = prior_attempts
@@ -556,6 +578,8 @@ class _Execution:
         # Keys this pass assigned, in order: results() reads only these, so a
         # resumed pass sees exactly what the first pass saw (review B4).
         self.assigned: list[str] = []
+        # Result objects given to the script; only these pass through parallel().
+        self.handed_out: list[dict] = []
         self.steps = 0
         self.deadline = (
             time.monotonic() + runner.max_script_seconds if runner.max_script_seconds else None
@@ -611,6 +635,10 @@ class _Execution:
     def run_one(self, spec: Any) -> dict:
         return self.parallel([spec])[0]
 
+    def _is_result(self, value: Any) -> bool:
+        """True only for a result object this pass itself handed to the script."""
+        return any(value is known for known in self.handed_out)
+
     def map(self, items: Any, fn: Any) -> list[dict]:
         return self.parallel([fn(item) for item in items])
 
@@ -628,19 +656,35 @@ class _Execution:
 
     def results(self) -> list[dict]:
         done = self.runner.store.children(self.run_id)
-        return [
+        results = [
             self._result(done[key]) for key in self.assigned
             if key in done and done[key]["status"] in ("ok", "failed")
         ]
+        self.handed_out.extend(results)
+        return results
 
     def parallel(self, specs: Any) -> list[dict]:
         specs = list(specs)
         if len(specs) > MAX_PARALLEL_SPECS:
             raise _RunLimit(f"parallel() and map() take at most {MAX_PARALLEL_SPECS} helpers at once")
+        # map() already runs its helpers.  Passing its results on to
+        # parallel() is the natural next line, so a result this pass handed
+        # out is returned as it is; it starts nothing (r2e replays).
+        if specs and all(self._is_result(spec) for spec in specs):
+            return list(specs)
+        if any(self._is_result(spec) for spec in specs):
+            ran = [spec for spec in specs if self._is_result(spec)]
+            fresh = [spec for spec in specs if not self._is_result(spec)]
+            fresh_results = iter(self.parallel(fresh))
+            ran_ids = {id(spec) for spec in ran}
+            return [spec if id(spec) in ran_ids else next(fresh_results) for spec in specs]
         for spec in specs:
             # Every path that starts a helper re-checks the kind (review B1).
             if not isinstance(spec, _Spec):
-                raise ScriptRefused("parallel() and run() take only specs made by task(kind, prompt, schema).")
+                raise ScriptRefused(
+                    "parallel() and run() take specs made by task(kind, prompt, schema) "
+                    "or results that map() or parallel() returned."
+                )
             if spec.kind not in self.runner.kinds:
                 raise ScriptRefused(f"Unknown helper kind {spec.kind!r}.")
         self.runner.check_stop()
@@ -666,7 +710,9 @@ class _Execution:
             finally:
                 pool.shutdown(wait=True, cancel_futures=True)
         self.stored = self.runner.store.children(self.run_id)
-        return [self._result(self.stored[key]) for key in keys]
+        results = [self._result(self.stored[key]) for key in keys]
+        self.handed_out.extend(results)
+        return results
 
     # internals --------------------------------------------------------
     def _assign(self, spec: _Spec) -> str:

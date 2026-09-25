@@ -692,6 +692,7 @@ def test_workflow_status_needs_the_same_conversation(workflow_env, monkeypatch):
     tool = workflow_env.tool
     run_id = json.loads(tool.workflow_start(script="output = 1", wait=True, parent_agent=workflow_env.parent))["run_id"]
     monkeypatch.setattr("gateway.session_context.get_session_env", lambda name, default="": default)
+    monkeypatch.setattr("tools.approval.get_current_session_key", lambda default="": "")
     assert "another conversation" in json.loads(tool.workflow_status(run_id=run_id))["error"]
 
 
@@ -829,3 +830,79 @@ def test_workflow_started_from_a_completion_turn_delivers_one_reply(tmp_path, wo
     )
     assert again["duplicate"] == 1 and again["delivered"] == 0
     assert len([s for s in sent if s["message"].startswith("All 61")]) == 1
+
+
+# ── r2e replays: map() then parallel(), partial results, scheduled status ─
+
+
+MAP_THEN_PARALLEL = (
+    f"jobs = {JOBS!r}\n"
+    "schema = {'type': 'object', 'required': ['cases'], 'properties': {'cases': {'type': 'array'}}}\n"
+    "specs = map(chunks(jobs, 5), lambda group: task('readonly-investigation', "
+    "'Check WhatsApp for ' + join(group), schema))\n"
+    "found = parallel(specs)\n"
+    "output = [case for r in found if r['status'] == 'ok' for case in r['output']['cases']]\n"
+)
+
+
+def test_map_results_passed_to_parallel_run_once_and_complete(tmp_path, workflow_env):
+    """The replayed pattern: 5 runs lost 39 finished helpers to this refusal."""
+    tool = workflow_env.tool
+    store = background.CompletionStore(tmp_path / "inbox.db")
+    background.install_sink(store)
+    run_id = json.loads(tool.workflow_start(
+        script=MAP_THEN_PARALLEL, title="61", parent_agent=workflow_env.parent,
+    ))["run_id"]
+    assert _wait_for(lambda: not process_registry.completion_queue.empty())
+    assert background.maintain(store)["recorded"] == 1
+    result = json.loads(store.get(run_id)["result_json"])
+    assert result["status"] == "completed" and not result.get("error")
+    assert sorted(case["job_no"] for case in result["output"]) == JOBS
+    assert len(workflow_env.calls) == 13  # parallel() started nothing new
+
+
+def test_a_script_error_after_helpers_ran_keeps_their_results(tmp_path, workflow_env):
+    tool = workflow_env.tool
+    store = background.CompletionStore(tmp_path / "inbox.db")
+    background.install_sink(store)
+    script = MAP_THEN_PARALLEL.replace("found = parallel(specs)\n", "found = parallel(specs)\nbroken = found[999]\n")
+    run_id = json.loads(tool.workflow_start(script=script, title="61", parent_agent=workflow_env.parent))["run_id"]
+    assert _wait_for(lambda: not process_registry.completion_queue.empty())
+    assert background.maintain(store)["recorded"] == 1
+    row = store.get(run_id)
+    result = json.loads(row["result_json"])
+    assert row["outcome"] == "completed"
+    assert "IndexError" in result["error"]
+    assert result["output"]["partial"] is True
+    assert len(result["output"]["results"]) == 13
+    covered = sorted(c["job_no"] for r in result["output"]["results"] for c in r["output"]["cases"])
+    assert covered == JOBS
+    # The completion turn shows the finished work and the error together.
+    _id, event = background.completion_event(row, [_one_record()])
+    assert "AM/JOB/2609/0061" in event["body"] and "IndexError" in event["body"]
+
+
+def test_scheduled_management_job_can_read_its_own_run(workflow_env, monkeypatch):
+    """r2e replay s7: workflow_status in the scheduled job said 'another conversation'."""
+    tool = workflow_env.tool
+    cron_env = {
+        "HERMES_SESSION_KEY": "cron_job1_20260925_163300",
+        "HERMES_SESSION_PA_JOB_TYPE": "tgg_management",
+        "HERMES_CRON_AUTO_DELIVER_CHAT_ID": CHAT,
+        "HERMES_CRON_AUTO_DELIVER_PLATFORM": "whatsapp",
+    }
+    monkeypatch.setattr("gateway.session_context.get_session_env", lambda n, d="": cron_env.get(n, d))
+    monkeypatch.setattr("tools.approval.get_current_session_key", lambda default="": cron_env["HERMES_SESSION_KEY"])
+    run_id = json.loads(tool.workflow_start(script="output = 1", wait=True, parent_agent=workflow_env.parent))["run_id"]
+    status = json.loads(tool.workflow_status(run_id=run_id))
+    assert status.get("status") == "completed", status
+    # Its origin conversation, by chat, may read it too.
+    live_env = {"HERMES_SESSION_CHAT_ID": CHAT, "HERMES_SESSION_KEY": SESSION_KEY}
+    monkeypatch.setattr("gateway.session_context.get_session_env", lambda n, d="": live_env.get(n, d))
+    monkeypatch.setattr("tools.approval.get_current_session_key", lambda default="": SESSION_KEY)
+    assert json.loads(tool.workflow_status(run_id=run_id)).get("status") == "completed"
+    # Another chat may not.
+    other = {"HERMES_SESSION_CHAT_ID": "other@g.us", "HERMES_SESSION_KEY": "other"}
+    monkeypatch.setattr("gateway.session_context.get_session_env", lambda n, d="": other.get(n, d))
+    monkeypatch.setattr("tools.approval.get_current_session_key", lambda default="": "other")
+    assert "another conversation" in json.loads(tool.workflow_status(run_id=run_id))["error"]

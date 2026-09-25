@@ -150,6 +150,33 @@ def _merge_cron_pa_toolsets(
     return _dedupe(next_enabled), _dedupe(next_disabled)
 
 
+# PA-203 r2e (s7): files a scheduled Management job returns with the
+# capability's file-return tool.  A scheduled job has no live Management turn
+# to capture them in, so they are attached to the job's delivery to its
+# origin chat instead.
+_SCHEDULED_FILE_RETURNS: contextvars.ContextVar[list | None] = contextvars.ContextVar(
+    "HERMES_SCHEDULED_FILE_RETURNS", default=None
+)
+
+
+def record_scheduled_file_return(path: str, display_name: str | None = None) -> bool:
+    """Queue a returned file for this scheduled job's origin delivery.
+
+    ``display_name`` is the exact name WhatsApp shows; the stored copy keeps
+    a safe name.  Returns False outside a scheduled job, so the caller keeps
+    its own path.
+    """
+    collected = _SCHEDULED_FILE_RETURNS.get()
+    if collected is None:
+        return False
+    text = str(path or "").strip()
+    if not text:
+        return False
+    if all(item.get("path") != text for item in collected):
+        collected.append({"path": text, "display_name": display_name})
+    return True
+
+
 def _resolve_cron_pa_workspace_owner(job: dict) -> str | None:
     """Return the originating Management conversation's workspace owner.
 
@@ -637,6 +664,7 @@ def _deliver_whatsapp_via_tgg_reply_bridge(
     workspace_owner: str | None = None,
     allowed_work_paths: set[str] | None = None,
     receipt: dict | None = None,
+    display_names: dict[str, str] | None = None,
 ) -> Optional[str]:
     """Deliver Christopher cron output through the durable consumer bridge.
 
@@ -738,7 +766,11 @@ def _deliver_whatsapp_via_tgg_reply_bridge(
             resolved = resolve_media_path(str(media_path))
             # WhatsApp shows the exact name the job asked to send, spaces and
             # parentheses included; the stored copy keeps a safe name.
-            display_name = requested_display_name(media_path) or resolved.name
+            display_name = (
+                (display_names or {}).get(str(media_path))
+                or requested_display_name(media_path)
+                or resolved.name
+            )
             resolved_media_files.append((resolved, is_voice, display_name))
         except (OSError, ValueError) as exc:
             return (
@@ -879,9 +911,13 @@ def _deliver_result(
     published_paths: set[str] | None = None,
     origin_may_attach_any: bool = True,
     conversation_session_key: str | None = None,
+    returned_files: list[dict] | None = None,
 ) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
+
+    ``returned_files`` (PA-203) are files the job returned with the file-return
+    tool; they are attached only to a delivery to the job's origin chat.
 
     ``published_paths`` (PA-203) is set when the job works in a folder it
     shares: its origin conversation's persistent folder, or the agent-wide
@@ -986,11 +1022,21 @@ def _deliver_result(
                     and str(origin_target.get("chat_id") or "") == str(chat_id)
                 )
                 bridge_receipt: dict = {}
+                target_media = list(media_files)
+                display_names: dict[str, str] = {}
+                if to_origin and origin_may_attach_any:
+                    listed = {str(path) for path, _voice in target_media}
+                    for item in returned_files or []:
+                        if item.get("path") and item["path"] not in listed:
+                            target_media.append((item["path"], False))
+                            if item.get("display_name"):
+                                display_names[item["path"]] = item["display_name"]
                 error = _deliver_whatsapp_via_tgg_reply_bridge(
                     job,
                     chat_id,
                     cleaned_delivery_content,
-                    media_files,
+                    target_media,
+                    display_names=display_names,
                     receipt=bridge_receipt,
                     workspace_owner=workspace_owner,
                     allowed_work_paths=(
@@ -1709,6 +1755,10 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         or _cron_session_id
     )
     _workspace_owner_token = bind_workspace_owner(_workspace_owner)
+    _file_returns = job.get("_runtime_file_returns")
+    _file_returns_token = (
+        _SCHEDULED_FILE_RETURNS.set(_file_returns) if isinstance(_file_returns, list) else None
+    )
     _cron_delivery_vars = (
         "HERMES_CRON_AUTO_DELIVER_PLATFORM",
         "HERMES_CRON_AUTO_DELIVER_CHAT_ID",
@@ -2131,6 +2181,8 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             reset_workspace_owner(_workspace_owner_token)
             if _published_token is not None:
                 reset_published_collector(_published_token)
+            if _file_returns_token is not None:
+                _SCHEDULED_FILE_RETURNS.reset(_file_returns_token)
         except ValueError:
             # Reset from a different context; the tick's per-job copied
             # context is discarded after the job anyway.
@@ -2264,6 +2316,10 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                 # chat other than the job's origin may attach only these.
                 published: set[str] = set()
                 run_input["_runtime_published"] = published
+                # Files the job returns for its origin chat (PA-203 r2e, s7).
+                file_returns: list[str] = []
+                if management_owner is not None:
+                    run_input["_runtime_file_returns"] = file_returns
                 success, output, final_response, error = run_job(run_input)
 
                 output_file = save_job_output(job["id"], output)
@@ -2295,6 +2351,7 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                             ),
                             origin_may_attach_any=management_owner is not None,
                             conversation_session_key=management_owner,
+                            returned_files=list(file_returns),
                         )
                     except Exception as de:
                         delivery_error = str(de)

@@ -366,6 +366,8 @@ def workflow_start(
     }
     from gateway.session_context import get_session_env
 
+    # A scheduled Management job acts for the chat it delivers to (s7).
+    started_by["deliver_chat_id"] = get_session_env("HERMES_CRON_AUTO_DELIVER_CHAT_ID", "")
     started_by["user_id"] = get_session_env("HERMES_SESSION_USER_ID", "")
     started_by["user_name"] = get_session_env("HERMES_SESSION_USER_NAME", "")
     store = _store()
@@ -430,15 +432,25 @@ def workflow_status(run_id: Optional[str] = None, parent_agent: Any = None) -> s
     from gateway.session_context import get_session_env
     from tools.registry import tool_error
 
-    chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
+    # A scheduled job has no session chat; it acts for its delivery chat.
+    chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "") or get_session_env(
+        "HERMES_CRON_AUTO_DELIVER_CHAT_ID", ""
+    )
+    from tools.approval import get_current_session_key
+
+    session_key = get_current_session_key(default="") or get_session_env("HERMES_SESSION_KEY", "")
     store = _store()
     if not run_id:
         return tool_error("Provide the run_id that workflow_start returned.")
     run = store.get_run(run_id)
     if run is None:
         return tool_error(f"No workflow run {run_id}.")
-    run_chat = str(((run.get("started_by") or {}).get("chat_id")) or "")
-    if not chat_id or not run_chat or chat_id != run_chat:
+    started_by = run.get("started_by") or {}
+    run_chat = str(started_by.get("chat_id") or started_by.get("deliver_chat_id") or "")
+    run_key = str(started_by.get("session_key") or "")
+    same_chat = bool(chat_id and run_chat and chat_id == run_chat)
+    same_session = bool(session_key and run_key and session_key == run_key)
+    if not (same_chat or same_session):
         return tool_error(f"Workflow run {run_id} belongs to another conversation.")
     return json.dumps(store.run_status(run_id), ensure_ascii=False, default=str)
 
@@ -525,7 +537,14 @@ WORKFLOW_START_SCHEMA = {
         "task(kind, prompt, schema) with kind 'readonly-investigation'; run(spec); "
         "parallel(specs); map(items, fn); chunks(items, size); join(items, sep); results(). "
         "Assign the final value to `output`. Plain Python expressions, for, if and lambda "
-        "only; no imports, attributes, functions, files or other tools."
+        "only; no imports, attributes, functions, files or other tools. map() starts the "
+        "helpers itself and returns their results; there is no need to pass them to "
+        "parallel(). Example: schema = {'type': 'object', 'required': ['cases']}; "
+        "found = map(chunks(jobs, 5), lambda group: task('readonly-investigation', "
+        "'Check WhatsApp for ' + join(group, ', '), schema)); "
+        "output = [r['output'] for r in found if r['status'] == 'ok']. "
+        "If the script stops early, every helper result that came back is still returned. "
+        "Helpers only gather evidence: build any file yourself with python_sandbox."
     ),
     "parameters": {
         "type": "object",

@@ -67,7 +67,9 @@ def test_fan_out_is_capped(tmp_path):
         "    map(range(100), lambda i: task('readonly-investigation', str(g) + ':' + str(i), {'type': 'object'}))\n"
     )
     status, executor, _ = _run(tmp_path / "b", over_run) if (tmp_path / "b").mkdir() is None else None
-    assert status["status"] == "failed" and "at most 200 helpers" in status["error"]
+    # The limit stops the run; the 200 helpers that finished are kept (r2e).
+    assert status["status"] == "completed" and "at most 200 helpers" in status["error"]
+    assert len(status["output"]["results"]) == 200 and status["output"]["partial"] is True
     assert len(executor.calls) == 200
 
 

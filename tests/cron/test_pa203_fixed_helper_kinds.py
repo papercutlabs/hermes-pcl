@@ -177,3 +177,32 @@ def test_acp_transport_from_the_model_is_refused_on_the_management_route():
 def test_batch_task_name_is_not_a_helper_kind():
     _, built, _ = _delegate(_scoped_parent(), tasks=[{"goal": "a", "name": "set-1"}, {"goal": "b"}])
     assert built == [[READONLY], [READONLY]]
+
+
+# ── r2e replay s3: helpers check, Christopher builds ─────────────────────
+
+
+@pytest.mark.parametrize("goal", [
+    "Build the Sheet1 Master/SFC check workbook for the 682 visible rows",
+    "Produce Filtered_Sheet1_Master_SFC_Check.xlsx with the yellow rows checked",
+    "Update the workbook with each case's finding and send it back",
+])
+def test_a_helper_asked_to_build_a_file_is_refused_at_dispatch(goal):
+    parent = _scoped_parent()
+    for kwargs in ({"goal": goal, "background": True}, {"goal": goal}, {"tasks": [{"goal": "Check AM/JOB/1"}, {"goal": goal}]}):
+        result, built, runs = _delegate(parent, **kwargs)
+        assert result["error"].startswith(
+            "Helpers only gather evidence; build the file yourself with the python sandbox, then send it."
+        ), result
+        assert runs == []  # nothing started; any helper already built was released
+
+
+@pytest.mark.parametrize("goal", [
+    "Check WhatsApp for AM/JOB/2609/0001 and AM/JOB/2609/0002; the rows come from Krisleen's sheet",
+    "For yellow rows perform read-only WhatsApp review and return the finding for each row",
+    "Investigate whether the update for each row of the sheet is supported by WhatsApp",
+])
+def test_evidence_gathering_helpers_still_start(goal):
+    result, built, runs = _delegate(_scoped_parent(), goal=goal)
+    assert "error" not in result, result
+    assert built == [[READONLY]]

@@ -31,6 +31,7 @@ no tools, and none gets more than its parent.
 
 from __future__ import annotations
 
+import re
 from typing import Any, Iterable
 
 MANAGEMENT_JOB_TYPE = "tgg_management"
@@ -189,3 +190,31 @@ def check_helper_tools(
                 f"({', '.join(sorted(extra))}), so it was not started."
             )
     return tools
+
+
+# Teren (25 Sep): helpers check, Christopher builds.  A helper has no sandbox
+# or file tools, so a helper asked to build or edit a file can only fail
+# (r2e replay s3).  The refusal happens before it starts, with the next step.
+FILE_BUILDING_REFUSAL = (
+    "Helpers only gather evidence; build the file yourself with the python "
+    "sandbox, then send it. No helper was started."
+)
+_FILE_NOUN = (
+    r"(?:work\s*books?|spread\s*sheets?|excel(?:\s+files?)?|xlsx|xls|csv|docx|files?|sheets?|"
+    r"attachments?|[\w\-.()]+\.(?:xlsx|xls|csv|docx))\b"
+)
+_WORD = r"\s+[\w/\-.()']+"
+_FILE_BUILDING = re.compile(
+    # Build verbs, with up to five words before the file noun.
+    rf"\b(?:build|create|produce|generate|make|prepare|edit|modify|write|save|export|"
+    rf"populate|fill\s+in|fill)\b(?:{_WORD}){{0,5}}?\s+{_FILE_NOUN}"
+    # Verbs that are often nouns, only right before the file noun.
+    rf"|\b(?:update|return|send|attach)\b(?:{_WORD}){{0,2}}?\s+{_FILE_NOUN}",
+    re.IGNORECASE,
+)
+
+
+def check_not_file_building(goal: Any) -> None:
+    """Refuse a helper whose own task asks it to build, edit or send a file."""
+    if _FILE_BUILDING.search(str(goal or "")):
+        raise HelperScopeError(FILE_BUILDING_REFUSAL)

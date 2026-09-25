@@ -1088,10 +1088,14 @@ def _build_child_agent(
     # (from ``profile``) fixes the child's toolsets.  Model-supplied toolset
     # names are ignored, the child is always a leaf, and a helper that would
     # start empty or wider than its parent is refused (HelperScopeError).
-    from agent.pa_delegation import check_helper_tools, fixed_helper_toolsets
+    from agent.pa_delegation import (
+        check_helper_tools, check_not_file_building, fixed_helper_toolsets,
+    )
 
     pa_fixed_toolsets = fixed_helper_toolsets(parent_agent, profile)
     if pa_fixed_toolsets is not None:
+        # Helpers check; Christopher builds (Teren, 25 Sep; r2e replay s3).
+        check_not_file_building(goal)
         if toolsets and list(toolsets) != pa_fixed_toolsets:
             logger.info(
                 "delegate_task: ignoring model-supplied toolsets %s; the helper kind fixes %s",
