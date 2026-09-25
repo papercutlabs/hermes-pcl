@@ -730,10 +730,16 @@ def _deliver_whatsapp_via_tgg_reply_bridge(
         except (URLError, TimeoutError, OSError, ValueError, json.JSONDecodeError) as exc:
             return f"bridge {endpoint} failed: {exc}"
 
-    resolved_media_files: list[tuple[Path, bool]] = []
+    from tools.pa_agent_workspace import requested_display_name
+
+    resolved_media_files: list[tuple[Path, bool, str]] = []
     for media_path, is_voice in media_files:
         try:
-            resolved_media_files.append((resolve_media_path(str(media_path)), is_voice))
+            resolved = resolve_media_path(str(media_path))
+            # WhatsApp shows the exact name the job asked to send, spaces and
+            # parentheses included; the stored copy keeps a safe name.
+            display_name = requested_display_name(media_path) or resolved.name
+            resolved_media_files.append((resolved, is_voice, display_name))
         except (OSError, ValueError) as exc:
             return (
                 "attachment was not delivered; use the exact files[].path returned "
@@ -748,7 +754,7 @@ def _deliver_whatsapp_via_tgg_reply_bridge(
             return error
         delivered["text"] = text
         delivered["text_message_id"] = last_message_id["value"]
-    for resolved_media, _is_voice in resolved_media_files:
+    for resolved_media, _is_voice, display_name in resolved_media_files:
         suffix = resolved_media.suffix.lower()
         media_type = (
             "image" if suffix in _IMAGE_EXTS else "video" if suffix in _VIDEO_EXTS
@@ -759,13 +765,13 @@ def _deliver_whatsapp_via_tgg_reply_bridge(
             "chatId": chat_id,
             "filePath": str(resolved_media),
             "mediaType": media_type,
-            "fileName": resolved_media.name,
+            "fileName": display_name,
         })
         if error:
             return error
         delivered["files"].append(
             {
-                "name": resolved_media.name,
+                "name": display_name,
                 "message_id": last_message_id["value"],
                 "workspace_path": _keep_delivered_file_in_workspace(
                     job,
@@ -773,6 +779,7 @@ def _deliver_whatsapp_via_tgg_reply_bridge(
                     resolved_media,
                     message_id=last_message_id["value"],
                     text_message_id=str(delivered.get("text_message_id") or ""),
+                    display_name=display_name,
                 ),
             }
         )
@@ -786,6 +793,7 @@ def _keep_delivered_file_in_workspace(
     *,
     message_id: str = "",
     text_message_id: str = "",
+    display_name: str = "",
 ) -> Optional[str]:
     """Keep a file a scheduled job delivered in the agent workspace (PA-203).
 
@@ -808,6 +816,7 @@ def _keep_delivered_file_in_workspace(
                 "text_message_id": text_message_id,
                 "scheduled_job_id": str(job.get("id") or ""),
                 "scheduled_job_name": str(job.get("name") or ""),
+                "display_name": display_name,
             },
         )
     except Exception as exc:

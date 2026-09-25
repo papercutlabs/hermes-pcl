@@ -1882,8 +1882,12 @@ class WhatsAppAdapter(BasePlatformAdapter):
             declared_media_mimes = data.get("mediaMimes") or []
             if isinstance(declared_media_mimes, str):
                 declared_media_mimes = [declared_media_mimes]
+            declared_file_names = data.get("mediaFileNames") or []
+            if isinstance(declared_file_names, str):
+                declared_file_names = [declared_file_names]
             cached_urls = []
             media_types = []
+            media_file_names = []
             refused_documents = []
             for media_index, url in enumerate(raw_urls):
                 if msg_type == MessageType.PHOTO and url.startswith(("http://", "https://")):
@@ -1946,6 +1950,14 @@ class WhatsAppAdapter(BasePlatformAdapter):
                         )
                     cached_urls.append(url)
                     media_types.append(mime)
+                    declared_name = (
+                        declared_file_names[media_index]
+                        if media_index < len(declared_file_names)
+                        else ""
+                    )
+                    media_file_names.append(
+                        declared_name if isinstance(declared_name, str) else ""
+                    )
                     print(f"[{self.name}] Using bridge-cached document: {url}", flush=True)
                 elif msg_type == MessageType.VIDEO and os.path.isabs(url):
                     cached_urls.append(url)
@@ -2017,6 +2029,11 @@ class WhatsAppAdapter(BasePlatformAdapter):
                 reply_to_text=self._reply_context_text(data),
                 media_urls=cached_urls,
                 media_types=media_types,
+                media_file_names=(
+                    media_file_names
+                    if len(media_file_names) == len(cached_urls)
+                    else []
+                ),
                 addressed=addressed,                channel_prompt=data.get("_hermes_channel_prompt"),
                 pa_job_type=data.get("_hermes_pa_job_type"),
                 pa_context=data.get("_hermes_pa_context") if isinstance(data.get("_hermes_pa_context"), dict) else None,

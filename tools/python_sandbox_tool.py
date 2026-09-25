@@ -1672,20 +1672,35 @@ def describe_quoted_workspace_files(
     at_text = f" {when}" if when else ""
     paths = ", ".join(f"/{entry['path']}" for entry in entries if entry.get("path"))
     direction = str(first.get("direction") or "")
+    # The exact name the chat showed, where one was recorded and it differs
+    # from the saved file's name.
+    shown = ", ".join(
+        f"'{name}'"
+        for name, saved in (
+            (
+                str(entry.get("original_name") or entry.get("display_name") or ""),
+                Path(str(entry.get("path") or "")).name,
+            )
+            for entry in entries
+        )
+        if name and name != saved
+    )
     if direction == "received":
+        named = f" named {shown}" if shown else ""
         return (
             f"[The sender is replying to an earlier{at_text} message in this chat "
-            f"that sent you a file, now saved as {paths}.]"
+            f"that sent you a file{named}, now saved as {paths}.]"
         )
+    shown_note = f", shown in the chat as {shown}" if shown else ""
     if direction == "scheduled_delivery":
         job = str(first.get("scheduled_job_name") or first.get("scheduled_job_id") or "")
         by = f" by the scheduled job '{job}'" if job else " by a scheduled job"
         return (
             f"[The sender is replying to your{at_text} delivery, sent{by}, "
-            f"which carried {paths}.]"
+            f"which carried {paths}{shown_note}.]"
         )
     return (
-        f"[The sender is replying to your{at_text} message, which carried {paths}.]"
+        f"[The sender is replying to your{at_text} message, which carried {paths}{shown_note}.]"
     )
 
 

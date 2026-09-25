@@ -30,6 +30,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import stat
 import threading
 import time
@@ -633,6 +634,48 @@ def capture_work_file(raw_path: Any, context: str) -> tuple[Path, str]:
     return target, chosen
 
 
+_UNSAFE_DISK_CHARACTERS = re.compile(r"[^\w.\- ]")
+
+
+def safe_disk_name(name: Any) -> str:
+    """The name a file is stored under: word characters, dots, dashes, spaces.
+
+    What a recipient sees is the separate display name (``display_file_name``).
+    """
+    cleaned = _UNSAFE_DISK_CHARACTERS.sub("_", Path(str(name or "")).name)
+    return cleaned.strip(" .") or "file"
+
+
+def display_file_name(name: Any) -> str:
+    """Check a name to show a recipient, and return it exactly as given.
+
+    Spaces, dashes, parentheses and Unicode are kept.  A path, an empty name,
+    a control character or a name over 255 bytes is refused.
+    """
+    if not isinstance(name, str) or not name or name != name.strip():
+        raise ValueError("display file name must be one non-empty basename")
+    if name in {".", ".."} or "/" in name or "\\" in name or Path(name).name != name:
+        raise ValueError("display file name must be one basename, not a path")
+    if any(ord(char) < 32 or ord(char) == 127 for char in name):
+        raise ValueError("display file name contains a control character")
+    if len(name.encode("utf-8")) > 255:
+        raise ValueError("display file name is longer than 255 bytes")
+    return name
+
+
+def requested_display_name(raw_path: Any) -> str | None:
+    """The exact name at the end of a requested path, or ``None`` if unusable."""
+    text = str(raw_path or "").strip()
+    if text.startswith("file://"):
+        from urllib.parse import unquote
+
+        text = unquote(text[len("file://"):])
+    try:
+        return display_file_name(Path(text).name)
+    except ValueError:
+        return None
+
+
 def _object_exists(base: Path, sha: str) -> bool:
     path = private_dir(base) / "objects" / sha
     return path.is_file() and not path.is_symlink()
@@ -716,13 +759,14 @@ def _keep_named(folder: Path, name: str, source: Path, sha: str) -> Path:
 
 
 def _keep_in_send_folder(sent: Path, name: str, source: Path) -> Path:
-    """Copy ``source`` to ``sent/<send-id>/<name>``: one folder per send.
+    """Copy ``source`` to ``sent/<send-id>/<safe name>``: one folder per send.
 
-    The file keeps its exact original name, which is what WhatsApp shows the
-    recipient; two different files of one name never clash.
+    Two different files of one name never clash.  The stored name is made
+    safe; the sender passes the exact display name to WhatsApp separately.
     """
     folder = sent / f"send-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-{uuid.uuid4().hex[:12]}"
     folder.mkdir(parents=True, mode=0o700)
+    name = safe_disk_name(name)
     target = folder / name
     staged = folder / f".{name}.{uuid.uuid4().hex}.tmp"
     with source.open("rb") as src, open(staged, "xb") as out:
@@ -783,8 +827,6 @@ def keep_file(
     code); a file already under ``records/`` is not copied again.  Returns the
     ``records/...`` path.  Takes only the short records lock.
     """
-    import re
-
     base = agent_dir()
     ensure_layout(base)
     records = records_dir(base)
@@ -798,7 +840,7 @@ def keep_file(
         sha = store_object(fd, base)
     finally:
         os.close(fd)
-    display = re.sub(r"[^\w.\- ]", "_", Path(str(name or source_path.name)).name).strip(" .") or "file"
+    display = safe_disk_name(name or source_path.name)
     with records_lock(base):
         resolved = source_path.resolve()
         if resolved.is_relative_to(records.resolve()):

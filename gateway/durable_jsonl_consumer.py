@@ -369,6 +369,27 @@ def _declared_document_mime(value: Any) -> str:
     return ""
 
 
+def _declared_document_file_name(value: Any) -> str:
+    """Recover the sender's exact document file name from the capture record.
+
+    The capture bridge stores a document under a sanitised name and its
+    normalized item carries only that path; the provider message in ``raw``
+    still has WhatsApp's ``fileName``, which is the name the sender sees.
+    """
+    if not isinstance(value, Mapping):
+        return ""
+    document = value.get("documentMessage")
+    if isinstance(document, Mapping):
+        name = document.get("fileName") or document.get("title") or ""
+        return name if isinstance(name, str) else ""
+    for nested in value.values():
+        if isinstance(nested, Mapping):
+            name = _declared_document_file_name(nested)
+            if name:
+                return name
+    return ""
+
+
 @dataclass(frozen=True)
 class InboxRecord:
     seq: int
@@ -741,6 +762,13 @@ class DurableInbox:
                 declared_document_mime = _declared_document_mime(decoded)
                 if declared_document_mime and len(item.get("mediaUrls") or []) == 1:
                     item["mediaMimes"] = [declared_document_mime]
+                declared_file_name = _declared_document_file_name(decoded)
+                if (
+                    declared_file_name
+                    and not item.get("mediaFileNames")
+                    and len(item.get("mediaUrls") or []) == 1
+                ):
+                    item["mediaFileNames"] = [declared_file_name]
                 message_id = str(item["messageId"])
                 staged.append((start, end, item, decoded))
                 last_message_id = message_id
@@ -3617,9 +3645,23 @@ def _parse_captured_send(entry: Mapping[str, Any]) -> dict[str, Any] | None:
 
 
 _CAPTURED_IMAGE_MEDIA_RE = re.compile(
-    r"MEDIA:\s*(?P<path>(?:(?:file://)?(?:~/|/)\S+|work/\S+))",
+    # A quoted or backticked path may contain spaces, so a file whose exact
+    # name has spaces or parentheses can be sent under that name.
+    r"MEDIA:\s*(?:"
+    r"\"(?P<quoted>(?:(?:file://)?(?:~/|/)|work/)[^\"\n]+)\""
+    r"|`(?P<backticked>(?:(?:file://)?(?:~/|/)|work/)[^`\n]+)`"
+    r"|(?P<path>(?:(?:file://)?(?:~/|/)\S+|work/\S+)))",
     re.IGNORECASE,
 )
+
+
+def _captured_media_match_path(match: re.Match[str]) -> str:
+    return (
+        match.group("quoted")
+        or match.group("backticked")
+        or match.group("path")
+        or ""
+    )
 
 
 def _expand_captured_send(send: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -3643,7 +3685,7 @@ def _expand_captured_send(send: Mapping[str, Any]) -> list[dict[str, Any]]:
             {
                 "send_kind": "media",
                 "chat_id": str(send.get("chat_id") or ""),
-                "path": match.group("path"),
+                "path": _captured_media_match_path(match),
                 "caption": cleaned if ordinal == 0 and cleaned else None,
                 # Keep the answer on every expanded item so delivery can send
                 # it separately if any attachment fails.  This field is never
@@ -3735,8 +3777,26 @@ def _resolve_captured_media_path(
     return resolved
 
 
+def _captured_document_display_name(send: Mapping[str, Any], media_path: Path) -> str:
+    """The exact name WhatsApp shows for a document this send delivers.
+
+    An explicit ``file_name`` (``send_document``'s, which ``tgg_file_return``
+    sets) wins; otherwise the name at the end of the requested path, as
+    written in the ``MEDIA:`` directive.  The stored copy keeps a safe name.
+    """
+    from tools.pa_agent_workspace import display_file_name, requested_display_name
+
+    explicit = send.get("file_name")
+    if explicit:
+        try:
+            return display_file_name(explicit)
+        except ValueError as exc:
+            raise MediaRetentionError(f"display file name refused: {exc}") from exc
+    return requested_display_name(send.get("path")) or media_path.name
+
+
 def _keep_sent_file_in_workspace(
-    path: Path, *, chat_id: str, message_id: str = ""
+    path: Path, *, chat_id: str, message_id: str = "", display_name: str = ""
 ) -> None:
     """Keep a file Christopher sent in the agent workspace (PA-203 round 2).
 
@@ -3751,7 +3811,11 @@ def _keep_sent_file_in_workspace(
             path,
             direction="sent",
             folder="sent",
-            details={"chat_id": chat_id, "message_id": message_id},
+            details={
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "display_name": display_name,
+            },
         )
     except Exception as exc:
         print(
@@ -3983,9 +4047,11 @@ def _parse_captured_media(entry: Mapping[str, Any]) -> list[dict[str, Any]]:
             reply_to = args[4]
     if not chat_id:
         return []
+    display_name = None
     if kind == "send_document":
         path = kwargs.get("file_path") or (args[1] if len(args) > 1 else None)
         caption = kwargs.get("caption") or (args[2] if len(args) > 2 else None)
+        display_name = kwargs.get("file_name") or (args[3] if len(args) > 3 else None)
         values = [(path, caption)] if path else []
     elif kind == "send_image_file":
         path = kwargs.get("image_path") or (args[1] if len(args) > 1 else None)
@@ -4018,6 +4084,11 @@ def _parse_captured_media(entry: Mapping[str, Any]) -> list[dict[str, Any]]:
                 "reply_to": str(reply_to) if reply_to else None,
                 "ordinal": ordinal,
                 "workspace_owner": str(entry.get("workspace_owner") or "").strip() or None,
+                **(
+                    {"file_name": display_name}
+                    if isinstance(display_name, str) and display_name
+                    else {}
+                ),
             })
     return parsed
 
@@ -4310,6 +4381,10 @@ def deliver_management_replies(
                 media_type, media_mime, media_file_name = (
                     _validated_captured_media_type(media_path)
                 )
+                if media_type == "document":
+                    media_file_name = _captured_document_display_name(
+                        send, media_path
+                    )
                 media_identity = hashlib.sha256(media_path.read_bytes()).hexdigest()
             except (OSError, MediaRetentionError) as exc:
                 requested_reference = str(send.get("path") or "")
@@ -4436,6 +4511,7 @@ def deliver_management_replies(
                         kwargs={
                             "chat_id": chat_id,
                             "message_id": str(payload.get("messageId") or ""),
+                            "display_name": media_file_name or "",
                         },
                         name="pa203-keep-sent-file",
                         daemon=True,

@@ -997,6 +997,10 @@ class MessageEvent:
     # Other adapters may populate a subset (e.g. file_url + file_path only).
     media_refs: List[Dict[str, Optional[str]]] = field(default_factory=list)
 
+    # The sender's exact file name for each entry in media_urls, where the
+    # platform supplied one ("" otherwise).  The cached file keeps a safe name.
+    media_file_names: List[str] = field(default_factory=list)
+
     # Reply context
     reply_to_message_id: Optional[str] = None
     reply_to_text: Optional[str] = None  # Text of the replied-to message (for context injection)

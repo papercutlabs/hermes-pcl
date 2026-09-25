@@ -8883,6 +8883,19 @@ class GatewayRunner:
                 parts = basename.split("_", 2)
                 display_name = parts[2] if len(parts) >= 3 else basename
                 display_name = re.sub(r'[^\w.\- ]', '_', display_name)
+                # The sender's exact file name, when the platform carried it.
+                # The stored file keeps its safe name; this is what they see.
+                _declared_names = getattr(event, "media_file_names", None) or []
+                original_name = ""
+                if i < len(_declared_names) and _declared_names[i]:
+                    try:
+                        from tools.pa_agent_workspace import display_file_name
+
+                        original_name = display_file_name(str(_declared_names[i]))
+                    except ValueError:
+                        original_name = ""
+                if original_name:
+                    display_name = original_name
 
                 # Translate host cache path to in-container path if running under Docker backend.
                 # This ensures the agent receives a path it can open inside its sandbox, as the
@@ -8890,10 +8903,10 @@ class GatewayRunner:
                 agent_path = to_agent_visible_cache_path(path)
                 sandbox_path = host_path_to_python_sandbox_path(path, _sandbox_config)
                 location_note = (
-                    f"Original filename: '{basename}'. "
+                    f"Original filename: '{original_name or basename}'. "
                     f"Sandbox path: {sandbox_path}. Host path: {agent_path}."
                     if sandbox_path is not None
-                    else f"Original filename: '{basename}'. Host path: {agent_path}."
+                    else f"Original filename: '{original_name or basename}'. Host path: {agent_path}."
                 )
                 # PA-203 round 2: with one agent-wide workspace, every file
                 # a person sends is kept in it, so later turns in any
@@ -8910,6 +8923,7 @@ class GatewayRunner:
                         details={
                             "chat_id": str(getattr(source, "chat_id", "") or ""),
                             "message_id": str(getattr(event, "message_id", "") or ""),
+                            "original_name": original_name,
                         },
                     )
                 except Exception as _keep_exc:
