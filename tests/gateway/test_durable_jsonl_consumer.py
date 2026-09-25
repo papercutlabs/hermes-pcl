@@ -3355,8 +3355,8 @@ async def test_live_drain_reuses_one_session_across_site_chat_turns(tmp_path):
         runner=Runner(),
     )
     assert [plan.replay_namespace for plan in plans] == [
-        "agent:live-drain:persistent-chat:openai-direct-primary:fixture",
-        "agent:live-drain:persistent-chat:openai-direct-primary:fixture",
+        "agent:live-drain:conversation",
+        "agent:live-drain:conversation",
     ]
     assert all({message["chatId"] for message in plan.messages} == {chat_id} for plan in plans)
 
@@ -3390,7 +3390,8 @@ async def test_live_drain_reuses_one_session_across_site_chat_turns(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_live_drain_starts_new_session_namespace_after_provider_switch(tmp_path):
+async def test_live_drain_keeps_session_namespace_across_provider_and_model_switch(tmp_path):
+    """PA-203 round 2: an engine change resumes the same conversation."""
     args = _enabled_consumer_args(tmp_path, [])
     plans = []
 
@@ -3408,18 +3409,15 @@ async def test_live_drain_starts_new_session_namespace_after_provider_switch(tmp
         persistent_session=True, runner=Runner(),
     )
     Path(args.config).write_text(yaml.safe_dump({
-        "model": {"provider": "openai-codex", "default": "fixture"},
+        "model": {"provider": "openai-codex", "default": "gpt-6-sol"},
         "pa": {"enabled": True},
     }))
     await consumer.process_live_records(
         [record], config_path=Path(args.config), state_db=Path(args.state_db),
         persistent_session=True, runner=Runner(),
     )
-    assert plans[0].replay_namespace.endswith(
-        ":openai-direct-primary:fixture"
-    )
-    assert plans[1].replay_namespace.endswith(":openai-codex:fixture")
-    assert plans[0].replay_namespace != plans[1].replay_namespace
+    assert plans[0].replay_namespace == "agent:live-drain:conversation"
+    assert plans[1].replay_namespace == plans[0].replay_namespace
 
 
 @pytest.mark.asyncio

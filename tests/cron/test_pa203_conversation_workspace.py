@@ -37,10 +37,8 @@ MANAGEMENT_CHAT = "120363000000000001@g.us"
 OTHER_MANAGEMENT_CHAT = "120363000000000002@g.us"
 OPS_CHAT = "120363000000000003@g.us"
 PROVIDER, MODEL = "openai-codex", "gpt-test"
-# The live persistent-chat key shape read from the TGG host on 2026-09-24.
-LIVE_KEY = (
-    f"agent:live-drain:persistent-chat:{PROVIDER}:{MODEL}:whatsapp:group:{MANAGEMENT_CHAT}"
-)
+# The live conversation key: no provider or model since PA-203 round 2.
+LIVE_KEY = f"agent:live-drain:conversation:whatsapp:group:{MANAGEMENT_CHAT}"
 HOOKS: dict[str, threading.Event] = {}
 
 
@@ -257,9 +255,7 @@ def test_conversation_key_matches_the_live_drain_namespace(home):
         persistent_chat_namespace,
     )
 
-    assert persistent_chat_namespace(PROVIDER, MODEL) == (
-        f"agent:live-drain:persistent-chat:{PROVIDER}:{MODEL}"
-    )
+    assert persistent_chat_namespace() == "agent:live-drain:conversation"
     assert management_conversation_session_key(
         home / "config.yaml", platform="whatsapp", chat_id=MANAGEMENT_CHAT
     ) == LIVE_KEY

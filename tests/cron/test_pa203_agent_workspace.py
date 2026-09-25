@@ -43,9 +43,7 @@ from tests.cron.test_pa203_conversation_workspace import (  # noqa: F401 - fixtu
 )
 from gateway.session_context import clear_session_vars, set_session_vars
 
-OTHER_KEY = (
-    f"agent:live-drain:persistent-chat:{PROVIDER}:{MODEL}:whatsapp:group:{OTHER_MANAGEMENT_CHAT}"
-)
+OTHER_KEY = f"agent:live-drain:conversation:whatsapp:group:{OTHER_MANAGEMENT_CHAT}"
 SANDBOX_CONFIG = {"enabled": True, "workspace": "agent"}
 
 
@@ -418,13 +416,16 @@ def _snapshot(work: Path) -> dict[str, bytes]:
 
 
 def test_existing_folders_merge_without_loss(agent_home):
-    # Today's shape: one folder per conversation and model.
-    current = _legacy(agent_home, LIVE_KEY, {
+    # The host's shape before round 2: one folder per conversation and model.
+    legacy_key = (
+        f"agent:live-drain:persistent-chat:{PROVIDER}:{MODEL}:whatsapp:group:{MANAGEMENT_CHAT}"
+    )
+    current = _legacy(agent_home, legacy_key, {
         "Outstanding_Cases_Update_v7.xlsx": "v7 current",
         "shared.txt": "same bytes",
         "nested/a.txt": "a",
     }, mtime=2_000_000_000)
-    old_model = _legacy(agent_home, LIVE_KEY.replace(MODEL, "gpt-old"), {
+    old_model = _legacy(agent_home, legacy_key.replace(MODEL, "gpt-old"), {
         "Outstanding_Cases_Update_v7.xlsx": "v7 from the old model folder",
         "shared.txt": "same bytes",
         "only_old.txt": "old",

@@ -246,6 +246,7 @@
     "gateway/channel_directory.py",
     "gateway/client_surface_policy.py",
     "gateway/config.py",
+    "gateway/conversation_key_carryover.py",
     "gateway/delivery.py",
     "gateway/display_config.py",
     "gateway/durable_jsonl_consumer.py",

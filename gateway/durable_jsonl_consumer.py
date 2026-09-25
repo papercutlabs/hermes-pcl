@@ -3193,13 +3193,12 @@ async def process_live_records(
         source_path="durable-jsonl-consumer-live",
         # Ordinary live drain is one ongoing conversation per chat. Bounded
         # backplay is recovery/diagnostic replay and remains isolated.
-        # A persisted conversation cannot safely carry its engine identity
-        # across a provider/model switch. Include that identity in the live
-        # namespace so ordinary restarts retain context, while an intentional
-        # engine change starts a fresh session instead of producing an audit
-        # mismatch and suppressing reply delivery.
+        # The namespace carries no provider or model (PA-203 round 2): an
+        # engine change resumes the same conversation.  The turn record takes
+        # its provider and model from the agent that ran, so the engine check
+        # below still compares the engine that actually answered.
         replay_namespace=(
-            persistent_chat_namespace(provider, model)
+            persistent_chat_namespace()
             if persistent_session
             else None
         ),
@@ -3281,9 +3280,32 @@ async def process_live_records(
     }
 
 
-def persistent_chat_namespace(provider: str, model: str) -> str:
-    """Session namespace of the ordinary live drain: one conversation per chat."""
-    return f"agent:live-drain:persistent-chat:{provider}:{model}"
+# PA-203 round 2: the live conversation namespace is independent of the
+# provider and model, so an engine change resumes Krisleen's conversation.
+# It is deliberately a new string, not the bare pre-engine
+# ``agent:live-drain:persistent-chat`` namespace, so an entry left under that
+# older key can never be resumed by mistake.
+# Earlier releases keyed the live namespace on the engine,
+# ``agent:live-drain:persistent-chat:{provider}:{model}``; the carry-over in
+# ``gateway.conversation_key_carryover`` moves those conversations once.
+from gateway.conversation_key_carryover import (  # noqa: E402
+    LEGACY_PREFIX as LEGACY_ENGINE_NAMESPACE_PREFIX,
+    NEW_NAMESPACE as PERSISTENT_CHAT_NAMESPACE,
+)
+
+
+def persistent_chat_namespace() -> str:
+    """Session namespace of the ordinary live drain: one conversation per chat.
+
+    It carries no provider or model, so a model or provider change resumes
+    the same Management and site conversations.
+    """
+    return PERSISTENT_CHAT_NAMESPACE
+
+
+def legacy_engine_chat_namespace(provider: str, model: str) -> str:
+    """The engine-keyed namespace earlier releases used for the live drain."""
+    return f"{LEGACY_ENGINE_NAMESPACE_PREFIX}:{provider}:{model}"
 
 
 def management_conversation_session_key(
@@ -3328,8 +3350,7 @@ def management_conversation_session_key(
             getattr(gateway_config, "thread_sessions_per_user", False)
         ),
     )
-    provider, model = configured_engine(config_path)
-    return namespace_session_key(base_key, persistent_chat_namespace(provider, model))
+    return namespace_session_key(base_key, persistent_chat_namespace())
 
 
 def _management_selector_chats(config_path: Path) -> frozenset[str]:
@@ -4753,7 +4774,7 @@ async def _run_management_document_turn(
             bypass_auth=True,
             live_business_writes=False,
             source_path="tgg-management-document-event",
-            replay_namespace=f"agent:live-drain:persistent-chat:{provider}:{model}",
+            replay_namespace=persistent_chat_namespace(),
         )
     )
     captured = [dict(item) for item in result.outbound if isinstance(item, Mapping)]
@@ -5588,6 +5609,37 @@ async def _process_background_completion(
             print(f"background completion FAILED: {exc}", file=sys.stderr)
 
 
+def _carry_over_conversation_keys() -> dict[str, Any] | None:
+    """Idempotent start-up carry-over; a failure never stops the consumer.
+
+    Nothing is lost when it fails: every old entry is kept, and the release
+    runs the same carry-over with the service stopped.
+    """
+    from gateway.config import load_gateway_config
+    from gateway.conversation_key_carryover import carry_over
+    from hermes_constants import get_hermes_home
+
+    try:
+        result = carry_over(
+            get_hermes_home(),
+            apply=True,
+            sessions_dir=load_gateway_config().sessions_dir,
+        )
+    except Exception as exc:  # noqa: BLE001 - reported, never fatal
+        print(f"conversation key carry-over FAILED: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return None
+    if result["carried"] or result["workspaces_copied"]:
+        print(
+            "conversation key carry-over: "
+            + json.dumps(
+                {key: result[key] for key in ("carried", "workspaces_copied")},
+                sort_keys=True,
+            ),
+            file=sys.stderr,
+        )
+    return result
+
+
 async def run_consumer(args: argparse.Namespace) -> int:
     config_path = Path(args.config).resolve()
     source = Path(args.source).resolve()
@@ -5609,6 +5661,9 @@ async def run_consumer(args: argparse.Namespace) -> int:
     management_quiet_seconds = _management_quiet_seconds(config_path)
 
     with SingletonLock(Path(args.lock_file).resolve()):
+        # PA-203 round 2: carry engine-keyed conversations to the stable
+        # namespace before any SessionStore in this process loads them.
+        _carry_over_conversation_keys()
         recovery = inbox.reconcile_orphan_processing(state_db)
         expected_total = inbox.assert_and_record_conservation()
         # PA-203 round 2: this process, not the gateway watcher, owns the
