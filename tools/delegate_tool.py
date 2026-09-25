@@ -1159,9 +1159,14 @@ def _build_child_agent(
         from toolsets import resolve_toolset
 
         child_toolsets = [name for name in child_toolsets if name in pa_fixed_toolsets]
+        # Before construction only emptiness is checked: the declared toolset
+        # may list tools that are unavailable here, which the constructed
+        # helper will not have either.  Width is checked on the real helper
+        # after construction (review B5).
         check_helper_tools(
             parent_agent,
             {tool for name in child_toolsets for tool in (resolve_toolset(name) or [])},
+            check_width=False,
         )
 
     workspace_hint = _resolve_workspace_hint(parent_agent)
@@ -2405,7 +2410,21 @@ def delegate_task(
     # Wrapped in try/finally so the global is always restored even if a
     # child build raises (otherwise _last_resolved_tool_names stays corrupted).
     children = []
-    from agent.pa_delegation import HelperScopeError
+    from agent.pa_delegation import HelperScopeError, is_scoped
+
+    pa_scoped = is_scoped(parent_agent)
+    if pa_scoped:
+        # PA-203 review B2: on the scoped route the helper's transport comes
+        # from configuration only.  A model-supplied ACP command would start
+        # an arbitrary host process as the helper, so it is refused.
+        if acp_command or acp_args or any(
+            isinstance(t, dict) and (t.get("acp_command") or t.get("acp_args"))
+            for t in task_list
+        ):
+            return tool_error(
+                "acp_command and acp_args cannot be set on this route; the helper's "
+                "transport comes from configuration. No helper was started."
+            )
 
     try:
         for i, t in enumerate(task_list):
@@ -2435,7 +2454,9 @@ def delegate_task(
                     else (acp_args if acp_args is not None else creds.get("args"))
                 ),
                 role=effective_role,
-                profile=t.get("profile") or t.get("name"),
+                # On the scoped route only ``profile`` selects the helper kind;
+                # a task's display name is not a kind (review B6.1).
+                profile=t.get("profile") if pa_scoped else (t.get("profile") or t.get("name")),
             )
             # Domain profile is intentionally distinct from the delegation
             # topology role (leaf/orchestrator).  Preserve the original task

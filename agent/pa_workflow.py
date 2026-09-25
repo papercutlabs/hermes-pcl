@@ -30,6 +30,7 @@ into the script.
 from __future__ import annotations
 
 import ast
+import copy
 import hashlib
 import json
 import re
@@ -46,6 +47,14 @@ ChildExecutor = Callable[[str, str, dict], dict]
 
 API_NAMES = frozenset({"task", "run", "parallel", "map", "chunks", "join", "results"})
 _RANGE_CAP = 10_000
+# Bounds on the script itself (review B3): line/loop steps, the size of any
+# string, list or tuple built by + or *, and the size of an integer product.
+MAX_SCRIPT_STEPS = 1_000_000
+MAX_SEQUENCE_ITEMS = 1_000_000
+MAX_INT_BITS = 4096
+# Bounds on fan-out (review B1): helpers per run and per parallel() call.
+MAX_CHILDREN_PER_RUN = 200
+MAX_PARALLEL_SPECS = 100
 
 
 class ScriptRefused(ValueError):
@@ -54,6 +63,81 @@ class ScriptRefused(ValueError):
 
 class _RunLimit(Exception):
     """A run exceeded a configured bound."""
+
+
+class RunStopped(Exception):
+    """The host asked the run to stop (a time limit, or Christopher paused)."""
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
+class _Spec:
+    """A helper spec.  Only ``task()`` makes one; a script cannot build one.
+
+    Scripts have no attribute access and no name for this class, so a
+    hand-written dict can never stand in for it (review B1).
+    """
+
+    __slots__ = ("kind", "prompt", "schema")
+
+    def __init__(self, kind: str, prompt: str, schema: dict):
+        self.kind = kind
+        self.prompt = prompt
+        self.schema = schema
+
+
+def _bounded_binop(op: str, left: Any, right: Any) -> Any:
+    """``+`` and ``*`` with size limits, so a script cannot exhaust memory."""
+    sequences = (str, list, tuple)
+    if op == "add":
+        if isinstance(left, sequences) and isinstance(right, sequences):
+            if len(left) + len(right) > MAX_SEQUENCE_ITEMS:
+                raise _RunLimit(f"a string or list may hold at most {MAX_SEQUENCE_ITEMS} items")
+        return left + right
+    for seq, count in ((left, right), (right, left)):
+        if isinstance(seq, sequences) and isinstance(count, int) and not isinstance(count, bool):
+            if len(seq) * max(count, 0) > MAX_SEQUENCE_ITEMS:
+                raise _RunLimit(f"a string or list may hold at most {MAX_SEQUENCE_ITEMS} items")
+    if isinstance(left, int) and isinstance(right, int):
+        if left.bit_length() + right.bit_length() > MAX_INT_BITS:
+            raise _RunLimit(f"an integer may have at most {MAX_INT_BITS} bits")
+    return left * right
+
+
+class _BoundOps(ast.NodeTransformer):
+    """Route every ``+`` and ``*`` (including ``+=`` and ``*=``) through the bounded helper."""
+
+    _OPS = {ast.Add: "add", ast.Mult: "mult"}
+
+    def _call(self, op: str, left: ast.expr, right: ast.expr, like: ast.AST) -> ast.Call:
+        return ast.copy_location(
+            ast.Call(
+                func=ast.Name(id="__wf_binop", ctx=ast.Load()),
+                args=[ast.Constant(op), left, right], keywords=[],
+            ),
+            like,
+        )
+
+    def visit_BinOp(self, node: ast.BinOp) -> ast.AST:
+        self.generic_visit(node)
+        op = self._OPS.get(type(node.op))
+        return self._call(op, node.left, node.right, node) if op else node
+
+    def visit_AugAssign(self, node: ast.AugAssign) -> ast.AST:
+        self.generic_visit(node)
+        op = self._OPS.get(type(node.op))
+        if not op:
+            return node
+        load = copy.deepcopy(node.target)
+        for sub in ast.walk(load):
+            if hasattr(sub, "ctx"):
+                sub.ctx = ast.Load()
+        store = copy.deepcopy(node.target)
+        return ast.copy_location(
+            ast.Assign(targets=[store], value=self._call(op, load, node.value, node)), node,
+        )
 
 
 def _safe_range(*args: int) -> range:
@@ -115,8 +199,10 @@ def validate_script(source: str, *, max_chars: int = 20000) -> ast.Module:
                 f"The workflow script may not use {type(node).__name__} "
                 f"(line {getattr(node, 'lineno', '?')}). " + _ALLOWED_TEXT
             )
-        if isinstance(node, ast.Pow):
-            raise ScriptRefused("The workflow script may not use the ** operator. " + _ALLOWED_TEXT)
+        if isinstance(node, (ast.Pow, ast.LShift, ast.MatMult)):
+            raise ScriptRefused(
+                f"The workflow script may not use the {type(node).__name__} operator. " + _ALLOWED_TEXT
+            )
         if isinstance(node, ast.Name) and node.id.startswith("_"):
             raise ScriptRefused(f"The workflow script may not use the name {node.id!r}. " + _ALLOWED_TEXT)
         if isinstance(node, ast.arg) and node.arg.startswith("_"):
@@ -158,7 +244,7 @@ def extract_json(text: str | None) -> Any:
     for i, ch in enumerate(text):
         if ch in "{[":
             try:
-                value, _ = decoder.raw_decode(text[i:])
+                value, _ = decoder.raw_decode(text, i)
                 return value
             except ValueError:
                 continue
@@ -391,14 +477,25 @@ class WorkflowRunner:
         kinds: Iterable[str],
         max_concurrency: int = 4,
         max_attempts: int = 3,
-        max_children: int = 500,
+        max_children: int = MAX_CHILDREN_PER_RUN,
+        stop_reason: Callable[[], str | None] | None = None,
+        max_script_seconds: float | None = None,
     ):
         self.store = store
         self.execute_child = execute_child
         self.kinds = frozenset(kinds)
         self.max_concurrency = max(1, int(max_concurrency))
         self.max_attempts = max(1, int(max_attempts))
-        self.max_children = max(1, int(max_children))
+        self.max_children = max(1, min(int(max_children), MAX_CHILDREN_PER_RUN))
+        # Checked before every helper attempt and every script step.  "paused"
+        # leaves the run unfinished so it resumes; any other reason ends it.
+        self.stop_reason = stop_reason or (lambda: None)
+        self.max_script_seconds = max_script_seconds
+
+    def check_stop(self) -> None:
+        reason = self.stop_reason()
+        if reason:
+            raise RunStopped(reason)
 
     def run(self, run_id: str) -> dict:
         record = self.store.get_run(run_id)
@@ -410,15 +507,20 @@ class WorkflowRunner:
             tree = validate_script(record["script"])
             output = _Execution(self, run_id).execute(tree)
             self.store.finish_run(run_id, status="completed", output=output, error=None)
+        except RunStopped as exc:
+            if exc.reason != "paused":
+                self.store.finish_run(run_id, status="failed", output=None, error=f"stopped: {exc.reason}")
+            # A paused run stays unfinished; the host resumes it later.
         except Exception as exc:  # script, limit or kind errors end the run failed
             self.store.finish_run(run_id, status="failed", output=None, error=f"{type(exc).__name__}: {exc}")
         return self.store.run_status(run_id)
 
     def _attempt_child(self, run_id: str, key: str, kind: str, prompt: str, schema: dict, prior_attempts: int) -> dict:
         attempts = prior_attempts
-        error: str | None = None
+        error: str | None = "the retry budget was spent before a usable answer"
         text_prompt = prompt
         while attempts < self.max_attempts:
+            self.check_stop()
             attempts += 1
             self.store.mark_child_running(run_id, key, attempts)
             try:
@@ -450,19 +552,47 @@ class _Execution:
         self.stored = runner.store.children(run_id)
         self.occurrences: dict[str, int] = {}
         self.seq = 0
+        # Keys this pass assigned, in order: results() reads only these, so a
+        # resumed pass sees exactly what the first pass saw (review B4).
+        self.assigned: list[str] = []
+        self.steps = 0
+        self.deadline = (
+            time.monotonic() + runner.max_script_seconds if runner.max_script_seconds else None
+        )
+
+    def _trace(self, frame: Any, event: str, arg: Any) -> Any:
+        if frame.f_code.co_filename != "<workflow>":
+            return None
+        if event == "line":
+            self.steps += 1
+            if self.steps > MAX_SCRIPT_STEPS:
+                raise _RunLimit(f"the script ran more than {MAX_SCRIPT_STEPS} steps")
+            if self.deadline is not None and time.monotonic() > self.deadline:
+                raise RunStopped("timeout")
+            if self.steps % 1000 == 0:
+                self.runner.check_stop()
+        return self._trace
 
     def execute(self, tree: ast.Module) -> Any:
-        scope: dict[str, Any] = {"__builtins__": {}}
+        import sys
+
+        tree = ast.fix_missing_locations(_BoundOps().visit(copy.deepcopy(tree)))
+        scope: dict[str, Any] = {"__builtins__": {}, "__wf_binop": _bounded_binop}
         scope.update(SAFE_BUILTINS)
         scope.update(
             task=self.task, run=self.run_one, parallel=self.parallel,
             map=self.map, chunks=self.chunks, join=self.join, results=self.results,
         )
-        exec(compile(tree, "<workflow>", "exec"), scope)  # noqa: S102 - AST-whitelisted
+        previous = sys.gettrace()
+        sys.settrace(self._trace)
+        try:
+            exec(compile(tree, "<workflow>", "exec"), scope)  # noqa: S102 - AST-whitelisted
+        finally:
+            sys.settrace(previous)
         return scope["output"] if "output" in scope else self.results()
 
     # API --------------------------------------------------------------
-    def task(self, kind: Any, prompt: Any, schema: Any) -> dict:
+    def task(self, kind: Any, prompt: Any, schema: Any) -> _Spec:
         if kind not in self.runner.kinds:
             raise ScriptRefused(
                 f"Unknown helper kind {kind!r}; the kinds are {', '.join(sorted(self.runner.kinds))}."
@@ -475,7 +605,7 @@ class _Execution:
             jsonschema.Draft202012Validator.check_schema(schema)
         except jsonschema.SchemaError as exc:
             raise ScriptRefused(f"The helper output schema is not valid JSON Schema: {exc.message}") from exc
-        return {"kind": kind, "prompt": prompt, "schema": schema}
+        return _Spec(kind, prompt, schema)
 
     def run_one(self, spec: Any) -> dict:
         return self.parallel([spec])[0]
@@ -496,14 +626,23 @@ class _Execution:
         return str(sep).join(str(item) for item in items)
 
     def results(self) -> list[dict]:
-        done = self.runner.store.children(self.run_id).values()
-        return [self._result(c) for c in done if c["status"] in ("ok", "failed")]
+        done = self.runner.store.children(self.run_id)
+        return [
+            self._result(done[key]) for key in self.assigned
+            if key in done and done[key]["status"] in ("ok", "failed")
+        ]
 
     def parallel(self, specs: Any) -> list[dict]:
         specs = list(specs)
+        if len(specs) > MAX_PARALLEL_SPECS:
+            raise _RunLimit(f"parallel() and map() take at most {MAX_PARALLEL_SPECS} helpers at once")
         for spec in specs:
-            if not isinstance(spec, dict) or set(spec) != {"kind", "prompt", "schema"}:
-                raise ScriptRefused("parallel() and run() take specs made by task(kind, prompt, schema).")
+            # Every path that starts a helper re-checks the kind (review B1).
+            if not isinstance(spec, _Spec):
+                raise ScriptRefused("parallel() and run() take only specs made by task(kind, prompt, schema).")
+            if spec.kind not in self.runner.kinds:
+                raise ScriptRefused(f"Unknown helper kind {spec.kind!r}.")
+        self.runner.check_stop()
         keys = [self._assign(spec) for spec in specs]
         todo = [(key, spec) for key, spec in zip(keys, specs)
                 if self.stored[key]["status"] not in ("ok", "failed")]
@@ -512,8 +651,8 @@ class _Execution:
             try:
                 futures = [
                     pool.submit(
-                        self.runner._attempt_child, self.run_id, key, spec["kind"], spec["prompt"],
-                        spec["schema"], 0,
+                        self.runner._attempt_child, self.run_id, key, spec.kind, spec.prompt,
+                        spec.schema, int(self.stored[key].get("attempts") or 0),
                     )
                     for key, spec in todo
                 ]
@@ -525,9 +664,9 @@ class _Execution:
         return [self._result(self.stored[key]) for key in keys]
 
     # internals --------------------------------------------------------
-    def _assign(self, spec: dict) -> str:
+    def _assign(self, spec: _Spec) -> str:
         base = hashlib.sha256(
-            _canonical([spec["kind"], spec["prompt"], spec["schema"]]).encode()
+            _canonical([spec.kind, spec.prompt, spec.schema]).encode()
         ).hexdigest()
         n = self.occurrences.get(base, 0)
         self.occurrences[base] = n + 1
@@ -537,12 +676,13 @@ class _Execution:
                 raise _RunLimit(f"a run may start at most {self.runner.max_children} helpers")
             seq = len(self.stored)
             self.runner.store.register_child(
-                self.run_id, key=key, seq=seq, kind=spec["kind"], task=spec["prompt"], schema=spec["schema"],
+                self.run_id, key=key, seq=seq, kind=spec.kind, task=spec.prompt, schema=spec.schema,
             )
             self.stored[key] = {
-                "key": key, "seq": seq, "kind": spec["kind"], "task": spec["prompt"],
+                "key": key, "seq": seq, "kind": spec.kind, "task": spec.prompt,
                 "status": "pending", "output": None, "error": None, "attempts": 0,
             }
+        self.assigned.append(key)
         return key
 
     @staticmethod

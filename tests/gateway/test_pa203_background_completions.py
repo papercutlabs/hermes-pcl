@@ -259,7 +259,10 @@ def test_restart_during_the_completion_turn_retries_it_unless_it_completed(tmp_p
         assert store.claim(completion_id)
     summary = store.recover_after_restart({"background-completion:done-turn": "turn-9"})
     assert summary["processing_completed"] == 1 and summary["processing_retried"] == 1
-    assert store.get("done-turn")["status"] == "completed"
+    # Review item 9: a finished turn whose reply was never stored is recorded
+    # as lost, not silently completed and not re-run.
+    done = store.get("done-turn")
+    assert done["status"] == "failed" and "before its reply was handed to delivery" in done["last_error"]
     assert store.get("cut-turn")["status"] == "pending"
 
 
@@ -432,6 +435,8 @@ def test_runner_resumes_after_a_crash(tmp_path, workflow_env):
     new_store, summary, restore = background.start_for_consumer(tmp_path / "inbox.db", tmp_path / "state.db")
     try:
         assert summary["resumed"] == 1 and summary["interrupted"] == 0
+        # Resume happens on the first loop with processing enabled (review item 8).
+        assert background.set_processing(new_store, True)["resumed"] == 1
         assert _wait_for(lambda: not process_registry.completion_queue.empty())
         time.sleep(0.1)
         assert background.maintain(new_store)["recorded"] == 1
@@ -486,3 +491,217 @@ def test_gateway_post_turn_drain_leaves_workflow_completions_for_the_consumer():
     while not q.empty():
         left.append(q.get_nowait()["type"])
     assert sorted(left) == ["async_delegation", "workflow_run"]
+
+
+
+# ── Review fixes (review-r2.md) ──────────────────────────────────────────
+
+
+def _one_record():
+    return durable.InboxRecord(
+        seq=1, message_id="krisleen-request", chat_id=CHAT, start_offset=0, end_offset=1,
+        raw={"messageId": "krisleen-request", "chatId": CHAT, "isGroup": True,
+             "senderName": "Krisleen", "body": REQUEST, "timestamp": 1},
+    )
+
+
+def test_delivery_failure_keeps_the_reply_and_retries_only_delivery(tmp_path, monkeypatch):
+    """Item 9: the reply is stored before sending; a failed hand-off is retried."""
+    store = background.CompletionStore(tmp_path / "inbox.db")
+    store.record_dispatch({"delegation_id": "deleg_x", "origin": _origin(), "goal": "g"})
+    store.record_completion("deleg_x", outcome="completed", result={"summary": "done"})
+    turns, _ = _fake_turns(monkeypatch)
+    attempts = []
+
+    def flaky_deliver(_inbox, **kwargs):
+        attempts.append(kwargs["captured_outbound"])
+        if len(attempts) == 1:
+            raise OSError("bridge down")
+        return {"delivered": 1, "undelivered": 0, "suppressed": 0, "duplicate": 0}
+
+    monkeypatch.setattr(durable, "deliver_management_replies", flaky_deliver)
+    inbox = SimpleNamespace(message_id_selection=lambda ids: [_one_record()])
+    config = tmp_path / "config.yaml"
+    config.write_text("model:\n  provider: fixture\n  default: fixture-model\n", encoding="utf-8")
+    kwargs = dict(store=store, inbox=inbox, config_path=config, state_db=tmp_path / "s.db",
+                  gate_changed_at="2026-09-25T00:00:00Z", runner=object())
+
+    assert store.claim("deleg_x")
+    with pytest.raises(OSError):
+        asyncio.run(background.process_claimed_completion(row=store.get("deleg_x"), **kwargs))
+    row = store.get("deleg_x")
+    assert row["status"] == "delivering" and json.loads(row["outbound_json"]) == [{"kind": "send"}]
+
+    # Next loop: delivery only, from the stored reply; the turn does not run again.
+    assert store.next_pending()["completion_id"] == "deleg_x"
+    assert store.claim("deleg_x")
+    asyncio.run(background.process_claimed_completion(row=store.get("deleg_x"), **kwargs))
+    assert len(turns) == 1 and len(attempts) == 2
+    assert attempts[1] == [{"kind": "send"}]
+    assert store.get("deleg_x")["status"] == "completed"
+
+
+def test_restart_keeps_a_stored_reply_for_delivery(tmp_path):
+    store = background.CompletionStore(tmp_path / "inbox.db")
+    store.record_dispatch({"delegation_id": "deleg_y", "origin": _origin(), "goal": "g"})
+    store.record_completion("deleg_y", outcome="completed", result={})
+    assert store.claim("deleg_y")
+    store.hand_to_delivery("deleg_y", turn_id="t1", captured_outbound=[{"kind": "send"}], handled=[])
+    store.recover_after_restart({"background-completion:deleg_y": "t1"})
+    assert store.get("deleg_y")["status"] == "delivering"
+
+
+def test_completion_fallback_is_not_suppressed_by_the_original_turns_fallback(tmp_path, monkeypatch):
+    """Integration finding 5: fallback and refusal keys carry the completion prefix."""
+    inbox = durable.DurableInbox(tmp_path / "inbox.db")
+    record = _one_record()
+    monkeypatch.setattr(durable, "_management_selector_chats", lambda _p: frozenset({CHAT}))
+    # The original turn already used a fallback for this message.
+    assert inbox.claim_reply_delivery(
+        f"media-fallback::{CHAT}::krisleen-request", chat_id=CHAT, reply_to_message_id="krisleen-request",
+    )
+    sent = []
+
+    class _Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return b'{"success": true, "messageId": "sent-1"}'
+
+    monkeypatch.setattr("urllib.request.urlopen", lambda req, timeout=30: sent.append(json.loads(req.data)) or _Response())
+    (tmp_path / "c.yaml").write_text("pa:\n  enabled: true\n", encoding="utf-8")
+    summary = durable.deliver_management_replies(
+        inbox, config_path=tmp_path / "c.yaml",
+        captured_outbound=[{"kind": "send_document", "args": [CHAT, "work/missing.xlsx", "The workbook"], "kwargs": {}}],
+        batch_records=[record], gate_changed_at="2026-09-25T00:00:00Z",
+        handled_groups=[{"message_ids": ["background-completion:deleg_1"], "turn_id": "t"}],
+        completion={"completion_id": "deleg_1", "original_message_id": "krisleen-request",
+                    "internal_message_id": "background-completion:deleg_1"},
+    )
+    assert summary["delivered"] == 1, summary
+    assert inbox.reply_delivery_status(
+        f"completion::deleg_1::media-fallback::{CHAT}::krisleen-request"
+    ) == "delivered"
+
+
+def test_workflow_parent_has_only_the_readonly_toolset(workflow_env):
+    from tests.cron.test_pa203_readonly_delegation_children import MANAGEMENT_ENABLED
+
+    parent = workflow_env.tool._ParentSpec({"enabled_toolsets": list(MANAGEMENT_ENABLED)}, {})
+    assert parent.enabled_toolsets == ["tgg-management-readonly-investigation"]
+    assert parent.acp_command is None
+
+
+def test_restart_resumes_workflow_runs_only_while_processing_is_enabled(tmp_path, workflow_env):
+    tool = workflow_env.tool
+    from agent.pa_workflow import WorkflowStore
+
+    store = background.CompletionStore(tmp_path / "inbox.db")
+    run_id = "wf-pausedrun01"
+    WorkflowStore(tool.store_path()).create_run(
+        run_id, script=SCRIPT, title="t", started_by={"chat_id": CHAT},
+        origin={**_origin(), "parent": {"enabled_toolsets": ["tgg-management-readonly-investigation"]}},
+    )
+    store.record_dispatch({"source": "workflow", "run_id": run_id, "origin": _origin(), "title": "t"})
+
+    new_store, summary, restore = background.start_for_consumer(tmp_path / "inbox.db", tmp_path / "state.db")
+    try:
+        assert summary["resumed"] == 1
+        time.sleep(0.2)
+        assert workflow_env.calls == []  # nothing ran at start-up
+        assert background.set_processing(new_store, False) == {"paused": 0, "resumed": 0}
+        assert workflow_env.calls == []
+        assert background.set_processing(new_store, True)["resumed"] == 1
+        assert _wait_for(lambda: not process_registry.completion_queue.empty())
+        time.sleep(0.1)
+        assert background.maintain(new_store)["recorded"] == 1
+    finally:
+        restore()
+    assert len(workflow_env.calls) == 13
+
+
+def test_pausing_stops_an_active_run_and_it_resumes_later(tmp_path, workflow_env, monkeypatch):
+    import threading as _threading
+
+    tool = workflow_env.tool
+    gate = _threading.Event()
+    real = tool._make_executor
+
+    def slow_executor(parent):
+        inner = real(parent)
+
+        def execute(kind, prompt, schema):
+            gate.wait(5)
+            return inner(kind, prompt, schema)
+        return execute
+
+    monkeypatch.setattr(tool, "_make_executor", slow_executor)
+    store = background.CompletionStore(tmp_path / "inbox.db")
+    background.install_sink(store)
+    started = json.loads(tool.workflow_start(script=SCRIPT, title="t", parent_agent=workflow_env.parent))
+    run_id = started["run_id"]
+    assert background.set_processing(store, False)["paused"] == 1
+    gate.set()
+    assert _wait_for(lambda: run_id not in tool.active_workflow_ids())
+    status = json.loads(tool.workflow_status(run_id=run_id))
+    assert status["status"] == "running" and process_registry.completion_queue.empty()
+    done_before = status["counts"]["ok"]
+    assert done_before < 13
+    assert background.set_processing(store, True)["resumed"] == 1
+    assert _wait_for(lambda: not process_registry.completion_queue.empty())
+    assert len(workflow_env.calls) == 13
+
+
+def test_timed_out_workflow_stops_starting_helpers(tmp_path, workflow_env, monkeypatch):
+    import threading as _threading
+
+    tool = workflow_env.tool
+    gate = _threading.Event()
+    real = tool._make_executor
+
+    def slow_executor(parent):
+        inner = real(parent)
+
+        def execute(kind, prompt, schema):
+            gate.wait(5)
+            return inner(kind, prompt, schema)
+        return execute
+
+    monkeypatch.setattr(tool, "_make_executor", slow_executor)
+    store = background.CompletionStore(tmp_path / "inbox.db")
+    background.install_sink(store)
+    run_id = json.loads(tool.workflow_start(script=SCRIPT, title="t", parent_agent=workflow_env.parent))["run_id"]
+    with sqlite3.connect(tmp_path / "inbox.db") as conn:
+        conn.execute("UPDATE background_completions SET deadline_at=0 WHERE completion_id=?", (run_id,))
+    assert background.maintain(store)["expired"] == 1
+    gate.set()
+    assert _wait_for(lambda: run_id not in tool.active_workflow_ids())
+    status = json.loads(tool.workflow_status(run_id=run_id))
+    assert status["status"] == "failed" and status["error"] == "stopped: timeout"
+    assert len(workflow_env.calls) < 13
+    assert store.get(run_id)["outcome"] == "timeout"
+
+
+def test_workflow_status_needs_the_same_conversation(workflow_env, monkeypatch):
+    tool = workflow_env.tool
+    run_id = json.loads(tool.workflow_start(script="output = 1", wait=True, parent_agent=workflow_env.parent))["run_id"]
+    monkeypatch.setattr("gateway.session_context.get_session_env", lambda name, default="": default)
+    assert "another conversation" in json.loads(tool.workflow_status(run_id=run_id))["error"]
+
+
+def test_active_workflow_runs_are_capped(tmp_path, workflow_env, monkeypatch):
+    tool = workflow_env.tool
+    store = background.CompletionStore(tmp_path / "inbox.db")
+    background.install_sink(store)
+    monkeypatch.setattr(tool, "_start_thread", lambda run_id, parent: None)
+    for _ in range(tool.MAX_ACTIVE_RUNS):
+        assert json.loads(tool.workflow_start(script="output = 1", parent_agent=workflow_env.parent))["status"] == "started"
+    assert "already running" in json.loads(tool.workflow_start(script="output = 1", parent_agent=workflow_env.parent))["error"]
+    with tool._active_lock:
+        tool._active_runs.clear()
