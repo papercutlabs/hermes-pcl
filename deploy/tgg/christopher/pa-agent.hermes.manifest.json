@@ -208,6 +208,7 @@
     "deploy/tgg/christopher/scripts/build_runtime_slots.py",
     "deploy/tgg/christopher/scripts/deploy_runtime.sh",
     "deploy/tgg/christopher/scripts/ensure_processing_gate.py",
+    "deploy/tgg/christopher/scripts/merge_sandbox_workspaces.py",
     "deploy/tgg/christopher/scripts/output_quality_eval.py",
     "deploy/tgg/christopher/scripts/prepare_host_secrets.sh",
     "deploy/tgg/christopher/scripts/preserve_env_key.py",
