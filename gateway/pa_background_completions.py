@@ -69,7 +69,10 @@ CREATE INDEX IF NOT EXISTS background_completions_status_idx
 """
 
 INTERNAL_PREFIX = "background-completion:"
-MAX_RESULT_CHARS = 60000
+# A completion turn carries at most this much result text inline; anything
+# larger is written to the sandbox /work folder and pointed to (r2f replay s3:
+# 235,819 characters were cut to 60,457 and the rest was lost).
+MAX_RESULT_CHARS = 12000
 MAX_TURN_ATTEMPTS = 3
 _COMPLETION_EVENT_TYPES = {"async_delegation", "workflow_run"}
 
@@ -476,7 +479,7 @@ def drain_completion_queue(store: CompletionStore, completion_queue: Any = None)
             key: evt.get(key)
             for key in (
                 "status", "summary", "error", "output", "counts", "api_calls",
-                "duration_seconds", "exit_reason", "run_id",
+                "duration_seconds", "exit_reason", "run_id", "results_file",
             )
             if evt.get(key) is not None
         }
@@ -485,10 +488,24 @@ def drain_completion_queue(store: CompletionStore, completion_queue: Any = None)
     return recorded
 
 
-def _clip(text: str, limit: int = MAX_RESULT_CHARS) -> str:
+def _clip(text: str, limit: int = MAX_RESULT_CHARS, *, full_path: str | None = None) -> str:
+    """Bound inline text.  Text is only ever cut with a pointer to the full file."""
     if len(text) <= limit:
         return text
-    return text[:limit] + f"\n[... {len(text) - limit} more characters not shown]"
+    if full_path:
+        return text[:limit] + f"\n[... {len(text) - limit} more characters are in {full_path}]"
+    return text[:limit] + (
+        f"\n[... {len(text) - limit} more characters could not be saved to /work and are not shown]"
+    )
+
+
+def _spill_to_work(name: str, text: str, row: Mapping[str, Any]) -> str | None:
+    """Write a large result into the originating conversation's /work folder."""
+    from tools.work_artifacts import write_work_file
+
+    origin = json.loads(row.get("origin_json") or "{}")
+    owner = str(origin.get("session_key") or "") or None
+    return write_work_file(name, text, owner=owner, details={"completion": row.get("completion_id")})
 
 
 _OUTCOME_WORDS = {
@@ -520,27 +537,41 @@ def completion_event(
             f"{item.get('body') or ''}\n\"\"\""
         )
     outcome = str(row.get("outcome") or result.get("status") or "completed")
+    full_path: str | None = None
     if row.get("source") == "workflow":
         label = f"Workflow run {result.get('run_id') or completion_id}"
         if task.get("title"):
             label += f" ({task['title']})"
-        payload = {
-            key: result.get(key)
-            for key in ("counts", "output", "error")
-            if result.get(key) is not None
-        }
+        if isinstance(result.get("summary"), Mapping):
+            # Counts, failures and a small sample; every result is in /work.
+            full_path = result.get("results_file") or result["summary"].get("results_file")
+            payload = dict(result["summary"])
+        else:
+            payload = {
+                key: result.get(key)
+                for key in ("counts", "output", "error")
+                if result.get(key) is not None
+            }
         result_text = json.dumps(payload, ensure_ascii=False, indent=1, default=str)
+        if len(result_text) > MAX_RESULT_CHARS and not full_path:
+            full_path = _spill_to_work(f"workflow-{completion_id}-completion.json", result_text, row)
     else:
         label = f"Background helper {completion_id}: {task.get('goal') or ''}"
         result_text = str(result.get("summary") or result.get("error") or "(no result text)")
         if result.get("summary") and result.get("error"):
             result_text += f"\nError: {result['error']}"
+        if len(result_text) > MAX_RESULT_CHARS:
+            full_path = _spill_to_work(f"helper-{completion_id}-result.txt", result_text, row)
+    if full_path and len(result_text) > MAX_RESULT_CHARS:
+        from tools.work_artifacts import read_hint
+
+        result_text = read_hint(full_path) + "\n\n" + result_text
     body = (
         "[Internal: background work you started in this conversation has "
         f"{_OUTCOME_WORDS.get(outcome, outcome)}. This is not a new client message.]\n\n"
         "The request it was started for, verbatim:\n"
         + ("\n\n".join(request_lines) or "(the original request message is not available)")
-        + f"\n\n{label}\nOutcome: {outcome}\nResult:\n{_clip(result_text)}\n\n"
+        + f"\n\n{label}\nOutcome: {outcome}\nResult:\n{_clip(result_text, full_path=full_path)}\n\n"
         "Finish the original request with this result."
     )
     first = items[0] if items else {}

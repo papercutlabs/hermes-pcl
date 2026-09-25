@@ -675,6 +675,7 @@
     "tools/web_tools.py",
     "tools/website_policy.py",
     "tools/wf_tools.py",
+    "tools/work_artifacts.py",
     "tools/xai_http.py",
     "tools/yuanbao_tools.py",
     "toolset_distributions.py",

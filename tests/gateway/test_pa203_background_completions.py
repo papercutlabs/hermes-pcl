@@ -350,6 +350,15 @@ def workflow_env(tmp_path, monkeypatch):
     return SimpleNamespace(tool=pa_workflow_tool, parent=parent, calls=calls, gate=gate, Crash=Crash)
 
 
+def _results_file(result):
+    """The full results a workflow completion points to, read from /work."""
+    from tools.work_artifacts import _work_dir
+
+    path = result.get("results_file") or result["summary"]["results_file"]
+    assert path.startswith("/work/")
+    return json.loads((_work_dir(SESSION_KEY) / path[len("/work/"):]).read_text(encoding="utf-8"))
+
+
 JOBS = [f"AM/JOB/2609/{n:04d}" for n in range(1, 62)]
 SCRIPT = (
     f"jobs = {JOBS!r}\n"
@@ -383,7 +392,7 @@ def test_runner_fan_out_of_61_items_returns_one_completion(tmp_path, workflow_en
     row = store.get(run_id)
     assert row["status"] == "pending"
     result = json.loads(row["result_json"])
-    assert sorted(case["job_no"] for case in result["output"]) == JOBS
+    assert sorted(case["job_no"] for case in _results_file(result)["output"]) == JOBS
     assert result["counts"]["ok"] == 13
 
     # The record backs a progress claim.
@@ -406,7 +415,8 @@ def test_runner_fan_out_of_61_items_returns_one_completion(tmp_path, workflow_en
         state_db=tmp_path / "state.db", gate_changed_at="2026-09-25T00:00:00Z", runner=object(),
     ))
     assert len(turns) == 1
-    assert REQUEST in turns[0]["event"]["body"] and "AM/JOB/2609/0061" in turns[0]["event"]["body"]
+    # The turn carries the request and a bounded summary that points to every result.
+    assert REQUEST in turns[0]["event"]["body"] and result["results_file"] in turns[0]["event"]["body"]
     assert store.get(run_id)["status"] == "completed"
 
 
@@ -444,7 +454,7 @@ def test_runner_resumes_after_a_crash(tmp_path, workflow_env):
         restore()
     assert len(workflow_env.calls) == 13  # 4 before the crash + only the 9 unfinished
     result = json.loads(new_store.get("wf-crashtest01")["result_json"])
-    assert sorted(case["job_no"] for case in result["output"]) == JOBS
+    assert sorted(case["job_no"] for case in _results_file(result)["output"]) == JOBS
 
 
 def test_workflow_script_refuses_raw_tools(workflow_env):
@@ -857,7 +867,7 @@ def test_map_results_passed_to_parallel_run_once_and_complete(tmp_path, workflow
     assert background.maintain(store)["recorded"] == 1
     result = json.loads(store.get(run_id)["result_json"])
     assert result["status"] == "completed" and not result.get("error")
-    assert sorted(case["job_no"] for case in result["output"]) == JOBS
+    assert sorted(case["job_no"] for case in _results_file(result)["output"]) == JOBS
     assert len(workflow_env.calls) == 13  # parallel() started nothing new
 
 
@@ -873,13 +883,14 @@ def test_a_script_error_after_helpers_ran_keeps_their_results(tmp_path, workflow
     result = json.loads(row["result_json"])
     assert row["outcome"] == "completed"
     assert "IndexError" in result["error"]
-    assert result["output"]["partial"] is True
-    assert len(result["output"]["results"]) == 13
-    covered = sorted(c["job_no"] for r in result["output"]["results"] for c in r["output"]["cases"])
+    full = _results_file(result)
+    assert full["output"]["partial"] is True
+    assert len(full["output"]["results"]) == 13
+    covered = sorted(c["job_no"] for r in full["output"]["results"] for c in r["output"]["cases"])
     assert covered == JOBS
-    # The completion turn shows the finished work and the error together.
+    # The completion turn shows the error and points to every finished result.
     _id, event = background.completion_event(row, [_one_record()])
-    assert "AM/JOB/2609/0061" in event["body"] and "IndexError" in event["body"]
+    assert "IndexError" in event["body"] and result["results_file"] in event["body"]
 
 
 def test_scheduled_management_job_can_read_its_own_run(workflow_env, monkeypatch):

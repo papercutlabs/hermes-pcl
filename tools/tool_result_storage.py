@@ -119,6 +119,34 @@ def _build_persisted_message(
     return msg
 
 
+def _write_to_work(content: str, tool_use_id: str) -> str | None:
+    """Write into the python sandbox's /work when the sandbox is enabled."""
+    try:
+        from tools.python_sandbox_tool import _load_config
+
+        if not (_load_config() or {}).get("enabled"):
+            return None
+        from tools.work_artifacts import write_work_file
+
+        return write_work_file(f"tool-result-{tool_use_id}.txt", content)
+    except Exception as exc:
+        logger.debug("Could not persist tool result to /work: %s", exc)
+        return None
+
+
+def _build_work_message(preview: str, has_more: bool, original_size: int, work_path: str) -> str:
+    msg = f"{PERSISTED_OUTPUT_TAG}\n"
+    msg += f"This tool result was too large ({original_size:,} characters).\n"
+    msg += f"Full output saved to: {work_path}\n"
+    msg += "Read it with python_sandbox (it is in /work), not by repeating the call.\n\n"
+    msg += f"Preview (first {len(preview)} chars):\n"
+    msg += preview
+    if has_more:
+        msg += "\n..."
+    msg += f"\n{PERSISTED_OUTPUT_CLOSING_TAG}"
+    return msg
+
+
 def maybe_persist_tool_result(
     content: str,
     tool_name: str,
@@ -166,6 +194,17 @@ def maybe_persist_tool_result(
                 return _build_persisted_message(preview, has_more, len(content), remote_path)
         except Exception as exc:
             logger.warning("Sandbox write failed for %s: %s", tool_use_id, exc)
+
+    # PA-203 r2f: with no terminal environment (Christopher has none), keep
+    # the full output in the python sandbox's /work folder instead of
+    # cutting it, and say how to read it.
+    work_path = _write_to_work(content, tool_use_id)
+    if work_path:
+        logger.info(
+            "Persisted large tool result to the sandbox workspace: %s (%s, %d chars -> %s)",
+            tool_name, tool_use_id, len(content), work_path,
+        )
+        return _build_work_message(preview, has_more, len(content), work_path)
 
     logger.info(
         "Inline-truncating large tool result: %s (%d chars, no sandbox write)",

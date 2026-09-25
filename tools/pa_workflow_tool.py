@@ -170,18 +170,141 @@ def _make_executor(parent: Any):
 
 # ── running and completing a run ────────────────────────────────────────────
 
+# ── full results in /work, bounded text everywhere else (r2f replay s3) ─────
+
+INLINE_OUTPUT_CHARS = 3000
+SAMPLE_RESULTS = 3
+LISTED_FAILURES = 10
+LISTED_CHILDREN = 20
+
+
+def _clip_text(value: Any, limit: int) -> str:
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
+    return text if len(text) <= limit else text[:limit] + " [...]"
+
+
+def write_results_files(store: WorkflowStore, run_id: str, status: Dict[str, Any]) -> Dict[str, str]:
+    """Write every helper result of a finished run into the sandbox ``/work``.
+
+    ``workflow-<run>-results.json`` holds the run's output and every helper's
+    full result; ``workflow-<run>-results.csv`` has one row per helper for
+    spreadsheet work.  Returns the ``/work/...`` paths written.
+    """
+    import csv
+    import io
+
+    from tools.work_artifacts import resolve_owner, write_work_file
+
+    # The sandbox folder this turn uses (a scheduled job's bound conversation,
+    # else the session), falling back to the run's own conversation.
+    run = store.get_run(run_id) or {}
+    owner = resolve_owner(None) or str((run.get("origin") or {}).get("session_key") or "") or None
+    children = sorted(store.children(run_id).values(), key=lambda c: c["seq"])
+    full = {
+        "run_id": run_id,
+        "title": status.get("title"),
+        "status": status.get("status"),
+        "error": status.get("error"),
+        "counts": status.get("counts"),
+        "output": status.get("output"),
+        "results": [
+            {
+                "seq": c["seq"], "kind": c["kind"], "task": c["task"], "status": c["status"],
+                "attempts": c["attempts"], "error": c["error"], "output": c["output"],
+            }
+            for c in children
+        ],
+    }
+    details = {"workflow_run": run_id}
+    paths: Dict[str, str] = {}
+    json_path = write_work_file(
+        f"workflow-{run_id}-results.json",
+        json.dumps(full, ensure_ascii=False, indent=1, default=str),
+        owner=owner, details=details,
+    )
+    if json_path:
+        paths["results_file"] = json_path
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(["seq", "status", "task", "error", "attempts", "result"])
+    for c in children:
+        writer.writerow([
+            c["seq"], c["status"], c["task"], c["error"] or "", c["attempts"],
+            "" if c["output"] is None else json.dumps(c["output"], ensure_ascii=False, default=str),
+        ])
+    csv_path = write_work_file(
+        f"workflow-{run_id}-results.csv", buffer.getvalue(), owner=owner, details=details,
+    )
+    if csv_path:
+        paths["results_csv"] = csv_path
+    return paths
+
+
+def bounded_summary(store: WorkflowStore, run_id: str, status: Dict[str, Any],
+                    paths: Dict[str, str]) -> Dict[str, Any]:
+    """Counts, failures and a small sample, never the full results."""
+    from tools.work_artifacts import read_hint
+
+    children = sorted(store.children(run_id).values(), key=lambda c: c["seq"])
+    failures = [c for c in children if c["status"] == "failed"]
+    oks = [c for c in children if c["status"] == "ok"]
+    summary: Dict[str, Any] = {
+        "run_id": run_id,
+        "title": status.get("title"),
+        "status": status.get("status"),
+        # Who started it: the run record Teren's ruling requires.
+        "started_by": status.get("started_by") or (store.get_run(run_id) or {}).get("started_by"),
+        "created_at": status.get("created_at"),
+        "updated_at": status.get("updated_at"),
+        "counts": status.get("counts"),
+        "total_helpers": len(children),
+        "error": status.get("error"),
+        "failures": [
+            {"seq": c["seq"], "task": _clip_text(c["task"], 160), "error": _clip_text(c["error"] or "", 300)}
+            for c in failures[:LISTED_FAILURES]
+        ],
+        "sample": [
+            {"seq": c["seq"], "task": _clip_text(c["task"], 160), "output": _clip_text(c["output"], 600)}
+            for c in oks[:SAMPLE_RESULTS]
+        ],
+        **paths,
+    }
+    if len(failures) > LISTED_FAILURES:
+        summary["failures_not_listed"] = len(failures) - LISTED_FAILURES
+    output = status.get("output")
+    if output is not None:
+        encoded = json.dumps(output, ensure_ascii=False, default=str)
+        if len(encoded) <= INLINE_OUTPUT_CHARS:
+            summary["output"] = output
+        else:
+            summary["output_chars"] = len(encoded)
+    if paths.get("results_file"):
+        summary["read_full_results"] = read_hint(paths["results_file"])
+    else:
+        summary["read_full_results"] = (
+            "The full results could not be written to /work; this summary is all that is available here."
+        )
+    return summary
+
+
+def _finished_summary(store: WorkflowStore, run_id: str, status: Dict[str, Any]) -> Dict[str, Any]:
+    return bounded_summary(store, run_id, status, write_results_files(store, run_id, status))
+
+
 def _emit_completion(store: WorkflowStore, run_id: str, status: Dict[str, Any]) -> bool:
     """Put exactly one completion for this run on the completion queue."""
     if not store.claim_completion(run_id):
         return False
     from tools.process_registry import process_registry
 
+    summary = _finished_summary(store, run_id, status)
     process_registry.completion_queue.put({
         "type": "workflow_run",
         "run_id": run_id,
         "status": "completed" if status.get("status") == "completed" else "failed",
         "counts": status.get("counts"),
-        "output": status.get("output"),
+        "summary": summary,
+        "results_file": summary.get("results_file"),
         "error": status.get("error"),
     })
     return True
@@ -408,7 +531,7 @@ def workflow_start(
         })
     status = _run(run_id, parent, emit=False)
     store.claim_completion(run_id)
-    return json.dumps(status, ensure_ascii=False, default=str)
+    return json.dumps(_finished_summary(store, run_id, status), ensure_ascii=False, default=str)
 
 
 def _release_on_error(fn):
@@ -452,7 +575,16 @@ def workflow_status(run_id: Optional[str] = None, parent_agent: Any = None) -> s
     same_session = bool(session_key and run_key and session_key == run_key)
     if not (same_chat or same_session):
         return tool_error(f"Workflow run {run_id} belongs to another conversation.")
-    return json.dumps(store.run_status(run_id), ensure_ascii=False, default=str)
+    status = store.run_status(run_id)
+    if status.get("status") != "running":
+        # Finished: the bounded summary and the /work files with every result.
+        return json.dumps(_finished_summary(store, run_id, status), ensure_ascii=False, default=str)
+    children = status.get("children") or []
+    status["children"] = children[:LISTED_CHILDREN]
+    if len(children) > LISTED_CHILDREN:
+        status["children_not_listed"] = len(children) - LISTED_CHILDREN
+    status.pop("origin", None)
+    return json.dumps(status, ensure_ascii=False, default=str)
 
 
 # ── consumer start-up recovery ──────────────────────────────────────────────
@@ -485,13 +617,14 @@ def prepare_workflow_recovery(completion_store: Any) -> list[str]:
             keep.append(run_id)
             continue
         store.claim_completion(run_id)
+        summary = _finished_summary(store, run_id, status)
         completion_store.record_completion(
             run_id,
             outcome="completed" if status.get("status") == "completed" else "failed",
             result={
                 "status": status.get("status"), "run_id": run_id,
-                "counts": status.get("counts"), "output": status.get("output"),
-                "error": status.get("error"),
+                "counts": status.get("counts"), "summary": summary,
+                "results_file": summary.get("results_file"), "error": status.get("error"),
             },
         )
     return keep
