@@ -18,6 +18,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import threading
 import time
 from pathlib import Path
@@ -43,6 +44,7 @@ from tests.cron.test_pa203_conversation_workspace import (  # noqa: F401 - fixtu
 )
 from gateway.session_context import clear_session_vars, set_session_vars
 
+SEND_PATH = re.compile(r"records/sent/send-\d{8}T\d{6}Z-[0-9a-f]{12}/[^/]+")
 OTHER_KEY = f"agent:live-drain:conversation:whatsapp:group:{OTHER_MANAGEMENT_CHAT}"
 SANDBOX_CONFIG = {"enabled": True, "workspace": "agent"}
 
@@ -292,7 +294,8 @@ def test_attached_only_workbook_is_visible_to_a_later_chat_turn(agent_home, tmp_
     assert later["status"] == "success", later
     assert later["result"]["text"] == "reviewed workbook: 47 blanks"
     entry = later["result"]["entry"]
-    assert entry["path"] == f"records/sent/{reviewed.name}"
+    assert SEND_PATH.fullmatch(entry["path"])
+    assert entry["path"].endswith(f"/{reviewed.name}")
     assert entry["chat_id"] == MANAGEMENT_CHAT
     assert entry["scheduled_job_id"] == "mgmt-morning-review"
     assert entry["sha256"] == hashlib.sha256(reviewed.read_bytes()).hexdigest()
@@ -318,14 +321,13 @@ def test_sent_and_received_files_are_kept_and_logged(agent_home, tmp_path):
     _keep_sent_file_in_workspace(_agent_work(agent_home) / "built.xlsx", chat_id=MANAGEMENT_CHAT)
 
     records = _records(agent_home)
-    assert (records / "sent" / retained.name).read_bytes() == b"sent from retained media"
-    # Even a file sent straight from work/ gets an immutable copy in records.
-    assert (records / "sent" / "built.xlsx").read_text() == "built in the sandbox"
     log = _files_log(agent_home)
-    assert [(e["direction"], e["path"]) for e in log] == [
-        ("sent", f"records/sent/{retained.name}"),
-        ("sent", "records/sent/built.xlsx"),
-    ]
+    assert [e["direction"] for e in log] == ["sent", "sent"]
+    assert SEND_PATH.fullmatch(log[0]["path"]) and log[0]["path"].endswith(f"/{retained.name}")
+    assert SEND_PATH.fullmatch(log[1]["path"]) and log[1]["path"].endswith("/built.xlsx")
+    assert (records / log[0]["path"][len("records/"):]).read_bytes() == b"sent from retained media"
+    # Even a file sent straight from work/ gets an immutable copy in records.
+    assert (records / log[1]["path"][len("records/"):]).read_text() == "built in the sandbox"
     assert log[1]["sha256"] == hashlib.sha256(b"built in the sandbox").hexdigest()
 
 
@@ -721,7 +723,8 @@ def test_files_log_records_the_whatsapp_message_ids(s1_delivered, agent_home, tm
     [entry] = [e for e in _files_log(agent_home) if e["direction"] == "scheduled_delivery"]
     assert entry["message_id"] == DELIVERY_FILE_ID
     assert entry["text_message_id"] == DELIVERY_TEXT_ID
-    assert entry["path"] == "records/sent/TGG_AM_186_case_review_12_Sep_2026.xlsx"
+    assert SEND_PATH.fullmatch(entry["path"])
+    assert entry["path"].endswith("/TGG_AM_186_case_review_12_Sep_2026.xlsx")
 
     from gateway.durable_jsonl_consumer import _keep_sent_file_in_workspace
 
@@ -737,7 +740,10 @@ def test_scheduled_delivery_is_in_the_conversation_history(s1_delivered):
     assert delivery["role"] == "assistant"
     assert "Scheduled job 'AM-186 review delivery' delivered this to the chat at" in delivery["content"]
     assert "90 remain blank" in delivery["content"]
-    assert "[Attached file: /records/sent/TGG_AM_186_case_review_12_Sep_2026.xlsx]" in delivery["content"]
+    assert re.search(
+        r"\[Attached file: /records/sent/send-[^/]+/TGG_AM_186_case_review_12_Sep_2026\.xlsx\]",
+        delivery["content"],
+    )
 
 
 @pytest.mark.asyncio
@@ -748,10 +754,11 @@ async def test_quoting_the_delivery_names_the_delivered_file(s1_delivered, quote
         quoted=quoted,
     )
 
-    assert (
-        "sent by the scheduled job 'AM-186 review delivery', which carried "
-        "/records/sent/TGG_AM_186_case_review_12_Sep_2026.xlsx.]"
-    ) in text
+    assert re.search(
+        r"sent by the scheduled job 'AM-186 review delivery', which carried "
+        r"/records/sent/send-[^/]+/TGG_AM_186_case_review_12_Sep_2026\.xlsx\.\]",
+        text,
+    )
     assert "[The sender is replying to your " in text
     assert "v7" not in text
 
@@ -1143,7 +1150,9 @@ def test_two_contexts_writing_one_name_each_send_their_own_version(agent_home, t
     assert sent_m.read_text() == "Management case data"
     assert sha_a == a["files"][0]["sha256"]
     assert sent_a != sent_m
-    assert sent_a.parent == _records(agent_home) / "sent"
+    # One folder per send: both recipients see the exact original name.
+    assert sent_a.name == sent_m.name == "report.xlsx"
+    assert sent_a.parent.parent == sent_m.parent.parent == _records(agent_home) / "sent"
     # Later sandbox writes never change what was sent.
     _turn(_write("report.xlsx", "rewritten later"))
     assert sent_a.read_text() == "site A figures"
@@ -1290,3 +1299,43 @@ def test_a_newer_run_version_beats_an_older_capture(agent_home):
 
     sent, _sha = delivery_snapshot("work/report.xlsx", LIVE_KEY, any_file_allowed=True)
     assert sent.read_text() == "v2"
+
+
+def test_every_send_keeps_the_exact_original_name(agent_home, tmp_path, monkeypatch):
+    """Integrator's bug: a clash renamed the sent copy to <name>.<sha8>-1.<ext>."""
+    from gateway.durable_jsonl_consumer import _keep_sent_file_in_workspace
+    from tools.pa_agent_workspace import delivery_snapshot
+
+    # MEDIA: directives from two contexts, same name, different bytes.
+    other = f"agent:live-drain:persistent-chat:{PROVIDER}:{MODEL}:whatsapp:group:site-c@g.us"
+    _turn(_write("Weekly Report.xlsx", "one"))
+    _turn(_write("Weekly Report.xlsx", "two"), chat="site-c@g.us", key=other)
+    first, _ = delivery_snapshot("work/Weekly Report.xlsx", LIVE_KEY, any_file_allowed=True)
+    second, _ = delivery_snapshot("work/Weekly Report.xlsx", other, any_file_allowed=True)
+    # A retained-media or scheduled attachment of the same name.
+    retained = tmp_path / "Weekly Report.xlsx"
+    retained.write_text("three")
+    _keep_sent_file_in_workspace(retained, chat_id=MANAGEMENT_CHAT, message_id="3EB0R")
+    third = _records(agent_home) / _files_log(agent_home)[-1]["path"][len("records/"):]
+
+    assert [path.name for path in (first, second, third)] == ["Weekly Report.xlsx"] * 3
+    assert len({path.parent for path in (first, second, third)}) == 3
+    assert [path.read_text() for path in (first, second, third)] == ["one", "two", "three"]
+
+
+def test_record_files_are_read_only_to_the_group_and_reader(agent_home, tmp_path, monkeypatch):
+    import tools.python_sandbox_access as access
+
+    calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(access, "configured_reader_uid", lambda config: "4242")
+    monkeypatch.setattr(access, "grant_reader_work_access", lambda home, work, uid: None)
+    monkeypatch.setattr(access, "_setfacl", lambda *args: calls.append(args))
+    document = tmp_path / "in.xlsx"
+    document.write_text("x")
+
+    sandbox.record_workspace_file(document, direction="received", folder="received")
+
+    limited = {arg for call in calls if call[:2] == ("-m", "g::r--,m::r--") for arg in call[3:]}
+    records = _records(agent_home)
+    assert str(records / "files-log.jsonl") in limited
+    assert str(records / "received" / "in.xlsx") in limited

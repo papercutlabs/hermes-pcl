@@ -677,7 +677,7 @@ def delivery_snapshot(
         source_name = Path(relative).name
     source = object_path(base, sha)
     with records_lock(base):
-        target = _keep_named(records_dir(base) / "sent", source_name, source, sha)
+        target = _keep_in_send_folder(records_dir(base) / "sent", source_name, source)
     if _file_sha(target) != sha:
         raise ValueError("the file to send failed its digest check")
     _grant_reader(base)
@@ -715,6 +715,27 @@ def _keep_named(folder: Path, name: str, source: Path, sha: str) -> Path:
     raise RuntimeError("could not choose a distinct records name")
 
 
+def _keep_in_send_folder(sent: Path, name: str, source: Path) -> Path:
+    """Copy ``source`` to ``sent/<send-id>/<name>``: one folder per send.
+
+    The file keeps its exact original name, which is what WhatsApp shows the
+    recipient; two different files of one name never clash.
+    """
+    folder = sent / f"send-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-{uuid.uuid4().hex[:12]}"
+    folder.mkdir(parents=True, mode=0o700)
+    target = folder / name
+    staged = folder / f".{name}.{uuid.uuid4().hex}.tmp"
+    with source.open("rb") as src, open(staged, "xb") as out:
+        while True:
+            chunk = src.read(1024 * 1024)
+            if not chunk:
+                break
+            out.write(chunk)
+    os.chmod(staged, 0o600)
+    os.replace(staged, target)
+    return target
+
+
 def _grant_reader(base: Path) -> None:
     from hermes_constants import get_hermes_home
     from tools.python_sandbox_access import configured_reader_uid, grant_reader_work_access
@@ -722,7 +743,27 @@ def _grant_reader(base: Path) -> None:
 
     reader_uid = configured_reader_uid(_load_config())
     if reader_uid is not None:
-        grant_reader_work_access(get_hermes_home(), records_dir(base), reader_uid)
+        records = records_dir(base)
+        grant_reader_work_access(get_hermes_home(), records, reader_uid)
+        _limit_record_files(records)
+
+
+def _limit_record_files(records: Path) -> None:
+    """Every record file is read-only to everyone but its owner.
+
+    ``setfacl -m`` recomputes the mask from the group class, so a file that
+    inherited ``group::r-x`` from the default ACL would give its group read
+    and execute.  Set the owning group's entry and the mask to read only.
+    """
+    from tools.python_sandbox_access import _setfacl
+
+    files = [
+        path
+        for path in records.rglob("*")
+        if path.is_file() and not path.is_symlink()
+    ]
+    for offset in range(0, len(files), 128):
+        _setfacl("-m", "g::r--,m::r--", "--", *(str(path) for path in files[offset : offset + 128]))
 
 
 # Received and sent files, and the files log --------------------------------------
@@ -762,6 +803,10 @@ def keep_file(
         resolved = source_path.resolve()
         if resolved.is_relative_to(records.resolve()):
             relative = resolved.relative_to(records.resolve()).as_posix()
+        elif folder.strip("/") == "sent":
+            # One folder per send, so the recipient sees the exact name.
+            target = _keep_in_send_folder(records / "sent", display, object_path(base, sha))
+            relative = target.relative_to(records).as_posix()
         else:
             target = _keep_named(records / folder.strip("/"), display, object_path(base, sha), sha)
             relative = target.relative_to(records).as_posix()
