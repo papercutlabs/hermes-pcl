@@ -30,6 +30,7 @@ into the script.
 from __future__ import annotations
 
 import ast
+import contextvars
 import copy
 import hashlib
 import json
@@ -649,8 +650,12 @@ class _Execution:
         if todo:
             pool = ThreadPoolExecutor(max_workers=min(self.runner.max_concurrency, len(todo)))
             try:
+                # Each helper runs in a copy of the run's context: pool threads
+                # do not inherit context variables, and the host keeps the
+                # originating turn's identity there.
                 futures = [
                     pool.submit(
+                        contextvars.copy_context().run,
                         self.runner._attempt_child, self.run_id, key, spec.kind, spec.prompt,
                         spec.schema, int(self.stored[key].get("attempts") or 0),
                     )

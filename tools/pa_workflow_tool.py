@@ -25,6 +25,7 @@ Tools: ``workflow_start`` and ``workflow_status`` (toolset ``pa-workflow``).
 
 from __future__ import annotations
 
+import contextvars
 import json
 import logging
 import threading
@@ -250,10 +251,60 @@ def _run(run_id: str, parent: Any, *, emit: bool) -> Dict[str, Any]:
     return status
 
 
-def _start_thread(run_id: str, parent: Any) -> None:
+def _session_env_snapshot() -> Dict[str, str]:
+    """Every session context value the business bridge and tools read.
+
+    A plain thread starts with no context variables, so a helper built there
+    resolved no PA job brief and every business operation was "unknown"
+    (r2b replay s6, wf-9e86a66f5c41).  The snapshot is persisted with the run
+    so a resumed run re-establishes it too.
+    """
+    from gateway.session_context import _VAR_MAP, get_session_env
+    from tools.approval import get_current_session_key
+
+    env = {name: get_session_env(name, "") for name in _VAR_MAP}
+    env = {name: value for name, value in env.items() if value}
+    approval_key = get_current_session_key(default="")
+    if approval_key:
+        env["approval_session_key"] = approval_key
+    return env
+
+
+def _enter_session_env(env: Dict[str, str]) -> None:
+    """Set the persisted session values in the current (run-owned) context."""
+    from gateway.session_context import _VAR_MAP
+    from tools.approval import set_current_session_key
+
+    for name, value in (env or {}).items():
+        var = _VAR_MAP.get(name)
+        if var is not None:
+            var.set(str(value))
+    if env.get("approval_session_key"):
+        set_current_session_key(env["approval_session_key"])
+
+
+def _start_thread(
+    run_id: str,
+    parent: Any,
+    *,
+    context: Optional[contextvars.Context] = None,
+    session_env: Optional[Dict[str, str]] = None,
+) -> None:
+    """Run a workflow on its own thread inside a context that carries the turn.
+
+    A run started from a turn uses a copy of that turn's context.  A resumed
+    run has no turn, so it gets a fresh context with the persisted session
+    values set before any helper starts.
+    """
+    ctx = context if context is not None else contextvars.Context()
+
+    def target() -> None:
+        if session_env:
+            _enter_session_env(session_env)
+        _run(run_id, parent, emit=True)
+
     thread = threading.Thread(
-        target=_run, args=(run_id, parent), kwargs={"emit": True},
-        name=f"pa-workflow-{run_id}", daemon=True,
+        target=ctx.run, args=(target,), name=f"pa-workflow-{run_id}", daemon=True,
     )
     thread.start()
 
@@ -272,6 +323,7 @@ def _origin(parent_agent: Any) -> Dict[str, Any]:
         "chat_id": get_session_env("HERMES_SESSION_CHAT_ID", ""),
         "source_message_ids": [str(ref) for ref in (refs or []) if ref],
         "pa_job_type": get_session_env("HERMES_SESSION_PA_JOB_TYPE", ""),
+        "session_env": _session_env_snapshot(),
         "parent": _parent_spec(parent_agent),
     }
 
@@ -336,7 +388,10 @@ def workflow_start(
             background = False
     if background:
         _live_credentials[run_id] = credentials
-        _start_thread(run_id, parent)
+        _start_thread(
+            run_id, parent, context=contextvars.copy_context(),
+            session_env=origin.get("session_env"),
+        )
         return json.dumps({
             "run_id": run_id,
             "status": "started",
@@ -439,14 +494,17 @@ def resume_workflow_runs(run_ids: list[str]) -> list[str]:
         run = store.get_run(run_id) or {}
         if run.get("status") != "running" or not _register_active(run_id):
             continue
-        spec = dict((run.get("origin") or {}).get("parent") or {})
+        origin = run.get("origin") or {}
+        spec = dict(origin.get("parent") or {})
         if not credentials:
             try:
                 credentials = _runtime_credentials()
             except Exception as exc:
                 logger.error("workflow resume: no runtime credentials: %s", exc)
                 credentials = {}
-        _start_thread(run_id, _ParentSpec(spec, credentials))
+        _start_thread(
+            run_id, _ParentSpec(spec, credentials), session_env=dict(origin.get("session_env") or {}),
+        )
         started.append(run_id)
     return started
 

@@ -699,7 +699,7 @@ def test_active_workflow_runs_are_capped(tmp_path, workflow_env, monkeypatch):
     tool = workflow_env.tool
     store = background.CompletionStore(tmp_path / "inbox.db")
     background.install_sink(store)
-    monkeypatch.setattr(tool, "_start_thread", lambda run_id, parent: None)
+    monkeypatch.setattr(tool, "_start_thread", lambda run_id, parent, **_: None)
     for _ in range(tool.MAX_ACTIVE_RUNS):
         assert json.loads(tool.workflow_start(script="output = 1", parent_agent=workflow_env.parent))["status"] == "started"
     assert "already running" in json.loads(tool.workflow_start(script="output = 1", parent_agent=workflow_env.parent))["error"]
