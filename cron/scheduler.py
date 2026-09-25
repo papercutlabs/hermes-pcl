@@ -150,6 +150,9 @@ def _merge_cron_pa_toolsets(
     return _dedupe(next_enabled), _dedupe(next_disabled)
 
 
+# How often a running job is checked against its inactivity limit.
+_CRON_POLL_INTERVAL = 5.0
+
 # PA-203 r2e (s7): files a scheduled Management job returns with the
 # capability's file-return tool.  A scheduled job has no live Management turn
 # to capture them in, so they are attached to the job's delivery to its
@@ -2030,7 +2033,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         else:
             _cron_timeout = 600.0
         _cron_inactivity_limit = _cron_timeout if _cron_timeout > 0 else None
-        _POLL_INTERVAL = 5.0
+        _POLL_INTERVAL = _CRON_POLL_INTERVAL
         _cron_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         # Preserve scheduler-scoped ContextVar state (for example skill-declared
         # env passthrough registrations) when the cron run hops into the worker
@@ -2091,10 +2094,20 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             )
             if hasattr(agent, "interrupt"):
                 agent.interrupt("Cron job timed out (inactivity)")
+            # PA-203 r2f (s7): work a workflow finished, or is finishing, is
+            # kept in its run store and /work file; the notice says where.
+            _workflow_notice = ""
+            try:
+                from tools.pa_workflow_tool import runs_notice_for_session
+
+                _workflow_notice = runs_notice_for_session(_cron_session_id)
+            except Exception:
+                _workflow_notice = ""
             raise TimeoutError(
                 f"Cron job '{job_name}' idle for "
                 f"{int(_secs_ago)}s (limit {int(_cron_inactivity_limit)}s) "
                 f"— last activity: {_last_desc}"
+                + (f"\n{_workflow_notice}" if _workflow_notice else "")
             )
 
         # Guard against non-dict returns from run_conversation under error conditions

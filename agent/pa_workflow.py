@@ -481,6 +481,7 @@ class WorkflowRunner:
         max_children: int = MAX_CHILDREN_PER_RUN,
         stop_reason: Callable[[], str | None] | None = None,
         max_script_seconds: float | None = None,
+        on_progress: Callable[[str], None] | None = None,
     ):
         self.store = store
         self.execute_child = execute_child
@@ -492,6 +493,16 @@ class WorkflowRunner:
         # leaves the run unfinished so it resumes; any other reason ends it.
         self.stop_reason = stop_reason or (lambda: None)
         self.max_script_seconds = max_script_seconds
+        # Called whenever a helper starts or finishes, so a host watchdog can
+        # tell a run that is making progress from one that is stuck (r2f s7).
+        self.on_progress = on_progress
+
+    def progress(self, what: str) -> None:
+        if self.on_progress is not None:
+            try:
+                self.on_progress(what)
+            except Exception:
+                pass
 
     def check_stop(self) -> None:
         reason = self.stop_reason()
@@ -546,6 +557,7 @@ class WorkflowRunner:
             self.check_stop()
             attempts += 1
             self.store.mark_child_running(run_id, key, attempts)
+            self.progress(f"workflow {run_id}: helper {key[:8]} started (attempt {attempts})")
             try:
                 reply = self.execute_child(kind, text_prompt, schema) or {}
                 if reply.get("status") not in (None, "ok", "completed"):
@@ -561,6 +573,7 @@ class WorkflowRunner:
                 )
                 continue
             self.store.finish_child(run_id, key, status="ok", output=value, error=None, attempts=attempts)
+            self.progress(f"workflow {run_id}: helper {key[:8]} finished")
             return value
         self.store.finish_child(run_id, key, status="failed", output=None, error=error, attempts=attempts)
         return None

@@ -80,9 +80,12 @@ class _ParentSpec:
     names, so ``_build_child_agent`` applies the same fixed-kind scope.
     """
 
-    def __init__(self, spec: Dict[str, Any], credentials: Dict[str, Any]):
+    def __init__(self, spec: Dict[str, Any], credentials: Dict[str, Any], activity: Any = None):
         from agent.pa_delegation import HELPER_KIND_TOOLSETS
 
+        # The real agent's activity tracker when the run is inline in a turn or
+        # a scheduled job, so helper progress keeps its watchdog from firing.
+        self._activity = activity if callable(activity) else None
         for name in _PARENT_FIELDS:
             setattr(self, name, spec.get(name))
         # Only the read-only toolset, whatever the starting parent had, so no
@@ -98,6 +101,13 @@ class _ParentSpec:
         self._active_children_lock = threading.Lock()
         # Same marker agent.pa_delegation sets on a scoped Management parent.
         self._pa_delegation_child_scope = True
+
+    def _touch_activity(self, desc: str) -> None:
+        if self._activity is not None:
+            try:
+                self._activity(desc)
+            except Exception:
+                pass
 
     def __getattr__(self, name: str) -> Any:
         if name.startswith("__"):
@@ -354,9 +364,11 @@ def _run(run_id: str, parent: Any, *, emit: bool) -> Dict[str, Any]:
             return reason
         return "timeout" if time.time() > deadline else None
 
+    touch = getattr(parent, "_touch_activity", None)
     runner = WorkflowRunner(
         store, _make_executor(parent), kinds=RUNNER_KINDS, max_concurrency=_MAX_CONCURRENCY,
         stop_reason=stop_reason, max_script_seconds=RUN_TIME_LIMIT_SECONDS,
+        on_progress=touch if callable(touch) else None,
     )
     try:
         status = runner.run(run_id)
@@ -370,6 +382,10 @@ def _run(run_id: str, parent: Any, *, emit: bool) -> Dict[str, Any]:
         # A paused run is still unfinished: no completion until it resumes and ends.
         if emit and status.get("status") != "running":
             _emit_completion(store, run_id, status)
+        elif status.get("status") != "running":
+            # Inline: the files exist even if the calling turn or scheduled
+            # job was stopped while the run finished (r2f replay s7).
+            write_results_files(store, run_id, status)
     finally:
         # Free the slot only after the completion is queued, so nothing sees
         # a finished run as neither active nor completed.
@@ -496,7 +512,9 @@ def workflow_start(
     store = _store()
     store.create_run(run_id, script=script, title=title, started_by=started_by, origin=origin)
     credentials = {"api_key": getattr(parent_agent, "api_key", None)}
-    parent = _ParentSpec(origin["parent"], credentials)
+    parent = _ParentSpec(
+        origin["parent"], credentials, activity=getattr(parent_agent, "_touch_activity", None),
+    )
 
     sink = get_durable_sink()
     background = sink is not None and not bool(wait)
@@ -588,6 +606,46 @@ def workflow_status(run_id: Optional[str] = None, parent_agent: Any = None) -> s
 
 
 # ── consumer start-up recovery ──────────────────────────────────────────────
+
+def runs_notice_for_session(session_key: str) -> str:
+    """Plain lines about workflow runs a (timed-out) job started.
+
+    A finished run's results stay in the run store and its /work file; a run
+    still going writes them there when it ends.
+    """
+    if not session_key:
+        return ""
+    try:
+        store = _store()
+        from tools.work_artifacts import read_hint
+
+        lines = []
+        with store._connect() as conn:
+            rows = conn.execute(
+                "SELECT run_id FROM workflow_runs WHERE started_by_json LIKE ? ORDER BY created_at",
+                (f"%{session_key}%",),
+            ).fetchall()
+        for row in rows:
+            status = store.run_status(row["run_id"])
+            if (status.get("started_by") or {}).get("session_key") != session_key:
+                continue
+            path = f"/work/workflow-{row['run_id']}-results.json"
+            counts = status.get("counts") or {}
+            if status.get("status") == "running":
+                lines.append(
+                    f"Workflow run {row['run_id']} is still running ({counts.get('ok', 0)} helpers "
+                    f"finished so far); its results will be in {path} when it ends."
+                )
+            else:
+                lines.append(
+                    f"Workflow run {row['run_id']} {status.get('status')} with {counts.get('ok', 0)} "
+                    f"helpers ok and {counts.get('failed', 0)} failed. " + read_hint(path)
+                )
+        return "\n".join(lines)
+    except Exception:
+        logger.debug("could not list workflow runs for %s", session_key, exc_info=True)
+        return ""
+
 
 def prepare_workflow_recovery(completion_store: Any) -> list[str]:
     """Decide, before interrupting anything, which workflow runs resume.
