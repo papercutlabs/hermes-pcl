@@ -188,3 +188,79 @@ def test_boot_check_refuses_a_hand_edited_model(tmp_path):
         assert re.search("model does not match", str(exc))
     else:  # pragma: no cover
         raise AssertionError("a hand-edited model must fail the boot check")
+
+
+def test_boot_after_switch_puts_every_brief_on_gpt6sol(tmp_path, monkeypatch):
+    """The capability constitution carries no runtime blocks; the runtime writes them.
+
+    An explicit switch rewrites the live config; the restart's
+    ExecStartPre (--preserve-host-config) then copies the capability
+    constitution and writes the slot model into every job brief.
+    """
+    apply = _load("apply_engine_slot")
+    monkeypatch.setattr(apply.os, "chown", lambda *_: None)
+    config = _live_config(tmp_path)
+    capability = yaml.safe_load(_constitution(tmp_path).read_text())
+    capability.pop("runtime", None)
+    for brief in capability["job_briefs"].values():
+        brief.pop("runtime", None)
+    constitution = tmp_path / "christopher_tgg_constitution.yaml"
+    constitution.write_text(yaml.safe_dump(capability, sort_keys=False))
+
+    _switch(apply, config, constitution, SLOT)
+    provider, _label = apply._validate_live_runtime_config(config, SLOT)
+    apply._apply_constitution_runtime(
+        constitution, provider=provider, model=apply.SLOT_MODELS[SLOT], uid=-1, gid=-1
+    )
+    live = yaml.safe_load(constitution.read_text())
+    assert live["runtime"] == {"provider": "openai-codex", "model": "gpt-6-sol"}
+    assert {
+        json.dumps(brief["runtime"], sort_keys=True) for brief in live["job_briefs"].values()
+    } == {json.dumps({"model": "gpt-6-sol", "provider": "openai-codex"}, sort_keys=True)}
+
+
+def test_explicit_switch_with_processing_enabled_and_external_capability(tmp_path, monkeypatch):
+    """The production shape: external capability, processing on.
+
+    The explicit switch used to raise "expected exactly one pa.enabled to
+    re-apply the live processing key, found 0", because with an external
+    capability it copies the live config onto itself, which already says
+    enabled: true.  switch_engine_slot.sh could never switch production.
+    """
+    from types import SimpleNamespace
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from test_tgg_external_capability import make_release
+
+    apply = _load("apply_engine_slot")
+    home, _runtime, _release = make_release(tmp_path)
+    config = yaml.safe_load((home / "config.yaml").read_text())
+    config["pa"]["enabled"] = True
+    config.setdefault("auxiliary", {})["compression"] = {"provider": "main", "model": "gpt-5.6-terra"}
+    (home / "config.yaml").write_text(yaml.safe_dump(config, sort_keys=False))
+    monkeypatch.setattr(apply.pwd, "getpwnam", lambda _name: SimpleNamespace(pw_uid=501))
+    monkeypatch.setattr(apply.grp, "getgrnam", lambda _name: SimpleNamespace(gr_gid=20))
+    monkeypatch.setattr(apply.os, "chown", lambda *_args: None)
+    monkeypatch.setattr(apply.os, "lchown", lambda *_args: None)
+
+    def run(*extra: str) -> None:
+        monkeypatch.setattr(sys, "argv", [
+            "apply_engine_slot.py", "--app-root", str(ROOT), "--hermes-home", str(home), *extra,
+        ])
+        assert apply.main() == 0
+
+    run("--slot", SLOT)
+    run("--preserve-host-config")  # the restart's ExecStartPre
+    live = yaml.safe_load((home / "config.yaml").read_text())
+    assert live["pa"]["enabled"] is True
+    assert live["model"]["default"] == "gpt-6-sol"
+    assert live["auxiliary"]["compression"]["model"] == "gpt-6-sol"
+    assert (home / "runtime/engine-slot").read_text().strip() == SLOT
+    receipt = json.loads((home / "runtime/engine-slot-receipt.json").read_text())
+    assert (receipt["model"], receipt["reasoning_effort"]) == ("gpt-6-sol", "medium")
+
+    run("--slot", ROLLBACK_SLOT)
+    run("--preserve-host-config")
+    back = yaml.safe_load((home / "config.yaml").read_text())
+    assert back["model"]["default"] == "gpt-5.6-terra" and back["pa"]["enabled"] is True
+    assert back["auxiliary"]["compression"]["model"] == "gpt-5.6-terra"

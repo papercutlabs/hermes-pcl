@@ -712,7 +712,10 @@ def main() -> int:
             uid=0,
             gid=group.gr_gid,
         )
-        if live_processing_enabled:
+        # With an external capability the source is the live config itself,
+        # which already carries its processing state; only a repo slot copy
+        # (processing forced off) needs the live key put back.
+        if live_processing_enabled and config_source != live_config_path:
             config_text = live_config_path.read_text(encoding="utf-8")
             patched, count = re.subn(
                 r"(^pa:\s*(?:#.*)?\n  enabled:)\s*false(\s*(?:#.*)?$)",
