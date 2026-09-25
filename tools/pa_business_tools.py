@@ -11,6 +11,7 @@ import hashlib
 import json
 import logging
 import os
+import uuid
 import re
 import subprocess
 import urllib.error
@@ -1231,11 +1232,21 @@ def _materialize_large_tgg_query_result(
         workspace.mkdir(parents=True, exist_ok=True, mode=0o700)
         path = workspace / f"pa-query-{full_digest[:16]}.json"
         if not path.exists():
-            tmp = path.with_suffix(".tmp")
-            tmp.write_text(encoded, encoding="utf-8")
+            # A fresh, exclusive, no-follow temp name: in the agent workspace
+            # sandbox code may be running in this folder right now.
+            tmp = workspace / f".pa-query-{uuid.uuid4().hex}.tmp"
+            fd = os.open(
+                tmp,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(encoded)
             os.replace(tmp, path)
         reader_uid = configured_reader_uid(_load_config())
-        if reader_uid is not None:
+        from tools.python_sandbox_tool import agent_workspace_enabled
+
+        if reader_uid is not None and not agent_workspace_enabled():
             grant_reader_work_access(get_hermes_home(), workspace, reader_uid)
         # Put the handle first so inline-preview fallback still tells the
         # model where the complete immutable result is.

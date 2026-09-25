@@ -630,6 +630,7 @@
     "tools/neutts_synth.py",
     "tools/openrouter_client.py",
     "tools/osv_check.py",
+    "tools/pa_agent_workspace.py",
     "tools/pa_business_tools.py",
     "tools/pa_photo_pair_classifier.py",
     "tools/pa_record_event.py",

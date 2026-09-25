@@ -3641,8 +3641,12 @@ def _resolve_captured_media_path(
     retention: Mapping[str, Any] | None,
     *,
     workspace_owner: str | None = None,
+    for_delivery: bool = False,
 ) -> Path:
     """Resolve a captured local path or configured opaque media reference.
+
+    ``for_delivery`` (PA-203, agent workspace): return the immutable,
+    digest-checked copy under ``records/sent/`` that is actually sent.
 
     Business tools expose retained files using ``media_ref_prefix`` rather
     than leaking the host filesystem root.  Convert only an exact
@@ -3655,7 +3659,20 @@ def _resolve_captured_media_path(
     text = str(raw_path or "").strip()
     if not text or any(marker in text for marker in ("?", "#", "\r", "\n")):
         raise MediaRetentionError("captured media reference is invalid")
-    if text.startswith(("work/", "/work/")):
+    if for_delivery and text.startswith(("work/", "/work/", "records/", "/records/")):
+        from tools.python_sandbox_tool import agent_workspace_enabled
+
+        if agent_workspace_enabled():
+            from tools.pa_agent_workspace import delivery_snapshot
+
+            try:
+                path, _sha = delivery_snapshot(
+                    text, str(workspace_owner or ""), any_file_allowed=True
+                )
+                return path
+            except ValueError as exc:
+                raise MediaRetentionError(str(exc)) from exc
+    if text.startswith(("work/", "/work/", "records/", "/records/")):
         from tools.python_sandbox_tool import resolve_sandbox_work_path
 
         try:
@@ -4267,6 +4284,7 @@ def deliver_management_replies(
                     send["path"],
                     retention,
                     workspace_owner=send.get("workspace_owner"),
+                    for_delivery=True,
                 )
                 media_type, media_mime, media_file_name = (
                     _validated_captured_media_type(media_path)
@@ -4274,7 +4292,9 @@ def deliver_management_replies(
                 media_identity = hashlib.sha256(media_path.read_bytes()).hexdigest()
             except (OSError, MediaRetentionError) as exc:
                 requested_reference = str(send.get("path") or "")
-                if not requested_reference.startswith(("work/", "/work/")):
+                if not requested_reference.startswith(
+                    ("work/", "/work/", "records/", "/records/")
+                ):
                     summary["suppressed"] += 1
                     continue
                 refusal_identity = json.dumps(
@@ -4395,6 +4415,7 @@ def deliver_management_replies(
                             "message_id": str(payload.get("messageId") or ""),
                         },
                         name="pa203-keep-sent-file",
+                        daemon=True,
                     ).start()
                 if send.get("send_kind", "text") == "media" and send.get("caption"):
                     media_caption_delivered.add((chat_id, str(anchor)))
