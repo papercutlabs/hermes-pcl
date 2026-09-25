@@ -700,9 +700,13 @@ async def test_quoting_her_own_file_message_points_to_received(agent_home, tmp_p
     assert entry["message_id"] == "3EB0KRISDOC"
 
 
-def test_delivery_history_uses_the_real_session_database(agent_home):
+def test_delivery_history_uses_the_real_session_database(agent_home, monkeypatch):
+    import hermes_state
     from hermes_state import SessionDB
     from cron.scheduler import _record_delivery_in_conversation
+
+    # The default path is fixed at import; point it at this test's home.
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", agent_home / "state.db")
 
     _management_session(agent_home)
     db = SessionDB()
