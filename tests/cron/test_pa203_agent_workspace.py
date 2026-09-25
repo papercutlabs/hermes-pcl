@@ -15,9 +15,11 @@ from __future__ import annotations
 
 import contextvars
 import hashlib
+import io
 import json
 import os
 import threading
+import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -47,9 +49,61 @@ OTHER_KEY = (
 SANDBOX_CONFIG = {"enabled": True, "workspace": "agent"}
 
 
+class _FakeMountJail:
+    """Stand-in for the jail with the direct-mount contract.
+
+    The real jail bind-mounts the agent folder at /work; this runs the
+    payload with ``WORK`` set to that same folder, on a thread so the run
+    loop's size watch and kill path are exercised.  Only the unshare process
+    is replaced; everything around it is the real code.
+    """
+
+    def __init__(self, argv, **_kwargs):
+        plan = json.loads(Path(argv[-1]).read_text(encoding="utf-8"))
+        assert plan["direct_work"], "agent mode must mount the folder directly"
+        assert plan["seed"] is None
+        self.work = Path(plan["direct_work"])
+        code = (Path(plan["run"]) / "script.py").read_text(encoding="utf-8")
+        self.stdout = io.BytesIO(b"")
+        self.stderr = io.BytesIO(b"")
+        self.pid = -1
+        self.returncode = None
+        self.killed = threading.Event()
+
+        def body():
+            try:
+                exec(code, {"WORK": self.work, "Path": Path, "HOOKS": HOOKS,
+                            "json": json, "KILLED": self.killed, "os": os})
+                code_rc = 0
+            except BaseException:
+                code_rc = 1
+            self.returncode = -9 if self.killed.is_set() else code_rc
+
+        self.thread = threading.Thread(target=body, daemon=True)
+        self.thread.start()
+
+    def poll(self):
+        return None if self.thread.is_alive() else self.returncode
+
+    def wait(self, timeout=None):
+        self.thread.join(timeout)
+        return self.returncode
+
+
 @pytest.fixture()
 def agent_home(home, monkeypatch):
     monkeypatch.setattr(sandbox, "_load_config", lambda: dict(SANDBOX_CONFIG))
+    monkeypatch.setattr(
+        sandbox,
+        "_generate_init_script",
+        lambda run_dir, *args, **kwargs: json.dumps({
+            "run": str(run_dir),
+            "seed": str(args[8]) if len(args) > 8 and args[8] else None,
+            "direct_work": str(kwargs["direct_work"]) if kwargs.get("direct_work") else None,
+        }),
+    )
+    monkeypatch.setattr(sandbox.subprocess, "Popen", _FakeMountJail)
+    monkeypatch.setattr(sandbox, "_kill_group", lambda proc, grace=5.0: proc.killed.set())
     return home
 
 
@@ -432,34 +486,42 @@ def test_delivery_before_any_sandbox_run_still_finds_a_moved_file(agent_home):
 # 5. Concurrent writers never lose files ---------------------------------------
 
 
-def test_concurrent_writers_from_different_conversations_keep_both(agent_home):
-    _turn(_write("report.xlsx", "original"))
-    HOOKS["a_seeded"] = threading.Event()
-    HOOKS["b_published"] = threading.Event()
+def test_runs_on_the_shared_folder_are_serialised(agent_home):
+    """A second run waits until the first has finished with the folder."""
+    HOOKS["a_running"] = threading.Event()
+    HOOKS["release_a"] = threading.Event()
+    HOOKS["b_started"] = threading.Event()
     results: dict = {}
 
     def conversation_a():
         results["a"] = _turn(
-            "HOOKS['a_seeded'].set()\n"
-            "assert HOOKS['b_published'].wait(10)\n"
-            + _write("report.xlsx", "edit from conversation A")
-            + _write("a_only.txt", "a"),
+            "HOOKS['a_running'].set()\n"
+            "assert HOOKS['release_a'].wait(10)\n"
+            + _write("report.xlsx", "edit from conversation A"),
         )
 
-    thread = threading.Thread(target=conversation_a)
-    thread.start()
-    assert HOOKS["a_seeded"].wait(10)
-    results["b"] = _helper(_write("report.xlsx", "edit from a helper") + _write("b_only.txt", "b"))
-    HOOKS["b_published"].set()
-    thread.join(20)
+    first = threading.Thread(target=conversation_a)
+    first.start()
+    assert HOOKS["a_running"].wait(10)
+    second = threading.Thread(
+        target=lambda: results.__setitem__("b", _helper(
+            "HOOKS['b_started'].set()\n"
+            "import json\n"
+            "(WORK / 'result.json').write_text(json.dumps("
+            "{'seen': (WORK / 'report.xlsx').read_text()}))\n"
+            + _write("report.xlsx", "edit from a helper")
+        ))
+    )
+    second.start()
+    assert not HOOKS["b_started"].wait(0.5)  # blocked while A holds the folder
+    HOOKS["release_a"].set()
+    first.join(20)
+    second.join(20)
 
-    work = _agent_work(agent_home)
     assert results["a"]["status"] == results["b"]["status"] == "success"
-    assert (work / "report.xlsx").read_text() == "edit from a helper"
-    [renamed] = results["a"]["workspace_renamed"]
-    assert (work / renamed["saved_as"][5:]).read_text() == "edit from conversation A"
-    assert (work / "a_only.txt").read_text() == "a"
-    assert (work / "b_only.txt").read_text() == "b"
+    assert results["b"]["result"] == {"seen": "edit from conversation A"}
+    assert (_agent_work(agent_home) / "report.xlsx").read_text() == "edit from a helper"
+    assert "workspace_renamed" not in results["a"]
 
 
 def test_concurrent_imports_and_sandbox_runs_lose_nothing(agent_home, tmp_path):
@@ -727,3 +789,189 @@ def test_delivery_history_uses_the_real_session_database(agent_home, monkeypatch
     assert message["role"] == "assistant"
     assert "[Attached file: /work/sent/r.xlsx]" in message["content"]
     assert not _record_delivery_in_conversation({"id": "j2"}, "no-such-key", {"text": "x"})
+
+
+# Direct mount of the agent workspace -------------------------------------------
+
+
+def test_init_script_mounts_the_folder_directly(tmp_path):
+    work = tmp_path / "sandbox_workspaces" / "s_x" / "work"
+    script = sandbox._generate_init_script(
+        tmp_path / "run", {}, tmp_path / "venv", 64, tmp_path, 64, 60, 64,
+        set(), None, False, direct_work=work,
+    )
+
+    assert f'mount --bind {work} "$JAIL/work"' in script
+    assert 'mount -o remount,bind,nosuid,nodev,noexec "$JAIL/work"' in script
+    assert 'tmpfs "$JAIL/work"' not in script
+    assert "$JAIL/seed/." not in script
+    assert 'remount,bind,ro "$JAIL/export"' not in script
+    assert script.rstrip().endswith("direct")
+
+    session = sandbox._generate_init_script(
+        tmp_path / "run", {}, tmp_path / "venv", 64, tmp_path, 64, 60, 64,
+        set(), tmp_path / "seed", False,
+    )
+    assert 'tmpfs "$JAIL/work"' in session
+    assert 'remount,bind,ro "$JAIL/export"' in session
+    assert not session.rstrip().endswith("direct")
+    assert 'if len(sys.argv) < 5 or sys.argv[4] != "direct":' in sandbox._SUPERVISOR_SOURCE
+
+
+def test_mount_mode_reads_and_writes_the_real_folder(agent_home):
+    work = _agent_work(agent_home)
+    work.mkdir(parents=True)
+    (work / "existing.xlsx").write_text("already here")
+    (work / "old.txt").write_text("to delete")
+
+    result = _turn(
+        "import json\n"
+        "seen = (WORK / 'existing.xlsx').read_text()\n"
+        "(WORK / 'new.xlsx').write_text('made in the run')\n"
+        "(WORK / 'old.txt').unlink()\n"
+        "(WORK / 'result.json').write_text(json.dumps({'seen': seen}))\n"
+    )
+
+    assert result["status"] == "success", result
+    assert result["result"] == {"seen": "already here"}
+    assert (work / "new.xlsx").read_text() == "made in the run"
+    assert not (work / "old.txt").exists()
+    # result.json is the run's return channel, never left in the folder.
+    assert not (work / "result.json").exists()
+    # files[] names what this run made or changed, not the whole folder.
+    assert [item["path"] for item in result["files"]] == ["work/new.xlsx"]
+    # No per-run copy of the folder was made.
+    assert not list((agent_home / "sandbox_runs").glob("*/seed"))
+
+
+def test_links_that_could_escape_are_removed_after_the_run(agent_home, tmp_path):
+    outside = tmp_path / "outside.txt"
+    outside.write_text("host file")
+    code = (
+        f"os.symlink({str(outside)!r}, WORK / 'escape.txt')\n"
+        f"os.symlink({str(tmp_path)!r}, WORK / 'escape_dir')\n"
+        f"os.link({str(outside)!r}, WORK / 'hard.txt')\n"
+        "os.mkfifo(WORK / 'pipe')\n"
+        "(WORK / 'real.txt').write_text('kept')\n"
+    )
+
+    result = _turn(code)
+
+    work = _agent_work(agent_home)
+    assert not (work / "escape.txt").is_symlink() and not (work / "escape.txt").exists()
+    assert not (work / "escape_dir").exists()
+    assert not (work / "pipe").exists()
+    assert (work / "hard.txt").read_text() == "host file"
+    assert os.stat(work / "hard.txt").st_nlink == 1
+    outside.write_text("changed on the host")
+    assert (work / "hard.txt").read_text() == "host file"
+    assert (work / "real.txt").read_text() == "kept"
+    assert sorted(result["workspace_removed_links"]) == [
+        "work/escape.txt", "work/escape_dir", "work/pipe",
+    ]
+
+
+def test_size_limit_refuses_and_stops_runs(agent_home, monkeypatch):
+    monkeypatch.setattr(
+        sandbox, "_load_config",
+        lambda: {**SANDBOX_CONFIG, "limits": {"workspace_mb": 1}},
+    )
+    # A run that grows the folder past the limit is stopped.
+    grow = _turn(
+        "chunk = b'x' * 262144\n"
+        "i = 0\n"
+        "while not KILLED.is_set() and i < 400:\n"
+        "    (WORK / f'big{i}.bin').write_bytes(chunk)\n"
+        "    i += 1\n"
+        "    import time; time.sleep(0.02)\n"
+    )
+    assert grow["status"] == "error"
+    assert "workspace size limit (1MB) exceeded" in grow["stderr"]
+    assert "workspace_over_limit" in grow
+
+    # Over the limit, the next run is refused before it starts.
+    refused = _turn(_write("after.txt", "never written"))
+    assert refused["status"] == "error"
+    assert "over its 1MB limit" in refused["error"]
+    assert not (_agent_work(agent_home) / "after.txt").exists()
+
+
+@pytest.mark.asyncio
+async def test_received_photos_land_in_the_folder(agent_home, tmp_path, monkeypatch):
+    from gateway.config import Platform
+    from gateway.platforms.base import MessageEvent, MessageType
+    from gateway.session import SessionSource
+
+    _sandbox_in_config(agent_home)
+    photo = tmp_path / "images" / "3EB0PHOTO.jpg"
+    photo.parent.mkdir()
+    photo.write_bytes(b"\xff\xd8\xff photo bytes")
+    runner = _runner()
+    runner._decide_image_input_mode = lambda: "native"
+    source = SessionSource(platform=Platform.WHATSAPP, chat_id=MANAGEMENT_CHAT, chat_type="group")
+    event = MessageEvent(
+        text="see this", message_type=MessageType.PHOTO, source=source,
+        message_id="3EB0PHOTO", media_urls=[str(photo)], media_types=["image/jpeg"],
+    )
+
+    text = await runner._prepare_inbound_message_text(event=event, source=source, history=[])
+
+    assert "[The image is also saved in your workspace as /work/received/3EB0PHOTO.jpg.]" in text
+    assert (_agent_work(agent_home) / "received" / "3EB0PHOTO.jpg").read_bytes() == photo.read_bytes()
+    [entry] = _files_log(agent_home)
+    assert entry["message_id"] == "3EB0PHOTO" and entry["direction"] == "received"
+    later = await _krisleen("what is in this photo?", quoted="3EB0PHOTO", message_id="3EB0K3")
+    assert "now saved as /work/received/3EB0PHOTO.jpg" in later
+
+
+def _real_jail_available() -> bool:
+    from tests.test_python_sandbox_tool import _can_run_jail
+
+    return _can_run_jail()
+
+
+@pytest.mark.skipif(not _real_jail_available(), reason="kernel user namespaces unavailable")
+@pytest.mark.sandbox_e2e
+def test_real_jail_works_in_the_mounted_agent_folder(tmp_path, monkeypatch):
+    """Linux only: the real jail with the agent folder bind-mounted at /work."""
+    from tests.test_python_sandbox_tool import _config, _csv, _db
+
+    source, csv = tmp_path / "records.db", tmp_path / "input.csv"
+    _db(source)
+    _csv(csv)
+    config = _config(source, csv, wall_seconds=20, max_wall_seconds=20)
+    config["workspace"] = "agent"
+    home = tmp_path / "home"
+    monkeypatch.setattr(sandbox, "_load_config", lambda: config)
+    monkeypatch.setattr(sandbox, "get_hermes_home", lambda: home)
+    work = (
+        home / "sandbox_workspaces"
+        / ("s_" + hashlib.sha256(sandbox.AGENT_WORKSPACE_OWNER.encode()).hexdigest())
+        / "work"
+    )
+    work.mkdir(parents=True)
+    (work / "existing.txt").write_text("before")
+    code = r'''
+import json, os, subprocess
+seen = open("/work/existing.txt").read()
+open("/work/made.txt", "w").write("in the jail")
+os.symlink("/etc/passwd", "/work/escape")
+open("/work/run.sh", "w").write("#!/bin/sh\necho hi\n")
+os.chmod("/work/run.sh", 0o755)
+try:
+    subprocess.run(["/work/run.sh"], check=True)
+    executed = True
+except (PermissionError, OSError, subprocess.CalledProcessError):
+    executed = False
+assert os.path.exists("/work/records.db")
+open(os.environ["RESULT_PATH"], "w").write(json.dumps({"seen": seen, "executed": executed}))
+'''
+    response = json.loads(sandbox.python_sandbox(code, ["records"], timeout_seconds=20))
+
+    assert response["status"] == "success", response
+    assert response["result"] == {"seen": "before", "executed": False}
+    assert (work / "made.txt").read_text() == "in the jail"
+    assert not os.path.lexists(work / "escape")
+    assert not (work / "records.db").exists()
+    assert not (work / "result.json").exists()
+    assert "work/made.txt" in {item["path"] for item in response["files"]}

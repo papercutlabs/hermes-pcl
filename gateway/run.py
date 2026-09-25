@@ -8756,6 +8756,40 @@ class GatewayRunner:
                     audio_paths.append(path)
 
             if image_paths:
+                # PA-203 round 2: received photos are kept in the agent
+                # workspace like documents, so any later turn can open them.
+                _kept_images: list[str] = []
+                try:
+                    from tools.python_sandbox_tool import record_workspace_file
+
+                    for _image_path in image_paths:
+                        _kept_image = await asyncio.to_thread(
+                            record_workspace_file,
+                            _image_path,
+                            direction="received",
+                            folder="received",
+                            name=os.path.basename(str(_image_path)),
+                            details={
+                                "chat_id": str(getattr(source, "chat_id", "") or ""),
+                                "message_id": str(getattr(event, "message_id", "") or ""),
+                            },
+                        )
+                        if _kept_image:
+                            _kept_images.append(f"/{_kept_image}")
+                except Exception as _keep_exc:
+                    logger.warning(
+                        "Received photo was not kept in the agent workspace: %s",
+                        _keep_exc,
+                    )
+                if _kept_images:
+                    _kept_note = (
+                        "[The image is also saved in your workspace as "
+                        + ", ".join(_kept_images)
+                        + ".]"
+                    )
+                    message_text = (
+                        f"{message_text}\n\n{_kept_note}" if message_text else _kept_note
+                    )
                 # Decide routing: native (attach pixels) vs text (vision_analyze
                 # pre-run + prepend description).  See agent/image_routing.py.
                 _img_mode = self._decide_image_input_mode()

@@ -4371,11 +4371,17 @@ def deliver_management_replies(
                 )
                 summary["delivered"] += 1
                 if send.get("send_kind", "text") == "media":
-                    _keep_sent_file_in_workspace(
-                        media_path,
-                        chat_id=chat_id,
-                        message_id=str(payload.get("messageId") or ""),
-                    )
+                    # Off the delivery loop: keeping the file waits for the
+                    # workspace lock, which a sandbox run holds while it runs.
+                    threading.Thread(
+                        target=_keep_sent_file_in_workspace,
+                        args=(media_path,),
+                        kwargs={
+                            "chat_id": chat_id,
+                            "message_id": str(payload.get("messageId") or ""),
+                        },
+                        name="pa203-keep-sent-file",
+                    ).start()
                 if send.get("send_kind", "text") == "media" and send.get("caption"):
                     media_caption_delivered.add((chat_id, str(anchor)))
             else:
