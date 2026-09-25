@@ -34,6 +34,11 @@ def main() -> int:
     parser.add_argument("--app-root", default="/home/pclaw/apps/hermes-pcl")
     parser.add_argument("--hermes-home", default="/home/pclaw/.hermes-christopher-tgg")
     parser.add_argument("--test-root", default="/home/pclaw/.hermes-christopher-tgg-test")
+    parser.add_argument(
+        "--python",
+        help="service interpreter; defaults to <app-root>/.venv/bin/python "
+        "(the standalone /opt runtime has no virtualenv, so pass it there)",
+    )
     args = parser.parse_args()
 
     app = Path(args.app_root).resolve(strict=True)
@@ -41,6 +46,7 @@ def main() -> int:
     runtime = home / "runtime"
     test_root = Path(args.test_root).resolve()
     deploy = app / "deploy/tgg/christopher"
+    python = Path(args.python) if args.python else app / ".venv/bin/python"
 
     assert run(["systemctl", "is-active", SERVICE]).stdout.strip() == "active"
     pid = int(run(["systemctl", "show", "-p", "MainPID", "--value", SERVICE]).stdout)
@@ -74,7 +80,7 @@ def main() -> int:
         run(
             [
                 "runuser", "-u", "pclaw", "--", "env", f"HERMES_HOME={home}",
-                str(app / ".venv/bin/python"),
+                str(python),
                 str(deploy / "scripts/verify_codex_auth.py"),
                 "--hermes-home", str(home),
                 "--credential-label", credential_label,
@@ -105,7 +111,7 @@ def main() -> int:
         [
             "runuser", "-u", "pclaw", "--", "env",
             f"HERMES_HOME={home}", f"PYTHONPATH={app}",
-            str(app / ".venv/bin/python"),
+            str(python),
             str(deploy / "scripts/run_isolated_smoke.py"),
             "--app-root", str(app), "--live-home", str(home),
             "--test-root", str(test_root),

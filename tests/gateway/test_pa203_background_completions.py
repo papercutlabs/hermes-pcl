@@ -29,7 +29,7 @@ from tools import async_delegation
 from tools.process_registry import process_registry
 
 CHAT = "management@g.us"
-NAMESPACE = durable.persistent_chat_namespace("fixture", "fixture-model")
+NAMESPACE = durable.persistent_chat_namespace()
 SESSION_KEY = f"{NAMESPACE}:whatsapp:group:{CHAT}:krisleen"
 REQUEST = "Check all 61 cases in the attached review against WhatsApp and send me the updated file."
 

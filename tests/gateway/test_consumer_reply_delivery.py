@@ -993,7 +993,7 @@ async def test_correlated_reply_reaches_recreated_management_session_as_metadata
         [record], config_path=config_path, state_db=state_db, persistent_session=True,
         runner=runner, management_document_correlations={"reply-1": correlation},
     )
-    assert runner.plans[0].replay_namespace == "agent:live-drain:persistent-chat:openai-codex:gpt-5.6-terra"
+    assert runner.plans[0].replay_namespace == "agent:live-drain:conversation"
     assert runner.plans[0].messages[0]["_hermes_pa_context"]["management_document_correlation"] == correlation
 
 
@@ -1013,8 +1013,8 @@ async def test_document_event_recreates_the_same_persistent_management_session(
     await _run_management_document_turn(_document_entry("entry-1"), config_path=config_path, destination_chat_id=MGMT_CHAT, runner=runner)
     await _run_management_document_turn(_document_entry("entry-2", created_at=101), config_path=config_path, destination_chat_id=MGMT_CHAT, runner=runner)
     assert [plan.replay_namespace for plan in runner.plans] == [
-        "agent:live-drain:persistent-chat:openai-codex:gpt-5.6-terra",
-        "agent:live-drain:persistent-chat:openai-codex:gpt-5.6-terra",
+        "agent:live-drain:conversation",
+        "agent:live-drain:conversation",
     ]
     assert all(plan.live_business_writes is False for plan in runner.plans)
 

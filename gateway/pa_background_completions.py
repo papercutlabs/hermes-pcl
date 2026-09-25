@@ -529,10 +529,9 @@ def completion_event(
 
 def _session_key_override(row: Mapping[str, Any], config_path: Path) -> str | None:
     """The originating conversation, when it is still in the live namespace."""
-    from gateway.durable_jsonl_consumer import configured_engine, persistent_chat_namespace
+    from gateway.durable_jsonl_consumer import persistent_chat_namespace
 
-    provider, model = configured_engine(config_path)
-    namespace = persistent_chat_namespace(provider, model)
+    namespace = persistent_chat_namespace()
     key = str(row.get("session_key") or "")
     return key if key.startswith(namespace + ":") else None
 

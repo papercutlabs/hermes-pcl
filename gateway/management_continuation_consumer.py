@@ -274,11 +274,10 @@ def _retained_live_management_session(
     replay used that entry before the mailbox becomes delivered.
     """
     from gateway.config import Platform
-    from gateway.durable_jsonl_consumer import configured_engine
+    from gateway.durable_jsonl_consumer import persistent_chat_namespace
     from gateway.replay import namespace_session_key
     from gateway.session import SessionSource, build_session_key
 
-    durable_provider, durable_model = configured_engine(config_path)
     from gateway.durable_jsonl_consumer import _bridge_item
 
     item = _bridge_item(original.raw)
@@ -296,7 +295,7 @@ def _retained_live_management_session(
         group_sessions_per_user=bool(getattr(runtime_config, "group_sessions_per_user", True)),
         thread_sessions_per_user=bool(getattr(runtime_config, "thread_sessions_per_user", False)),
     )
-    namespace = f"agent:live-drain:persistent-chat:{durable_provider}:{durable_model}"
+    namespace = persistent_chat_namespace()
     expected_key = namespace_session_key(base_key, namespace)
     store = getattr(runner, "session_store", None)
     if store is None:
