@@ -1,0 +1,526 @@
+"""PA-203 round 2: one persistent Christopher workspace across everything.
+
+``python_sandbox.workspace: agent`` gives every chat turn in every
+conversation, every scheduled job and every delegated helper the same
+folder.  It does not depend on the provider or model, so a model change
+keeps it; files people send and files that go out are kept in it; earlier
+per-conversation folders are merged in without loss; concurrent writers
+keep both versions of a clashing name.
+
+The jail stand-in and the scheduler driver come from the round 1 tests; only
+the jail process is replaced.
+"""
+
+from __future__ import annotations
+
+import contextvars
+import hashlib
+import json
+import os
+import threading
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import pytest
+import yaml
+
+import tools.python_sandbox_tool as sandbox
+from tests.cron.test_pa203_conversation_workspace import (  # noqa: F401 - fixture
+    HOOKS,
+    LIVE_KEY,
+    MANAGEMENT_CHAT,
+    MODEL,
+    OPS_CHAT,
+    OTHER_MANAGEMENT_CHAT,
+    PROVIDER,
+    _job,
+    _read,
+    _run_scheduled,
+    _write,
+    home,
+)
+from gateway.session_context import clear_session_vars, set_session_vars
+
+OTHER_KEY = (
+    f"agent:live-drain:persistent-chat:{PROVIDER}:{MODEL}:whatsapp:group:{OTHER_MANAGEMENT_CHAT}"
+)
+SANDBOX_CONFIG = {"enabled": True, "workspace": "agent"}
+
+
+@pytest.fixture()
+def agent_home(home, monkeypatch):
+    monkeypatch.setattr(sandbox, "_load_config", lambda: dict(SANDBOX_CONFIG))
+    return home
+
+
+def _agent_work(home: Path) -> Path:
+    return (
+        home
+        / "sandbox_workspaces"
+        / ("s_" + hashlib.sha256(sandbox.AGENT_WORKSPACE_OWNER.encode()).hexdigest())
+        / "work"
+    )
+
+
+def _turn(code: str, *, chat: str = MANAGEMENT_CHAT, key: str = LIVE_KEY,
+          session_id: str = "live-session-1") -> dict:
+    tokens = set_session_vars(
+        platform="whatsapp", chat_id=chat, session_key=key, session_id=session_id
+    )
+    try:
+        return json.loads(
+            sandbox._handle_python_sandbox({"code": code}, session_id=session_id)
+        )
+    finally:
+        clear_session_vars(tokens)
+
+
+def _helper(code: str) -> dict:
+    """A delegated child: its own session ID, no inherited session context."""
+    result: dict = {}
+
+    def child():
+        result["tool"] = json.loads(
+            sandbox._handle_python_sandbox({"code": code}, session_id="child-session-7")
+        )
+
+    thread = threading.Thread(target=lambda: contextvars.Context().run(child))
+    thread.start()
+    thread.join(20)
+    return result["tool"]
+
+
+def _files_log(home: Path) -> list[dict]:
+    path = _agent_work(home) / sandbox.FILES_LOG_NAME
+    return [json.loads(line) for line in path.read_text().splitlines()]
+
+
+# 1. One workspace across two conversations, a scheduled job and a helper ----
+
+
+def test_two_conversations_a_scheduled_job_and_a_helper_share_one_folder(agent_home):
+    first = _turn(_write("from_management.txt", "management"))
+    second = _turn(
+        _write("from_other_chat.txt", "other chat"),
+        chat=OTHER_MANAGEMENT_CHAT,
+        key=OTHER_KEY,
+        session_id="other-session",
+    )
+    observed, delivered = _run_scheduled(_job(), _write("from_job.txt", "scheduled"))
+    helper = _helper(_write("from_helper.txt", "helper"))
+    for result in (first, second, observed["tool"], helper):
+        assert result["status"] == "success", result
+
+    everything = (
+        "import json\n"
+        "names = ['from_management.txt', 'from_other_chat.txt', 'from_job.txt', "
+        "'from_helper.txt']\n"
+        "(WORK / 'result.json').write_text(json.dumps({n: (WORK / n).read_text() "
+        "for n in names}))\n"
+    )
+    expected = {
+        "from_management.txt": "management",
+        "from_other_chat.txt": "other chat",
+        "from_job.txt": "scheduled",
+        "from_helper.txt": "helper",
+    }
+    assert _turn(everything)["result"] == expected
+    assert _turn(everything, chat=OTHER_MANAGEMENT_CHAT, key=OTHER_KEY)["result"] == expected
+    assert _helper(everything)["result"] == expected
+    _observed, _ = _run_scheduled(_job(OPS_CHAT, id="ops-job", pa_job_type="tgg_ops_ingest"), everything)
+    assert _observed["tool"]["result"] == expected
+
+    # Delivery resolves from the same folder whatever owner it is handed.
+    assert sandbox.resolve_sandbox_work_path(
+        "work/from_helper.txt", delivered["workspace_owner"]
+    ) == _agent_work(agent_home) / "from_helper.txt"
+    assert sandbox.current_workspace_owner("anything") == sandbox.AGENT_WORKSPACE_OWNER
+    workspaces = [p.name for p in (agent_home / "sandbox_workspaces").iterdir()]
+    assert workspaces == [_agent_work(agent_home).parent.name]
+
+
+def test_capability_folder_derivation_lands_in_the_agent_folder(agent_home):
+    """tgg_file_return derives its root from ``_workspace_key(session key)``."""
+    root = agent_home / "sandbox_workspaces" / sandbox._workspace_key(LIVE_KEY) / "work"
+    assert root == _agent_work(agent_home)
+    assert sandbox._workspace_key(OTHER_KEY) == sandbox._workspace_key("cron_x_1")
+
+
+def test_session_mode_is_unchanged(home):
+    assert sandbox._workspace_key(LIVE_KEY) != sandbox._workspace_key(OTHER_KEY)
+    assert not sandbox.agent_workspace_enabled()
+
+
+# 2. A scheduled job's attached-only file reaches a later chat turn -----------
+
+
+class _Bridge:
+    status = 200
+
+    def read(self):
+        return b'{"success":true}'
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+
+def _run_and_deliver(job: dict, final_response: str, monkeypatch) -> list[dict]:
+    """Run a due job through tick with the real delivery to the reply bridge."""
+    from cron import scheduler
+    from gateway.config import Platform
+
+    sent: list[dict] = []
+    pconfig = MagicMock()
+    pconfig.enabled = False
+    gateway_config = MagicMock()
+    gateway_config.platforms = {Platform.WHATSAPP: pconfig}
+    monkeypatch.setenv("TGG_REPLY_BRIDGE_URL", "http://bridge.test")
+    with patch("cron.scheduler.get_due_jobs", return_value=[job]), \
+         patch("cron.scheduler.advance_next_run"), \
+         patch("cron.scheduler.save_job_output", return_value="out.md"), \
+         patch("cron.scheduler.mark_job_run"), \
+         patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+         patch("gateway.config.load_gateway_config", return_value=gateway_config), \
+         patch("urllib.request.urlopen",
+               side_effect=lambda req, timeout: sent.append(json.loads(req.data)) or _Bridge()), \
+         patch("dotenv.load_dotenv"), \
+         patch("hermes_state.SessionDB", return_value=MagicMock()), \
+         patch("tools.mcp_tool.discover_mcp_tools", return_value=[]), \
+         patch(
+             "hermes_cli.runtime_provider.resolve_runtime_provider",
+             return_value={
+                 "api_key": "test-key",
+                 "base_url": "https://provider.invalid/v1",
+                 "provider": "openrouter",
+                 "api_mode": "chat_completions",
+             },
+         ), \
+         patch("run_agent.AIAgent") as agent_cls:
+        agent = MagicMock()
+        agent.run_conversation.return_value = {
+            "completed": True, "final_response": final_response,
+        }
+        agent_cls.return_value = agent
+        assert scheduler.tick(verbose=False) == 1
+    return sent
+
+
+def test_attached_only_workbook_is_visible_to_a_later_chat_turn(agent_home, tmp_path, monkeypatch):
+    """The 12 Sep incident: the job attached a finished workbook it never built."""
+    _turn(_write("Outstanding_Cases_Update_v7.xlsx", "older v7: 99 blanks"))
+    reviewed = tmp_path / "media" / "pa204-am186-20260912" / "TGG_AM_186_case_review_12_Sep_2026.xlsx"
+    reviewed.parent.mkdir(parents=True)
+    reviewed.write_bytes(b"reviewed workbook: 47 blanks")
+
+    sent = _run_and_deliver(
+        _job(), f"90 remain blank.\nMEDIA:{reviewed}", monkeypatch
+    )
+
+    assert [item.get("fileName") for item in sent if "filePath" in item] == [reviewed.name]
+    later = _turn(
+        "import json\n"
+        "log = [json.loads(l) for l in (WORK / 'files-log.jsonl').read_text().splitlines()]\n"
+        "delivered = [e for e in log if e['direction'] == 'scheduled_delivery']\n"
+        "path = WORK / delivered[-1]['path'][len('work/'):]\n"
+        "(WORK / 'result.json').write_text(json.dumps({'entry': delivered[-1], "
+        "'text': path.read_text()}))\n",
+        session_id="live-root-compressed-child",
+    )
+    assert later["status"] == "success", later
+    assert later["result"]["text"] == "reviewed workbook: 47 blanks"
+    entry = later["result"]["entry"]
+    assert entry["path"] == f"work/sent/{reviewed.name}"
+    assert entry["chat_id"] == MANAGEMENT_CHAT
+    assert entry["scheduled_job_id"] == "mgmt-morning-review"
+    assert entry["sha256"] == hashlib.sha256(reviewed.read_bytes()).hexdigest()
+
+
+def test_non_management_job_may_attach_only_its_own_files(agent_home, monkeypatch):
+    _turn(_write("management_only.xlsx", "Management workbook"))
+    job = _job(OPS_CHAT, id="ops-job", pa_job_type="tgg_ops_ingest")
+
+    sent = _run_and_deliver(job, "done\nMEDIA:work/management_only.xlsx", monkeypatch)
+
+    assert not [item for item in sent if "filePath" in item]
+
+
+def test_sent_and_received_files_are_kept_and_logged(agent_home, tmp_path):
+    from gateway.durable_jsonl_consumer import _keep_sent_file_in_workspace
+
+    retained = tmp_path / "retained" / "abc_spreadsheet_0.xlsx"
+    retained.parent.mkdir()
+    retained.write_bytes(b"sent from retained media")
+    _keep_sent_file_in_workspace(retained, chat_id=MANAGEMENT_CHAT)
+    _turn(_write("built.xlsx", "built in the sandbox"))
+    _keep_sent_file_in_workspace(_agent_work(agent_home) / "built.xlsx", chat_id=MANAGEMENT_CHAT)
+
+    work = _agent_work(agent_home)
+    assert (work / "sent" / retained.name).read_bytes() == b"sent from retained media"
+    assert not (work / "sent" / "built.xlsx").exists()
+    assert [(e["direction"], e["path"]) for e in _files_log(agent_home)] == [
+        ("sent", f"work/sent/{retained.name}"),
+        ("sent", "work/built.xlsx"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_received_document_is_saved_and_named_in_the_turn(agent_home, tmp_path, monkeypatch):
+    from gateway.config import GatewayConfig, Platform
+    from gateway.platforms.base import MessageEvent, MessageType
+    from gateway.run import GatewayRunner
+    from gateway.session import SessionSource
+
+    monkeypatch.setattr("hermes_cli.config.read_raw_config", lambda: {"python_sandbox": SANDBOX_CONFIG})
+    document = tmp_path / "documents" / "Outstanding Cases.xlsx"
+    document.parent.mkdir()
+    document.write_bytes(b"Krisleen's workbook")
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(group_sessions_per_user=False)
+    runner.adapters = {}
+    runner._model = MODEL
+    runner._base_url = None
+    runner._has_setup_skill = lambda: False
+    source = SessionSource(platform=Platform.WHATSAPP, chat_id=MANAGEMENT_CHAT, chat_type="group")
+    event = MessageEvent(
+        text="please check",
+        message_type=MessageType.DOCUMENT,
+        source=source,
+        media_urls=[str(document)],
+        media_types=["application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"],
+        message_id="3EB0DOC",
+    )
+
+    text = await runner._prepare_inbound_message_text(event=event, source=source, history=[])
+
+    assert "Saved in your workspace as /work/received/Outstanding Cases.xlsx." in text
+    later = _turn(_read("received/Outstanding Cases.xlsx"), chat=OTHER_MANAGEMENT_CHAT, key=OTHER_KEY)
+    assert later["result"] == {"text": "Krisleen's workbook"}
+    [entry] = _files_log(agent_home)
+    assert entry["direction"] == "received" and entry["message_id"] == "3EB0DOC"
+
+
+def test_a_same_named_different_file_keeps_both_versions(agent_home, tmp_path):
+    first = tmp_path / "a" / "report.xlsx"
+    second = tmp_path / "b" / "report.xlsx"
+    for path, text in ((first, "first"), (second, "second")):
+        path.parent.mkdir()
+        path.write_text(text)
+
+    one = sandbox.record_workspace_file(first, direction="received", folder="received")
+    two = sandbox.record_workspace_file(second, direction="received", folder="received")
+    again = sandbox.record_workspace_file(first, direction="received", folder="received")
+
+    work = _agent_work(agent_home)
+    assert one == again == "work/received/report.xlsx"
+    assert two != one and two.startswith("work/received/report.i_")
+    assert (work / one[5:]).read_text() == "first"
+    assert (work / two[5:]).read_text() == "second"
+
+
+# 3. The folder is unchanged after a model or provider change -----------------
+
+
+def test_model_and_provider_change_keeps_the_folder(agent_home):
+    before = _turn(_write("report.xlsx", "made under the old model"))
+    assert before["status"] == "success"
+    config = yaml.safe_load((agent_home / "config.yaml").read_text())
+    config["model"] = {"provider": "openai-direct-primary", "default": "gpt-6-sol"}
+    (agent_home / "config.yaml").write_text(yaml.safe_dump(config))
+    new_key = (
+        "agent:live-drain:persistent-chat:openai-direct-primary:gpt-6-sol:"
+        f"whatsapp:group:{MANAGEMENT_CHAT}"
+    )
+
+    after = _turn(_read("report.xlsx"), key=new_key, session_id="fresh-session-new-model")
+
+    assert after["result"] == {"text": "made under the old model"}
+    observed, _ = _run_scheduled(_job(), _read("report.xlsx"))
+    assert observed["tool"]["result"] == {"text": "made under the old model"}
+
+
+# 4. Earlier folders are merged in without loss --------------------------------
+
+
+def _legacy(home: Path, owner: str, files: dict[str, str], mtime: float) -> Path:
+    work = home / "sandbox_workspaces" / ("s_" + hashlib.sha256(owner.encode()).hexdigest()) / "work"
+    for name, text in files.items():
+        (work / name).parent.mkdir(parents=True, exist_ok=True)
+        (work / name).write_text(text)
+        os.utime(work / name, (mtime, mtime))
+    return work
+
+
+def _snapshot(work: Path) -> dict[str, bytes]:
+    return {
+        path.relative_to(work).as_posix(): path.read_bytes()
+        for path in work.rglob("*")
+        if path.is_file()
+    }
+
+
+def test_existing_folders_merge_without_loss(agent_home):
+    # Today's shape: one folder per conversation and model.
+    current = _legacy(agent_home, LIVE_KEY, {
+        "Outstanding_Cases_Update_v7.xlsx": "v7 current",
+        "shared.txt": "same bytes",
+        "nested/a.txt": "a",
+    }, mtime=2_000_000_000)
+    old_model = _legacy(agent_home, LIVE_KEY.replace(MODEL, "gpt-old"), {
+        "Outstanding_Cases_Update_v7.xlsx": "v7 from the old model folder",
+        "shared.txt": "same bytes",
+        "only_old.txt": "old",
+    }, mtime=1_900_000_000)
+    other = _legacy(agent_home, OTHER_KEY, {"other.txt": "other chat"}, mtime=1_950_000_000)
+    before = {path: _snapshot(path) for path in (current, old_model, other)}
+
+    listing = _turn(
+        "import json, os\n"
+        "files = {}\n"
+        "for root, _d, names in os.walk(WORK):\n"
+        "    for n in names:\n"
+        "        p = os.path.join(root, n)\n"
+        "        files[os.path.relpath(p, WORK)] = open(p).read()\n"
+        "(WORK / 'result.json').write_text(json.dumps(files))\n"
+    )["result"]
+
+    # Nothing in any earlier folder changed or went away.
+    for path, files in before.items():
+        assert _snapshot(path) == files
+    # Every distinct file is present; the newest copy keeps the plain name.
+    old_tag = f"m_{old_model.parent.name[2:10]}"
+    assert listing == {
+        "Outstanding_Cases_Update_v7.xlsx": "v7 current",
+        f"Outstanding_Cases_Update_v7.{old_tag}.xlsx": "v7 from the old model folder",
+        "shared.txt": "same bytes",
+        "nested/a.txt": "a",
+        "only_old.txt": "old",
+        "other.txt": "other chat",
+    }
+    record = json.loads(
+        (_agent_work(agent_home).parent / sandbox._MERGE_RECORD_FILE).read_text()
+    )
+    assert set(record["merged"]) == {current.parent.name, old_model.parent.name, other.parent.name}
+    assert record["merged"][old_model.parent.name]["renamed"] == {
+        "Outstanding_Cases_Update_v7.xlsx": f"Outstanding_Cases_Update_v7.{old_tag}.xlsx"
+    }
+
+
+def test_merge_runs_once_and_earlier_folders_are_never_pruned(agent_home):
+    legacy = _legacy(agent_home, LIVE_KEY, {"report.xlsx": "v1"}, mtime=1_000_000_000)
+    _turn(_write("report.xlsx", "v2 edited after the move"))
+    _turn(_write("note.txt", "another run"))
+
+    assert (_agent_work(agent_home) / "report.xlsx").read_text() == "v2 edited after the move"
+    assert not list(_agent_work(agent_home).glob("report.m_*"))
+    assert (legacy / "report.xlsx").read_text() == "v1"
+
+
+def test_delivery_before_any_sandbox_run_still_finds_a_moved_file(agent_home):
+    _legacy(agent_home, LIVE_KEY, {"report.xlsx": "made before the move"}, mtime=1_000_000_000)
+
+    resolved = sandbox.resolve_sandbox_work_path("work/report.xlsx", LIVE_KEY)
+
+    assert resolved == _agent_work(agent_home) / "report.xlsx"
+    assert resolved.read_text() == "made before the move"
+
+
+# 5. Concurrent writers never lose files ---------------------------------------
+
+
+def test_concurrent_writers_from_different_conversations_keep_both(agent_home):
+    _turn(_write("report.xlsx", "original"))
+    HOOKS["a_seeded"] = threading.Event()
+    HOOKS["b_published"] = threading.Event()
+    results: dict = {}
+
+    def conversation_a():
+        results["a"] = _turn(
+            "HOOKS['a_seeded'].set()\n"
+            "assert HOOKS['b_published'].wait(10)\n"
+            + _write("report.xlsx", "edit from conversation A")
+            + _write("a_only.txt", "a"),
+        )
+
+    thread = threading.Thread(target=conversation_a)
+    thread.start()
+    assert HOOKS["a_seeded"].wait(10)
+    results["b"] = _helper(_write("report.xlsx", "edit from a helper") + _write("b_only.txt", "b"))
+    HOOKS["b_published"].set()
+    thread.join(20)
+
+    work = _agent_work(agent_home)
+    assert results["a"]["status"] == results["b"]["status"] == "success"
+    assert (work / "report.xlsx").read_text() == "edit from a helper"
+    [renamed] = results["a"]["workspace_renamed"]
+    assert (work / renamed["saved_as"][5:]).read_text() == "edit from conversation A"
+    assert (work / "a_only.txt").read_text() == "a"
+    assert (work / "b_only.txt").read_text() == "b"
+
+
+def test_concurrent_imports_and_sandbox_runs_lose_nothing(agent_home, tmp_path):
+    sources = []
+    for index in range(6):
+        path = tmp_path / f"in{index}" / "same-name.xlsx"
+        path.parent.mkdir()
+        path.write_text(f"version {index}")
+        sources.append(path)
+    results: list = []
+
+    def importer(path):
+        results.append(
+            sandbox.record_workspace_file(path, direction="received", folder="received")
+        )
+
+    threads = [threading.Thread(target=importer, args=(path,)) for path in sources]
+    threads += [
+        threading.Thread(target=_turn, args=(_write(f"run{index}.txt", str(index)),),
+                         kwargs={"session_id": f"s{index}"})
+        for index in range(3)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(30)
+
+    work = _agent_work(agent_home)
+    kept = sorted((work / path[5:]).read_text() for path in results)
+    assert kept == [f"version {index}" for index in range(6)]
+    assert len(set(results)) == 6
+    assert sorted((work / f"run{index}.txt").read_text() for index in range(3)) == ["0", "1", "2"]
+    assert len(_files_log(agent_home)) == 6
+
+
+# Release helper ----------------------------------------------------------------
+
+
+def test_release_helper_checks_then_proves_the_merge(home, monkeypatch, capsys):
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "merge_sandbox_workspaces",
+        Path(__file__).parents[2] / "deploy" / "tgg" / "christopher" / "scripts"
+        / "merge_sandbox_workspaces.py",
+    )
+    helper = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(helper)
+    _legacy(home, LIVE_KEY, {"a.xlsx": "current"}, mtime=2_000_000_000)
+    _legacy(home, OTHER_KEY, {"a.xlsx": "other", "b.txt": "b"}, mtime=1_000_000_000)
+
+    # Before the config flip: read-only check, nothing created.
+    assert helper.main(["check"]) == 0
+    checked = json.loads(capsys.readouterr().out)
+    assert checked["workspace_mode"] == "session"
+    assert checked["names_kept_twice"] == ["a.xlsx"]
+    assert checked["merged_bytes"] == len("current") + len("other") + len("b")
+    assert not _agent_work(home).exists()
+    with pytest.raises(SystemExit):
+        helper.main(["apply"])
+
+    monkeypatch.setattr(sandbox, "_load_config", lambda: dict(SANDBOX_CONFIG))
+    assert helper.main(["apply"]) == 0
+    applied = json.loads(capsys.readouterr().out)
+    assert applied["ok"] and applied["missing"] == []
+    assert applied["files_in_agent_folder"] == 3

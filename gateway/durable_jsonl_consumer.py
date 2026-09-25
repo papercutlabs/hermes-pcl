@@ -3697,6 +3697,26 @@ def _resolve_captured_media_path(
     return resolved
 
 
+def _keep_sent_file_in_workspace(path: Path, *, chat_id: str) -> None:
+    """Keep a file Christopher sent in the agent workspace (PA-203 round 2).
+
+    A sandbox file is already there and is only logged; a retained-media or
+    other local file is copied in, so a later turn in any conversation can
+    open exactly what was sent.  Never fails the delivery.
+    """
+    try:
+        from tools.python_sandbox_tool import record_workspace_file
+
+        record_workspace_file(
+            path, direction="sent", folder="sent", details={"chat_id": chat_id}
+        )
+    except Exception as exc:
+        print(
+            f"sent file was not kept in the agent workspace: chat={chat_id} error={exc}",
+            file=sys.stderr,
+        )
+
+
 def _recent_valid_sandbox_file_paths(
     messages: Sequence[Mapping[str, Any]],
     *,
@@ -4345,6 +4365,8 @@ def deliver_management_replies(
                     provider_outcome=str(payload.get("outcome") or "delivered"),
                 )
                 summary["delivered"] += 1
+                if send.get("send_kind", "text") == "media":
+                    _keep_sent_file_in_workspace(media_path, chat_id=chat_id)
                 if send.get("send_kind", "text") == "media" and send.get("caption"):
                     media_caption_delivered.add((chat_id, str(anchor)))
             else:

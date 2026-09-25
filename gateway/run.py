@@ -8859,6 +8859,31 @@ class GatewayRunner:
                     if sandbox_path is not None
                     else f"Original filename: '{basename}'. Host path: {agent_path}."
                 )
+                # PA-203 round 2: with one agent-wide workspace, every file
+                # a person sends is kept in it, so later turns in any
+                # conversation, scheduled jobs and helpers can open it.
+                try:
+                    from tools.python_sandbox_tool import record_workspace_file
+
+                    _kept = await asyncio.to_thread(
+                        record_workspace_file,
+                        path,
+                        direction="received",
+                        folder="received",
+                        name=basename,
+                        details={
+                            "chat_id": str(getattr(source, "chat_id", "") or ""),
+                            "message_id": str(getattr(event, "message_id", "") or ""),
+                        },
+                    )
+                except Exception as _keep_exc:
+                    _kept = None
+                    logger.warning(
+                        "Received document was not kept in the agent workspace: %s",
+                        _keep_exc,
+                    )
+                if _kept:
+                    location_note = f"{location_note} Saved in your workspace as /{_kept}."
 
                 if mtype.startswith("text/"):
                     context_note = (

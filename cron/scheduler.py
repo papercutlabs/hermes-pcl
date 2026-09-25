@@ -735,7 +735,38 @@ def _deliver_whatsapp_via_tgg_reply_bridge(
         })
         if error:
             return error
+        _keep_delivered_file_in_workspace(job, chat_id, resolved_media)
     return None
+
+
+def _keep_delivered_file_in_workspace(job: dict, chat_id: str, path) -> None:
+    """Keep a file a scheduled job delivered in the agent workspace (PA-203).
+
+    A job may attach a file it never built, such as an existing workbook at a
+    retained media path.  A later chat turn must be able to find exactly the
+    file that was delivered, so the file is copied into the agent workspace
+    (unless it is already there) and logged.  A failure here never turns a
+    completed delivery into a failed one.
+    """
+    try:
+        from tools.python_sandbox_tool import record_workspace_file
+
+        record_workspace_file(
+            path,
+            direction="scheduled_delivery",
+            folder="sent",
+            details={
+                "chat_id": str(chat_id),
+                "scheduled_job_id": str(job.get("id") or ""),
+                "scheduled_job_name": str(job.get("name") or ""),
+            },
+        )
+    except Exception as exc:
+        logger.warning(
+            "Job '%s': delivered file was not kept in the agent workspace: %s",
+            job.get("id", "?"),
+            exc,
+        )
 
 
 def _deliver_result(
@@ -746,14 +777,17 @@ def _deliver_result(
     *,
     workspace_owner: str | None = None,
     published_paths: set[str] | None = None,
+    origin_may_attach_any: bool = True,
 ) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
 
-    ``published_paths`` (PA-203) is set when the job worked in its origin
-    conversation's persistent folder.  A delivery to that origin chat may
-    attach any file of the folder; a delivery to any other target may attach
-    only the files this run's sandbox calls published.
+    ``published_paths`` (PA-203) is set when the job works in a folder it
+    shares: its origin conversation's persistent folder, or the agent-wide
+    workspace.  A delivery may attach any file of the folder only to the
+    job's origin chat and only when ``origin_may_attach_any`` (a Management
+    job); every other delivery may attach only the files this run's sandbox
+    calls published.
 
     When ``adapters`` and ``loop`` are provided (gateway is running), tries to
     use the live adapter first — this supports E2EE rooms (e.g. Matrix) where
@@ -854,7 +888,10 @@ def _deliver_result(
                     media_files,
                     workspace_owner=workspace_owner,
                     allowed_work_paths=(
-                        None if published_paths is None or to_origin else set(published_paths)
+                        None
+                        if published_paths is None
+                        or (to_origin and origin_may_attach_any)
+                        else set(published_paths)
                     ),
                 )
                 if error:
@@ -2101,10 +2138,16 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                 run_input["_runtime_session_id"] = cron_session_id
                 # One owner for the whole scheduled run: the job's sandbox
                 # work and its attachment delivery use the same folder.
-                workspace_owner = (
-                    _resolve_cron_pa_workspace_owner(job) or cron_session_id
-                )
+                management_owner = _resolve_cron_pa_workspace_owner(job)
+                workspace_owner = management_owner or cron_session_id
                 run_input["_runtime_workspace_owner"] = workspace_owner
+                # With one agent-wide workspace (PA-203 round 2) every job
+                # shares the folder, so every job's delivery is bounded:
+                # only a Management job may attach any folder file, and only
+                # to its origin chat.
+                from tools.python_sandbox_tool import agent_workspace_enabled
+
+                shared_workspace = agent_workspace_enabled()
                 # Files this run's sandbox calls publish.  A delivery to any
                 # chat other than the job's origin may attach only these.
                 published: set[str] = set()
@@ -2134,8 +2177,11 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                             loop=loop,
                             workspace_owner=workspace_owner,
                             published_paths=(
-                                published if workspace_owner != cron_session_id else None
+                                published
+                                if management_owner or shared_workspace
+                                else None
                             ),
+                            origin_may_attach_any=management_owner is not None,
                         )
                     except Exception as de:
                         delivery_error = str(de)

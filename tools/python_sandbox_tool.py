@@ -69,6 +69,14 @@ _PROBE_TTL = 30.0
 _WORKSPACE_LOCKS: dict[str, threading.Lock] = {}
 _WORKSPACE_LOCKS_GUARD = threading.Lock()
 _WORKSPACE_LOCK_FILE = ".publish.lock"
+# Owner of the one agent-wide workspace (``workspace: agent``).  Constant, so
+# the folder never depends on a conversation, job, provider or model.
+AGENT_WORKSPACE_OWNER = "hermes-agent-workspace"
+# Beside ``work/``: which earlier per-conversation folders were merged in.
+_MERGE_RECORD_FILE = ".merged-workspaces.json"
+# Inside ``work/``: one JSON line per file received, sent or delivered.
+FILES_LOG_NAME = "files-log.jsonl"
+_LEGACY_WORKSPACE_RE = re.compile(r"^s_[0-9a-f]{64}$")
 _EXPORT_COMPLETE = ".hermes-export-complete"
 # A runtime-derived workspace owner bound by trusted scheduler code.  It is
 # never a tool argument, so the model cannot select another conversation.
@@ -806,11 +814,34 @@ def _prune_runs(root: Path, config: Mapping[str, Any]) -> None:
 
 
 def _workspace_mode(config: Mapping[str, Any]) -> str:
-    """Return the configured scratch lifetime, preserving run scope by default."""
-    return "session" if config.get("workspace") == "session" else "run"
+    """Return the configured scratch lifetime, preserving run scope by default.
+
+    ``agent`` (PA-203 round 2) is one persistent folder for the whole agent:
+    every conversation, scheduled job and delegated helper, independent of
+    the provider, model and compaction.  ``session`` is one folder per
+    stable session key; ``run`` is a fresh folder per call.
+    """
+    value = config.get("workspace")
+    if value == "agent":
+        return "agent"
+    return "session" if value == "session" else "run"
 
 
-def _workspace_key(session_id: str) -> str:
+def agent_workspace_enabled(config: Mapping[str, Any] | None = None) -> bool:
+    """True when this deployment keeps one persistent agent-wide workspace."""
+    return _workspace_mode(_load_config() if config is None else config) == "agent"
+
+
+def _workspace_key(session_id: str, config: Mapping[str, Any] | None = None) -> str:
+    """Name of the retained folder for ``session_id``.
+
+    In ``agent`` mode every owner maps to the one agent folder, so each
+    caller that derives a folder from an owner (sandbox runs, delivery,
+    materialized query results, capability file return) lands in the same
+    place whatever conversation, job, helper or model it runs under.
+    """
+    if agent_workspace_enabled(config):
+        session_id = AGENT_WORKSPACE_OWNER
     return "s_" + hashlib.sha256(session_id.encode("utf-8")).hexdigest()
 
 
@@ -824,6 +855,17 @@ def resolve_sandbox_work_path(raw_path: Any, workspace_owner: str) -> Path:
     """
     text = str(raw_path or "").strip()
     owner = str(workspace_owner or "").strip()
+    config = _load_config()
+    if agent_workspace_enabled(config):
+        # One folder for everything: bring earlier folders in first so a
+        # file made before the move still resolves at its old path.
+        owner = AGENT_WORKSPACE_OWNER
+        try:
+            ensure_agent_workspace(config)
+        except (OSError, RuntimeError):
+            # Resolution still answers from the agent folder as it stands;
+            # the merge is retried by the next caller.
+            logger.exception("Could not merge earlier sandbox workspaces")
     if not owner:
         raise ValueError("sandbox workspace owner is unavailable")
     if text.startswith("/work/"):
@@ -843,7 +885,7 @@ def resolve_sandbox_work_path(raw_path: Any, workspace_owner: str) -> Path:
     work_root = (
         get_hermes_home()
         / "sandbox_workspaces"
-        / _workspace_key(owner)
+        / _workspace_key(owner, config)
         / "work"
     )
     candidate = work_root / relative
@@ -898,7 +940,10 @@ def current_workspace_owner(fallback: str | None = None) -> str:
 
     Precedence: a scheduler-bound owner, then the gateway's stable
     ``HERMES_SESSION_KEY`` (survives compaction), then the caller's fallback.
+    In ``agent`` mode the answer is always the one agent-wide owner.
     """
+    if agent_workspace_enabled():
+        return AGENT_WORKSPACE_OWNER
     bound = _BOUND_WORKSPACE_OWNER.get().strip()
     if bound:
         return bound
@@ -920,7 +965,7 @@ def _workspace_lock(session_id: str, workspace: Path) -> Iterator[None]:
     thread lock orders callers in this process; ``flock`` on a file inside the
     workspace orders separate processes (scheduler, gateway, maintenance).
     """
-    key = _workspace_key(session_id)
+    key = str(workspace)
     with _WORKSPACE_LOCKS_GUARD:
         thread_lock = _WORKSPACE_LOCKS.setdefault(key, threading.Lock())
     with thread_lock:
@@ -1195,6 +1240,228 @@ def _publish_workspace(
     }
 
 
+def _newest_file_mtime(work: Path) -> float:
+    newest = 0.0
+    for current, _dirs, files in os.walk(work, followlinks=False):
+        for name in files:
+            try:
+                newest = max(newest, (Path(current) / name).lstat().st_mtime)
+            except OSError:
+                continue
+    return newest
+
+
+def _merge_legacy_workspaces_locked(
+    workspace_root: Path,
+    workspace: Path,
+    *,
+    hermes_home: Path,
+    reader_uid: str | None,
+) -> list[dict[str, Any]]:
+    """Merge every earlier per-conversation folder into the agent folder.
+
+    The caller holds the agent workspace lock.  Nothing is deleted: each
+    earlier folder is read under its own lock and left exactly as it was, and
+    the merge uses the publication rules with an empty base, so a file the
+    agent folder lacks is added, an identical file is left alone, and a
+    same-named file with different bytes keeps both versions (the one already
+    here keeps its name; the other is saved beside it with an ``m_<folder>``
+    tag).  Folders are merged newest first, so the most recently used copy
+    of a name keeps the plain name.  A record beside ``work/`` names each
+    merged folder, so a merge never repeats.
+    """
+    record_path = workspace / _MERGE_RECORD_FILE
+    try:
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        record = {}
+    except (OSError, ValueError):
+        logger.exception("Workspace merge record is unreadable; not merging")
+        return []
+    merged = record.get("merged") if isinstance(record, dict) else None
+    if not isinstance(merged, dict):
+        merged = {}
+    if not workspace_root.is_dir():
+        return []
+    candidates = [
+        path
+        for path in workspace_root.iterdir()
+        if path != workspace
+        and _LEGACY_WORKSPACE_RE.fullmatch(path.name)
+        and path.name not in merged
+        and path.is_dir()
+        and not path.is_symlink()
+    ]
+    if not candidates:
+        return []
+    candidates.sort(
+        key=lambda path: (_newest_file_mtime(path / "work"), path.name),
+        reverse=True,
+    )
+    results: list[dict[str, Any]] = []
+    destination = workspace / "work"
+    destination.mkdir(parents=True, exist_ok=True, mode=0o700)
+    for legacy in candidates:
+        legacy_work = legacy / "work"
+        entry: dict[str, Any] = {
+            "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "files": 0,
+            "same_name": [],
+            "renamed": {},
+            "unpublished": [],
+        }
+        if legacy_work.is_dir() and not legacy_work.is_symlink():
+            with _workspace_lock(f"legacy:{legacy.name}", legacy):
+                files = _work_manifest(legacy_work)
+                outcome = _publish_workspace(
+                    legacy_work,
+                    destination,
+                    {},
+                    run_id=f"m_{legacy.name[2:10]}",
+                    hermes_home=hermes_home,
+                    reader_uid=reader_uid,
+                )
+            entry["files"] = len(files)
+            entry["renamed"] = dict(outcome.get("renamed") or {})
+            entry["unpublished"] = list(outcome.get("unpublished") or [])
+            entry["same_name"] = sorted(
+                set(outcome.get("produced") or []) - set(entry["renamed"].values())
+            )
+        merged[legacy.name] = entry
+        results.append({"folder": legacy.name, **entry})
+        record = {"format": "hermes-agent-workspace-merge/v1", "merged": merged}
+        staged = record_path.with_name(f".{record_path.name}.{uuid.uuid4().hex}.tmp")
+        staged.write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
+        os.replace(staged, record_path)
+        logger.info(
+            "Merged sandbox workspace %s into the agent workspace: %d files, %d renamed",
+            legacy.name,
+            entry["files"],
+            len(entry["renamed"]),
+        )
+    return results
+
+
+def ensure_agent_workspace(
+    config: Mapping[str, Any] | None = None,
+) -> Path | None:
+    """Return the agent workspace ``work/`` folder, merging earlier folders.
+
+    ``None`` when this deployment does not use ``workspace: agent``.
+    """
+    config = _load_config() if config is None else config
+    if not agent_workspace_enabled(config):
+        return None
+    hermes_home = get_hermes_home()
+    workspace_root = hermes_home / "sandbox_workspaces"
+    workspace = workspace_root / _workspace_key(AGENT_WORKSPACE_OWNER, config)
+    reader_uid = configured_reader_uid(config)
+    with _workspace_lock(AGENT_WORKSPACE_OWNER, workspace):
+        _merge_legacy_workspaces_locked(
+            workspace_root, workspace, hermes_home=hermes_home, reader_uid=reader_uid
+        )
+        (workspace / "work").mkdir(parents=True, exist_ok=True, mode=0o700)
+    return workspace / "work"
+
+
+def _safe_import_name(name: str) -> str:
+    cleaned = re.sub(r"[^\w.\- ]", "_", Path(str(name or "")).name).strip(" .")
+    return cleaned or "file"
+
+
+def record_workspace_file(
+    source: str | Path,
+    *,
+    direction: str,
+    folder: str,
+    name: str | None = None,
+    details: Mapping[str, Any] | None = None,
+) -> str | None:
+    """Keep one file that came in or went out in the agent workspace.
+
+    ``source`` is a host file.  When it already lives in the agent folder it
+    is not copied; otherwise it is copied to ``work/<folder>/<name>`` with the
+    publication rules, so an existing different file of that name keeps its
+    name and this one is saved beside it.  Either way one line is appended to
+    ``work/files-log.jsonl`` saying what the file is, which way it moved,
+    when, and where it is now.  Returns the ``work/...`` path, or ``None``
+    when the deployment has no agent workspace.
+    """
+    config = _load_config()
+    if not agent_workspace_enabled(config):
+        return None
+    source_path = Path(source)
+    if source_path.is_symlink() or not source_path.is_file():
+        raise ValueError("workspace import source is not a regular file")
+    hermes_home = get_hermes_home()
+    workspace_root = hermes_home / "sandbox_workspaces"
+    workspace = workspace_root / _workspace_key(AGENT_WORKSPACE_OWNER, config)
+    work = workspace / "work"
+    reader_uid = configured_reader_uid(config)
+    digest = hashlib.sha256()
+    with source_path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    sha256 = digest.hexdigest()
+    display_name = _safe_import_name(name or source_path.name)
+    tag = f"i_{uuid.uuid4().hex[:8]}"
+    staging_root = hermes_home / "sandbox_runs" / tag
+    with _workspace_lock(AGENT_WORKSPACE_OWNER, workspace):
+        _merge_legacy_workspaces_locked(
+            workspace_root, workspace, hermes_home=hermes_home, reader_uid=reader_uid
+        )
+        work.mkdir(parents=True, exist_ok=True, mode=0o700)
+        resolved = source_path.resolve()
+        if resolved.is_relative_to(work.resolve()):
+            relative = resolved.relative_to(work.resolve()).as_posix()
+        else:
+            relative = f"{folder.strip('/')}/{display_name}"
+            staged_work = staging_root / "work"
+            try:
+                (staged_work / relative).parent.mkdir(
+                    parents=True, exist_ok=True, mode=0o700
+                )
+                shutil.copyfile(source_path, staged_work / relative)
+                if _work_manifest(staged_work).get(relative) != sha256:
+                    raise OSError("workspace import changed while copying")
+                outcome = _publish_workspace(
+                    staged_work,
+                    work,
+                    {},
+                    run_id=tag,
+                    hermes_home=hermes_home,
+                    reader_uid=reader_uid,
+                )
+            finally:
+                shutil.rmtree(staging_root, ignore_errors=True)
+            if relative in outcome.get("unpublished", []):
+                raise OSError("workspace import could not be saved")
+            relative = (outcome.get("renamed") or {}).get(relative, relative)
+        entry = {
+            "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "direction": direction,
+            "path": f"work/{relative}",
+            "name": display_name,
+            "sha256": sha256,
+            **{key: value for key, value in dict(details or {}).items() if value},
+        }
+        log_path = work / FILES_LOG_NAME
+        if log_path.is_symlink() or (log_path.exists() and not log_path.is_file()):
+            raise OSError("workspace files log is not a regular file")
+        with open(
+            log_path,
+            "a",
+            encoding="utf-8",
+            opener=lambda path, flags: os.open(
+                path, flags | getattr(os, "O_NOFOLLOW", 0), 0o600
+            ),
+        ) as handle:
+            handle.write(json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n")
+        if reader_uid is not None:
+            grant_reader_work_access(hermes_home, work, reader_uid)
+    return f"work/{relative}"
+
+
 def _prune_workspaces(
     root: Path,
     config: Mapping[str, Any],
@@ -1279,6 +1546,16 @@ def python_sandbox(
     available, reason = _probe(force=True)
     if not available:
         return _unavailable(reason)
+    if _workspace_mode(config) == "agent":
+        # One folder for every conversation, job and helper (PA-203 round 2).
+        return _run_python_sandbox(
+            code,
+            datasets,
+            input_json,
+            timeout_seconds,
+            config=config,
+            session_id=AGENT_WORKSPACE_OWNER,
+        )
     if _workspace_mode(config) == "session":
         if not isinstance(session_id, str) or not session_id.strip():
             return json.dumps(
@@ -1356,8 +1633,9 @@ def _run_python_sandbox(
     workspace_root = hermes_home / "sandbox_workspaces"
     workspace = None
     seed_work = None
+    agent_mode = _workspace_mode(config) == "agent"
     if session_id is not None:
-        workspace = workspace_root / _workspace_key(session_id)
+        workspace = workspace_root / _workspace_key(session_id, config)
     for path in (root, run, inputs, work):
         path.mkdir(parents=True, exist_ok=True, mode=0o700)
     (run / "script.py").write_text(code, encoding="utf-8")
@@ -1373,10 +1651,31 @@ def _run_python_sandbox(
         )
     seed_base: dict[str, str] = {}
     if workspace is not None:
-        _prune_workspaces(workspace_root, config, exclude=workspace)
+        if not agent_mode:
+            # The agent workspace keeps every earlier folder until an
+            # operator removes it after the merge is verified.
+            _prune_workspaces(workspace_root, config, exclude=workspace)
         retained_work = workspace / "work"
         seed_work = run / "seed"
         with _workspace_lock(session_id, workspace):
+            if agent_mode:
+                try:
+                    _merge_legacy_workspaces_locked(
+                        workspace_root,
+                        workspace,
+                        hermes_home=hermes_home,
+                        reader_uid=reader_uid,
+                    )
+                except (OSError, SandboxReaderPolicyError) as exc:
+                    logger.exception("Could not merge earlier sandbox workspaces")
+                    shutil.rmtree(run, ignore_errors=True)
+                    return json.dumps(
+                        {
+                            "status": "error",
+                            "error": f"workspace merge failed: {exc}",
+                            "result": None,
+                        }
+                    )
             retained_work.mkdir(parents=True, exist_ok=True, mode=0o700)
             if reader_uid is not None:
                 try:
@@ -1600,7 +1899,7 @@ def _run_python_sandbox(
             for written, saved in sorted(renamed.items())
         ]
         payload["workspace_note"] = (
-            "Another task in this conversation changed a file with the same "
+            "Another task using this folder changed a file with the same "
             "name while this run executed, or the folder already holds a "
             "different kind of entry at that name. The existing entry keeps "
             "its name; this run's file was saved as saved_as. Use "
@@ -1616,7 +1915,7 @@ def _run_python_sandbox(
         ]
         payload["workspace_kept_note"] = (
             "This run replaced these files with a directory, link or special "
-            "file, or its copy could not be read. The conversation folder "
+            "file, or its copy could not be read. The retained folder "
             "keeps the previous file under the same name."
         )
     payload = _sanitize_value(payload)
@@ -1633,7 +1932,7 @@ def _run_python_sandbox(
     shutil.rmtree(run / "jail", ignore_errors=True)
     shutil.rmtree(run / "seed", ignore_errors=True)
     _prune_runs(root, config)
-    if workspace is not None:
+    if workspace is not None and not agent_mode:
         _prune_workspaces(workspace_root, config, exclude=workspace)
     return json.dumps(payload, ensure_ascii=False)
 
@@ -1731,9 +2030,21 @@ def _schema_overrides() -> dict[str, str]:
         if importlib.util.find_spec(name) is not None
     ]
     library_text = f" plus {', '.join(libraries)}." if libraries else "."
+    workspace_text = (
+        "\n\n/work in this deployment is one persistent folder shared by all "
+        "your conversations, scheduled jobs and helpers, and it is kept when "
+        "the model changes. Files people send you are saved under "
+        "/work/received/, files you send or a scheduled job delivers that were "
+        "not already in /work are saved under /work/sent/, and "
+        f"/work/{FILES_LOG_NAME} has one line per file with its time, "
+        "direction, chat and exact path. Check it for the newest version of "
+        "a file before reworking an older one."
+        if agent_workspace_enabled(config)
+        else ""
+    )
     return {
         "description": (
-            f"{_BASE_DESCRIPTION}\n\nDatasets (pass names in datasets): "
+            f"{_BASE_DESCRIPTION}{workspace_text}\n\nDatasets (pass names in datasets): "
             f"{listing}. SQLite datasets are point-in-time read-only "
             f"snapshots. Libraries: Python stdlib{library_text}"
         )
