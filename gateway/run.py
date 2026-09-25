@@ -8913,6 +8913,25 @@ class GatewayRunner:
                     )
                 message_text = f"{context_note}\n\n{message_text}"
 
+        # PA-203 round 2: when the quoted message carried a file that the
+        # agent workspace recorded, say which file.  Information, not a rule;
+        # nothing is added when the quoted message has no file record.
+        _quoted_message_id = str(getattr(event, "reply_to_message_id", "") or "").strip()
+        if _quoted_message_id:
+            try:
+                from tools.python_sandbox_tool import describe_quoted_workspace_files
+
+                _quoted_note = await asyncio.to_thread(
+                    describe_quoted_workspace_files,
+                    _quoted_message_id,
+                    chat_id=str(getattr(source, "chat_id", "") or "") or None,
+                )
+            except Exception as _quoted_exc:
+                _quoted_note = None
+                logger.debug("Quoted-file lookup failed: %s", _quoted_exc)
+            if _quoted_note:
+                message_text = f"{_quoted_note}\n\n{message_text}"
+
         if getattr(event, "reply_to_text", None) and event.reply_to_message_id:
             # Always inject the reply-to pointer — even when the quoted text
             # already appears in history. The prefix isn't deduplication, it's

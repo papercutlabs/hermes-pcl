@@ -177,6 +177,8 @@ def _run_and_deliver(job: dict, final_response: str, monkeypatch) -> list[dict]:
     pconfig.enabled = False
     gateway_config = MagicMock()
     gateway_config.platforms = {Platform.WHATSAPP: pconfig}
+    gateway_config.group_sessions_per_user = False
+    gateway_config.thread_sessions_per_user = False
     monkeypatch.setenv("TGG_REPLY_BRIDGE_URL", "http://bridge.test")
     with patch("cron.scheduler.get_due_jobs", return_value=[job]), \
          patch("cron.scheduler.advance_next_run"), \
@@ -524,3 +526,200 @@ def test_release_helper_checks_then_proves_the_merge(home, monkeypatch, capsys):
     applied = json.loads(capsys.readouterr().out)
     assert applied["ok"] and applied["missing"] == []
     assert applied["files_in_agent_folder"] == 3
+
+
+# Follow-up: message ids, quoted replies, deliveries in the conversation --------
+# Shape of the s1 prescheduled case: a Management conversation holds v7; a
+# scheduled job attaches the existing reviewed workbook; Krisleen then quotes
+# that delivery.
+
+MANAGEMENT_SESSION_ID = "20260911_153104_5c6b7d"
+DELIVERY_TEXT_ID = "3EB0C508ED98E2132C2B2D"
+DELIVERY_FILE_ID = "3EB0C508ED98E2132C2B2E"
+
+
+def _bridge_with_ids(sent: list):
+    ids = iter([DELIVERY_TEXT_ID, DELIVERY_FILE_ID, "3EB0SPARE1", "3EB0SPARE2"])
+
+    class Response(_Bridge):
+        def __init__(self):
+            self.body = json.dumps({"success": True, "messageId": next(ids)}).encode()
+
+        def read(self):
+            return self.body
+
+    return lambda req, timeout: sent.append(json.loads(req.data)) or Response()
+
+
+def _sandbox_in_config(home: Path) -> None:
+    config = yaml.safe_load((home / "config.yaml").read_text())
+    config["python_sandbox"] = dict(SANDBOX_CONFIG)
+    (home / "config.yaml").write_text(yaml.safe_dump(config))
+
+
+def _management_session(home: Path) -> Path:
+    sessions = home / "sessions"
+    sessions.mkdir(exist_ok=True)
+    (sessions / "sessions.json").write_text(json.dumps({
+        LIVE_KEY: {
+            "session_key": LIVE_KEY,
+            "session_id": MANAGEMENT_SESSION_ID,
+            "platform": "whatsapp",
+            "chat_type": "group",
+            "origin": {"platform": "whatsapp", "chat_id": MANAGEMENT_CHAT},
+        }
+    }))
+    transcript = sessions / f"{MANAGEMENT_SESSION_ID}.jsonl"
+    transcript.write_text(json.dumps({"role": "user", "content": "earlier turn"}) + "\n")
+    return transcript
+
+
+def _runner():
+    from gateway.config import GatewayConfig
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(group_sessions_per_user=False)
+    runner.adapters = {}
+    runner._model = MODEL
+    runner._base_url = None
+    runner._has_setup_skill = lambda: False
+    return runner
+
+
+async def _krisleen(text: str, *, quoted: str | None = None, message_id: str = "3EB0KRIS",
+                    document: Path | None = None) -> str:
+    from gateway.config import Platform
+    from gateway.platforms.base import MessageEvent, MessageType
+    from gateway.session import SessionSource
+
+    source = SessionSource(platform=Platform.WHATSAPP, chat_id=MANAGEMENT_CHAT, chat_type="group")
+    event = MessageEvent(
+        text=text,
+        message_type=MessageType.DOCUMENT if document else MessageType.TEXT,
+        source=source,
+        message_id=message_id,
+        reply_to_message_id=quoted,
+        reply_to_text="quoted text" if quoted else None,
+        media_urls=[str(document)] if document else [],
+        media_types=(
+            ["application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"]
+            if document else []
+        ),
+    )
+    return await _runner()._prepare_inbound_message_text(event=event, source=source, history=[])
+
+
+@pytest.fixture()
+def s1_delivered(agent_home, tmp_path, monkeypatch):
+    """Run the s1 prescheduled shape up to the scheduled delivery."""
+    from cron import scheduler
+
+    _sandbox_in_config(agent_home)
+    transcript = _management_session(agent_home)
+    _turn(_write("Outstanding_Cases_Update_v7.xlsx", "older v7: 99 blanks"))
+    reviewed = tmp_path / "media" / "pa204-am186-20260912" / "TGG_AM_186_case_review_12_Sep_2026.xlsx"
+    reviewed.parent.mkdir(parents=True)
+    reviewed.write_bytes(b"reviewed workbook: 47 blanks")
+    sent: list = []
+    job = _job(name="AM-186 review delivery")
+    with patch("urllib.request.urlopen", side_effect=_bridge_with_ids(sent)):
+        original = scheduler._deliver_result
+
+        def deliver(*args, **kwargs):
+            with patch("urllib.request.urlopen", side_effect=_bridge_with_ids(sent)):
+                return original(*args, **kwargs)
+
+        with patch("cron.scheduler._deliver_result", side_effect=deliver):
+            _run_and_deliver(
+                job, f"90 remain blank: 82 No update found, 8 Conflicting information.\nMEDIA:{reviewed}",
+                monkeypatch,
+            )
+    return {"transcript": transcript, "reviewed": reviewed, "sent": sent}
+
+
+def test_files_log_records_the_whatsapp_message_ids(s1_delivered, agent_home, tmp_path):
+    [entry] = [e for e in _files_log(agent_home) if e["direction"] == "scheduled_delivery"]
+    assert entry["message_id"] == DELIVERY_FILE_ID
+    assert entry["text_message_id"] == DELIVERY_TEXT_ID
+    assert entry["path"] == "work/sent/TGG_AM_186_case_review_12_Sep_2026.xlsx"
+
+    from gateway.durable_jsonl_consumer import _keep_sent_file_in_workspace
+
+    other = tmp_path / "live.xlsx"
+    other.write_bytes(b"live send")
+    _keep_sent_file_in_workspace(other, chat_id=MANAGEMENT_CHAT, message_id="3EB0LIVE")
+    assert _files_log(agent_home)[-1]["message_id"] == "3EB0LIVE"
+
+
+def test_scheduled_delivery_is_in_the_conversation_history(s1_delivered):
+    lines = [json.loads(l) for l in s1_delivered["transcript"].read_text().splitlines()]
+    delivery = lines[-1]
+    assert delivery["role"] == "assistant"
+    assert "Scheduled job 'AM-186 review delivery' delivered this to the chat at" in delivery["content"]
+    assert "90 remain blank" in delivery["content"]
+    assert "[Attached file: /work/sent/TGG_AM_186_case_review_12_Sep_2026.xlsx]" in delivery["content"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("quoted", [DELIVERY_TEXT_ID, DELIVERY_FILE_ID])
+async def test_quoting_the_delivery_names_the_delivered_file(s1_delivered, quoted):
+    text = await _krisleen(
+        "does this 90 blanks and 82 no update found + 8 conflicting information, the same?",
+        quoted=quoted,
+    )
+
+    assert (
+        "sent by the scheduled job 'AM-186 review delivery', which carried "
+        "/work/sent/TGG_AM_186_case_review_12_Sep_2026.xlsx.]"
+    ) in text
+    assert "[The sender is replying to your " in text
+    assert "v7" not in text
+
+
+@pytest.mark.asyncio
+async def test_quoting_a_message_without_a_file_record_adds_nothing(s1_delivered):
+    text = await _krisleen("how many blanks are there now?", quoted="3EB0UNRELATED")
+    assert "The sender is replying to" not in text
+    plain = await _krisleen("how many blanks are there now?")
+    assert "The sender is replying to" not in plain
+
+
+@pytest.mark.asyncio
+async def test_quoting_her_own_file_message_points_to_received(agent_home, tmp_path, monkeypatch):
+    _sandbox_in_config(agent_home)
+    document = tmp_path / "documents" / "Outstanding_Cases_Update_v5.xlsx"
+    document.parent.mkdir()
+    document.write_bytes(b"Krisleen's v5")
+    await _krisleen("here is the list", message_id="3EB0KRISDOC", document=document)
+
+    text = await _krisleen("use this one", quoted="3EB0KRISDOC", message_id="3EB0KRIS2")
+
+    assert "that sent you a file, now saved as /work/received/Outstanding_Cases_Update_v5.xlsx.]" in text
+    [entry] = _files_log(agent_home)
+    assert entry["message_id"] == "3EB0KRISDOC"
+
+
+def test_delivery_history_uses_the_real_session_database(agent_home):
+    from hermes_state import SessionDB
+    from cron.scheduler import _record_delivery_in_conversation
+
+    _management_session(agent_home)
+    db = SessionDB()
+    try:
+        db.create_session(session_id=MANAGEMENT_SESSION_ID, source="whatsapp")
+    finally:
+        db.close()
+
+    assert _record_delivery_in_conversation(
+        {"id": "j1", "name": "Review"}, LIVE_KEY,
+        {"text": "done", "files": [{"name": "r.xlsx", "workspace_path": "work/sent/r.xlsx"}]},
+    )
+    db = SessionDB()
+    try:
+        [message] = db.get_messages_as_conversation(MANAGEMENT_SESSION_ID)
+    finally:
+        db.close()
+    assert message["role"] == "assistant"
+    assert "[Attached file: /work/sent/r.xlsx]" in message["content"]
+    assert not _record_delivery_in_conversation({"id": "j2"}, "no-such-key", {"text": "x"})

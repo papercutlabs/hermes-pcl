@@ -1462,6 +1462,101 @@ def record_workspace_file(
     return f"work/{relative}"
 
 
+def workspace_files_for_message(
+    message_id: str, *, chat_id: str | None = None
+) -> list[dict[str, Any]]:
+    """Files-log entries carried by one WhatsApp message.
+
+    An entry matches on the message that carried the file (``message_id``)
+    or on the text message of the same delivery (``text_message_id``).
+    Empty when there is no agent workspace or no record.
+    """
+    wanted = str(message_id or "").strip()
+    if not wanted or not agent_workspace_enabled():
+        return []
+    log_path = (
+        get_hermes_home()
+        / "sandbox_workspaces"
+        / _workspace_key(AGENT_WORKSPACE_OWNER)
+        / "work"
+        / FILES_LOG_NAME
+    )
+    if log_path.is_symlink() or not log_path.is_file():
+        return []
+    found: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    with log_path.open(encoding="utf-8") as handle:
+        for line in handle:
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(entry, dict):
+                continue
+            if wanted not in {
+                str(entry.get("message_id") or ""),
+                str(entry.get("text_message_id") or ""),
+            }:
+                continue
+            if chat_id and entry.get("chat_id") and str(entry["chat_id"]) != str(chat_id):
+                continue
+            if entry.get("path") in seen:
+                continue
+            seen.add(str(entry.get("path")))
+            found.append(entry)
+    return found
+
+
+def _local_time_label(at: str) -> str:
+    from datetime import datetime, timezone
+
+    try:
+        moment = datetime.strptime(at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return ""
+    try:
+        from hermes_time import get_timezone
+
+        zone = get_timezone()
+    except Exception:
+        zone = None
+    local = moment.astimezone(zone) if zone is not None else moment.astimezone()
+    return f"{local:%H:%M} on {local.day} {local:%b}"
+
+
+def describe_quoted_workspace_files(
+    message_id: str, *, chat_id: str | None = None
+) -> str | None:
+    """Plain context for a turn that quotes a message which carried a file.
+
+    Information for the model, not a rule.  ``None`` when the quoted message
+    has no file record.
+    """
+    entries = workspace_files_for_message(message_id, chat_id=chat_id)
+    if not entries:
+        return None
+    first = entries[0]
+    when = _local_time_label(str(first.get("at") or ""))
+    at_text = f" {when}" if when else ""
+    paths = ", ".join(f"/{entry['path']}" for entry in entries if entry.get("path"))
+    direction = str(first.get("direction") or "")
+    if direction == "received":
+        return (
+            f"[The sender is replying to an earlier{at_text} message in this chat "
+            f"that sent you a file, now saved as {paths}.]"
+        )
+    if direction == "scheduled_delivery":
+        job = str(first.get("scheduled_job_name") or first.get("scheduled_job_id") or "")
+        by = f" by the scheduled job '{job}'" if job else " by a scheduled job"
+        return (
+            f"[The sender is replying to your{at_text} delivery, sent{by}, "
+            f"which carried {paths}.]"
+        )
+    return (
+        f"[The sender is replying to your{at_text} message, which carried {paths}.]"
+    )
+
+
 def _prune_workspaces(
     root: Path,
     config: Mapping[str, Any],

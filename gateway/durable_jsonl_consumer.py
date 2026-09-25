@@ -3697,7 +3697,9 @@ def _resolve_captured_media_path(
     return resolved
 
 
-def _keep_sent_file_in_workspace(path: Path, *, chat_id: str) -> None:
+def _keep_sent_file_in_workspace(
+    path: Path, *, chat_id: str, message_id: str = ""
+) -> None:
     """Keep a file Christopher sent in the agent workspace (PA-203 round 2).
 
     A sandbox file is already there and is only logged; a retained-media or
@@ -3708,7 +3710,10 @@ def _keep_sent_file_in_workspace(path: Path, *, chat_id: str) -> None:
         from tools.python_sandbox_tool import record_workspace_file
 
         record_workspace_file(
-            path, direction="sent", folder="sent", details={"chat_id": chat_id}
+            path,
+            direction="sent",
+            folder="sent",
+            details={"chat_id": chat_id, "message_id": message_id},
         )
     except Exception as exc:
         print(
@@ -4366,7 +4371,11 @@ def deliver_management_replies(
                 )
                 summary["delivered"] += 1
                 if send.get("send_kind", "text") == "media":
-                    _keep_sent_file_in_workspace(media_path, chat_id=chat_id)
+                    _keep_sent_file_in_workspace(
+                        media_path,
+                        chat_id=chat_id,
+                        message_id=str(payload.get("messageId") or ""),
+                    )
                 if send.get("send_kind", "text") == "media" and send.get("caption"):
                     media_caption_delivered.add((chat_id, str(anchor)))
             else:

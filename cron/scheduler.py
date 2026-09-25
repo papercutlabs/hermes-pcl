@@ -636,8 +636,13 @@ def _deliver_whatsapp_via_tgg_reply_bridge(
     *,
     workspace_owner: str | None = None,
     allowed_work_paths: set[str] | None = None,
+    receipt: dict | None = None,
 ) -> Optional[str]:
     """Deliver Christopher cron output through the durable consumer bridge.
+
+    ``receipt``, when given, is filled with what was actually delivered:
+    ``text_message_id`` and one ``files`` item per attachment with its
+    WhatsApp message id and its agent-workspace path (PA-203).
 
     Christopher deliberately has Hermes's ordinary WhatsApp adapter disabled:
     inbound capture and outbound policy live in the separate guarded bridge.
@@ -687,7 +692,10 @@ def _deliver_whatsapp_via_tgg_reply_bridge(
             raise ValueError("promoted media reference is unavailable")
         return resolved
 
+    last_message_id = {"value": ""}
+
     def post(endpoint: str, payload: dict) -> Optional[str]:
+        last_message_id["value"] = ""
         try:
             request = Request(
                 f"{bridge_url}/{endpoint}",
@@ -699,6 +707,7 @@ def _deliver_whatsapp_via_tgg_reply_bridge(
                 status = int(getattr(response, "status", 0) or 0)
                 body = json.loads(response.read() or b"{}")
             if status == 200 and body.get("success") is True:
+                last_message_id["value"] = str(body.get("messageId") or "")
                 return None
             return f"bridge {endpoint} outcome unconfirmed (http {status})"
         except HTTPError as exc:
@@ -716,10 +725,14 @@ def _deliver_whatsapp_via_tgg_reply_bridge(
                 f"by the sandbox or an existing /media/... reference ({exc})"
             )
 
+    delivered = receipt if receipt is not None else {}
+    delivered.setdefault("files", [])
     if text.strip():
         error = post("send", {"chatId": chat_id, "message": text})
         if error:
             return error
+        delivered["text"] = text
+        delivered["text_message_id"] = last_message_id["value"]
     for resolved_media, _is_voice in resolved_media_files:
         suffix = resolved_media.suffix.lower()
         media_type = (
@@ -735,11 +748,30 @@ def _deliver_whatsapp_via_tgg_reply_bridge(
         })
         if error:
             return error
-        _keep_delivered_file_in_workspace(job, chat_id, resolved_media)
+        delivered["files"].append(
+            {
+                "name": resolved_media.name,
+                "message_id": last_message_id["value"],
+                "workspace_path": _keep_delivered_file_in_workspace(
+                    job,
+                    chat_id,
+                    resolved_media,
+                    message_id=last_message_id["value"],
+                    text_message_id=str(delivered.get("text_message_id") or ""),
+                ),
+            }
+        )
     return None
 
 
-def _keep_delivered_file_in_workspace(job: dict, chat_id: str, path) -> None:
+def _keep_delivered_file_in_workspace(
+    job: dict,
+    chat_id: str,
+    path,
+    *,
+    message_id: str = "",
+    text_message_id: str = "",
+) -> Optional[str]:
     """Keep a file a scheduled job delivered in the agent workspace (PA-203).
 
     A job may attach a file it never built, such as an existing workbook at a
@@ -751,12 +783,14 @@ def _keep_delivered_file_in_workspace(job: dict, chat_id: str, path) -> None:
     try:
         from tools.python_sandbox_tool import record_workspace_file
 
-        record_workspace_file(
+        return record_workspace_file(
             path,
             direction="scheduled_delivery",
             folder="sent",
             details={
                 "chat_id": str(chat_id),
+                "message_id": message_id,
+                "text_message_id": text_message_id,
                 "scheduled_job_id": str(job.get("id") or ""),
                 "scheduled_job_name": str(job.get("name") or ""),
             },
@@ -767,6 +801,48 @@ def _keep_delivered_file_in_workspace(job: dict, chat_id: str, path) -> None:
             job.get("id", "?"),
             exc,
         )
+        return None
+
+
+def _record_delivery_in_conversation(
+    job: dict, conversation_session_key: str, receipt: dict
+) -> bool:
+    """Append a scheduled delivery to its Management conversation (PA-203).
+
+    The delivery is stored as an assistant message in the originating
+    conversation's history, the same way a normal reply is stored, so a
+    later turn sees what was sent, when, and which workspace file it was.
+    """
+    text = str(receipt.get("text") or "").strip()
+    files = list(receipt.get("files") or [])
+    if not text and not files:
+        return False
+    when = _hermes_now()
+    name = str(job.get("name") or job.get("id") or "scheduled job")
+    lines = [
+        f"[Scheduled job '{name}' delivered this to the chat at "
+        f"{when:%H:%M} on {when.day} {when:%b}.]"
+    ]
+    if text:
+        lines.append(text)
+    for item in files:
+        where = item.get("workspace_path")
+        lines.append(
+            f"[Attached file: /{where}]" if where else f"[Attached file: {item.get('name')}]"
+        )
+    try:
+        from gateway.mirror import mirror_to_session_key
+
+        return mirror_to_session_key(
+            conversation_session_key, "\n".join(lines), source_label="cron"
+        )
+    except Exception as exc:
+        logger.warning(
+            "Job '%s': delivery was not recorded in its conversation: %s",
+            job.get("id", "?"),
+            exc,
+        )
+        return False
 
 
 def _deliver_result(
@@ -778,6 +854,7 @@ def _deliver_result(
     workspace_owner: str | None = None,
     published_paths: set[str] | None = None,
     origin_may_attach_any: bool = True,
+    conversation_session_key: str | None = None,
 ) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
@@ -788,6 +865,9 @@ def _deliver_result(
     job's origin chat and only when ``origin_may_attach_any`` (a Management
     job); every other delivery may attach only the files this run's sandbox
     calls published.
+
+    ``conversation_session_key`` (PA-203) is the originating Management
+    conversation; a delivery to that origin chat is appended to its history.
 
     When ``adapters`` and ``loop`` are provided (gateway is running), tries to
     use the live adapter first — this supports E2EE rooms (e.g. Matrix) where
@@ -881,11 +961,13 @@ def _deliver_result(
                     str(origin_target.get("platform") or "").lower() == platform_name.lower()
                     and str(origin_target.get("chat_id") or "") == str(chat_id)
                 )
+                bridge_receipt: dict = {}
                 error = _deliver_whatsapp_via_tgg_reply_bridge(
                     job,
                     chat_id,
                     cleaned_delivery_content,
                     media_files,
+                    receipt=bridge_receipt,
                     workspace_owner=workspace_owner,
                     allowed_work_paths=(
                         None
@@ -894,6 +976,12 @@ def _deliver_result(
                         else set(published_paths)
                     ),
                 )
+                if to_origin and conversation_session_key:
+                    # Whatever reached the chat is recorded, even when a
+                    # later attachment in the same delivery failed.
+                    _record_delivery_in_conversation(
+                        job, conversation_session_key, bridge_receipt
+                    )
                 if error:
                     logger.error("Job '%s': %s", job["id"], error)
                     delivery_errors.append(error)
@@ -2182,6 +2270,7 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                                 else None
                             ),
                             origin_may_attach_any=management_owner is not None,
+                            conversation_session_key=management_owner,
                         )
                     except Exception as de:
                         delivery_error = str(de)
