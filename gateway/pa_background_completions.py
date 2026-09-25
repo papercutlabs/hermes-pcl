@@ -113,6 +113,13 @@ class CompletionStore:
         if not chat_id or not session_key:
             raise CompletionError("no originating chat and conversation")
         source = str(record.get("source") or source)
+        # Work started inside a completion turn answers the same original
+        # request: record Krisleen's inbound message ids, not the internal
+        # completion id the turn was driven by (r2d replay s3).
+        started_from = [str(v) for v in origin.get("source_message_ids") or [] if v]
+        origin["source_message_ids"] = self.original_source_ids(started_from)
+        if started_from != origin["source_message_ids"]:
+            origin["started_from_message_ids"] = started_from
         completion_id = str(record.get("delegation_id") or record.get("run_id") or "").strip()
         if not completion_id:
             raise CompletionError("background work has no identity")
@@ -292,6 +299,31 @@ class CompletionStore:
             return status
 
     # ── reads ───────────────────────────────────────────────────────────
+    def original_source_ids(self, message_ids: Sequence[str]) -> list[str]:
+        """Follow internal completion ids back to the original inbound ids.
+
+        A completion turn is driven by ``background-completion:<id>``; work it
+        starts inherits that completion's source, at any depth of nesting.
+        Composite ``id1+id2`` references are split.  Order is kept.
+        """
+        resolved: list[str] = []
+        seen: set[str] = set()
+        queue = [str(value) for value in message_ids if value]
+        while queue:
+            for part in queue.pop(0).split("+"):
+                part = part.strip()
+                if not part or part in seen:
+                    continue
+                seen.add(part)
+                if part.startswith(INTERNAL_PREFIX):
+                    parent = self.get(part[len(INTERNAL_PREFIX):])
+                    if parent is not None:
+                        parent_origin = json.loads(parent.get("origin_json") or "{}")
+                        queue.extend(str(v) for v in parent_origin.get("source_message_ids") or [] if v)
+                    continue
+                resolved.append(part)
+        return resolved
+
     def running(self, *, source: str | None = None) -> list[dict[str, Any]]:
         query = "SELECT * FROM background_completions WHERE status='running'"
         params: tuple[Any, ...] = ()
@@ -536,6 +568,17 @@ def _session_key_override(row: Mapping[str, Any], config_path: Path) -> str | No
     return key if key.startswith(namespace + ":") else None
 
 
+def _inbox_records(inbox: Any, message_ids: Sequence[str]) -> list[Any]:
+    """The ingress records among ``message_ids``; ids not in the inbox are skipped."""
+    records: list[Any] = []
+    for message_id in dict.fromkeys(message_ids):
+        try:
+            records.extend(inbox.message_id_selection([message_id]))
+        except Exception:
+            continue
+    return records
+
+
 async def process_claimed_completion(
     *,
     row: Mapping[str, Any],
@@ -553,14 +596,13 @@ async def process_claimed_completion(
     try:
         origin = json.loads(row.get("origin_json") or "{}")
         ids = [str(value) for value in origin.get("source_message_ids") or [] if value]
-        # A bundled turn may carry a composite "id1+id2" reference.
-        flat: list[str] = []
-        for value in ids:
-            flat.extend(part for part in value.split("+") if part)
+        # Follow any internal completion id back to the original request, and
+        # never require a synthetic id to exist in the ingress inbox.
+        flat = store.original_source_ids(ids)
         originals = [
-            record for record in inbox.message_id_selection(list(dict.fromkeys(flat)))
+            record for record in _inbox_records(inbox, flat)
             if record.chat_id == row["chat_id"]
-        ] if flat else []
+        ]
         if not originals:
             raise CompletionError("the original request is not in this consumer's inbox")
         internal_id = internal_message_id(completion_id)

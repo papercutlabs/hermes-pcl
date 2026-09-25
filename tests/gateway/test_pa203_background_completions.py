@@ -705,3 +705,127 @@ def test_active_workflow_runs_are_capped(tmp_path, workflow_env, monkeypatch):
     assert "already running" in json.loads(tool.workflow_start(script="output = 1", parent_agent=workflow_env.parent))["error"]
     with tool._active_lock:
         tool._active_runs.clear()
+
+
+# ── r2d replay s3: work started from a completion turn ───────────────────
+
+
+def test_source_chain_resolves_through_any_depth_of_completions(tmp_path):
+    store = background.CompletionStore(tmp_path / "inbox.db")
+    store.record_dispatch({"run_id": "wf-a", "source": "workflow", "origin": _origin(), "title": "a"})
+    nested = {**_origin(), "source_message_ids": ["background-completion:wf-a"]}
+    store.record_dispatch({"run_id": "wf-b", "source": "workflow", "origin": nested, "title": "b"})
+    deeper = {**_origin(), "source_message_ids": ["background-completion:wf-b+background-completion:wf-a"]}
+    store.record_dispatch({"delegation_id": "deleg_c", "origin": deeper, "goal": "c"})
+    for completion_id in ("wf-b", "deleg_c"):
+        origin = json.loads(store.get(completion_id)["origin_json"])
+        assert origin["source_message_ids"] == ["krisleen-request"]
+    assert sorted(store.original_source_ids(["background-completion:deleg_c", "x+background-completion:wf-b"])) == [
+        "krisleen-request", "x",
+    ]
+
+
+def test_workflow_started_from_a_completion_turn_delivers_one_reply(tmp_path, workflow_env, monkeypatch):
+    """A request starts a workflow; its completion turn starts a second one;
+    the second completion reaches the chat once, through retry and repeat."""
+    args = _setup_consumer(tmp_path)
+    tool = workflow_env.tool
+    inbox = durable.DurableInbox(Path(args.inbox))
+    store = background.CompletionStore(Path(args.inbox))
+    background.install_sink(store)
+    config = Path(args.config)
+
+    first = json.loads(tool.workflow_start(script=SCRIPT, title="first", parent_agent=workflow_env.parent))["run_id"]
+    assert _wait_for(lambda: first not in tool.active_workflow_ids())
+    assert background.maintain(store)["recorded"] == 1
+
+    base_env = {
+        "HERMES_SESSION_CHAT_ID": CHAT, "HERMES_SESSION_PLATFORM": "whatsapp",
+        "HERMES_SESSION_USER_NAME": "Krisleen", "HERMES_SESSION_PA_JOB_TYPE": "tgg_management",
+    }
+    started: dict[str, str] = {}
+    turns: list[str] = []
+
+    async def fake_process(records, **kwargs):
+        event = kwargs["replay_messages"][0]
+        turns.append(event["messageId"])
+        assert [r.message_id for r in records] == ["krisleen-request"]
+        if event["messageId"] == f"background-completion:{first}":
+            # The model starts a second workflow from inside this completion turn.
+            env = {**base_env, "HERMES_SESSION_SOURCE_MESSAGE_REFS": json.dumps([event["messageId"]])}
+            monkeypatch.setattr("gateway.session_context.get_session_env", lambda n, d="": env.get(n, d))
+            started["second"] = json.loads(tool.workflow_start(
+                script=SCRIPT, title="second", parent_agent=workflow_env.parent,
+            ))["run_id"]
+            text = "Checking the remaining cases now."
+        else:
+            text = "All 61 cases are checked; the list is below."
+        return {"provider_errors": [], "captured_outbound": [
+            {"kind": "send", "args": [CHAT, text], "kwargs": {}}],
+            "handled": [{"message_ids": [event["messageId"]], "turn_id": f"turn-{len(turns)}"}]}
+
+    monkeypatch.setattr(durable, "process_live_records", fake_process)
+    monkeypatch.setattr(durable, "_management_selector_chats", lambda _p: frozenset({CHAT}))
+    sent: list[dict] = []
+
+    class _Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return b'{"success": true, "messageId": "sent"}'
+
+    monkeypatch.setattr("urllib.request.urlopen", lambda req, timeout=30: sent.append(json.loads(req.data)) or _Response())
+    real_deliver = durable.deliver_management_replies
+    failures = {"left": 1}
+
+    def deliver_once_failing(inbox_, **kwargs):
+        if kwargs["completion"]["completion_id"] == started.get("second") and failures["left"]:
+            failures["left"] -= 1
+            raise OSError("bridge restarting")
+        return real_deliver(inbox_, **kwargs)
+
+    monkeypatch.setattr(durable, "deliver_management_replies", deliver_once_failing)
+    kwargs = dict(store=store, inbox=inbox, config_path=config, state_db=Path(args.state_db),
+                  gate_changed_at="2026-09-25T00:00:00Z", runner=object())
+
+    # First completion turn: starts the second workflow and replies once.
+    assert store.claim(first)
+    asyncio.run(background.process_claimed_completion(row=store.get(first), **kwargs))
+    second = started["second"]
+    assert json.loads(store.get(second)["origin_json"])["source_message_ids"] == ["krisleen-request"]
+    assert _wait_for(lambda: second not in tool.active_workflow_ids())
+    assert background.maintain(store)["recorded"] == 1
+
+    # Second completion: the first delivery attempt fails, the retry sends once.
+    assert store.claim(second)
+    with pytest.raises(OSError):
+        asyncio.run(background.process_claimed_completion(row=store.get(second), **kwargs))
+    assert store.get(second)["status"] == "delivering"
+    assert store.claim(second)
+    asyncio.run(background.process_claimed_completion(row=store.get(second), **kwargs))
+    assert store.get(second)["status"] == "completed"
+
+    finals = [s for s in sent if s["message"].startswith("All 61")]
+    assert len(finals) == 1
+    assert finals[0]["replyTo"]["messageId"] == "krisleen-request"
+    assert turns == [f"background-completion:{first}", f"background-completion:{second}"]
+
+    # Repeat safety: a completed row cannot be claimed again, and replaying
+    # its stored reply through delivery sends nothing new.
+    assert not store.claim(second)
+    row = store.get(second)
+    again = real_deliver(
+        inbox, config_path=config, captured_outbound=json.loads(row["outbound_json"]),
+        batch_records=inbox.message_id_selection(["krisleen-request"]),
+        gate_changed_at="2026-09-25T00:00:00Z", handled_groups=json.loads(row["handled_json"]),
+        completion={"completion_id": second, "original_message_id": "krisleen-request",
+                    "internal_message_id": f"background-completion:{second}"},
+    )
+    assert again["duplicate"] == 1 and again["delivered"] == 0
+    assert len([s for s in sent if s["message"].startswith("All 61")]) == 1

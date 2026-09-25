@@ -243,11 +243,15 @@ def _run(run_id: str, parent: Any, *, emit: bool) -> Dict[str, Any]:
         status = store.run_status(run_id)
     finally:
         _live_credentials.pop(run_id, None)
+    try:
+        # A paused run is still unfinished: no completion until it resumes and ends.
+        if emit and status.get("status") != "running":
+            _emit_completion(store, run_id, status)
+    finally:
+        # Free the slot only after the completion is queued, so nothing sees
+        # a finished run as neither active nor completed.
         with _active_lock:
             _active_runs.pop(run_id, None)
-    # A paused run is still unfinished: no completion until it resumes and ends.
-    if emit and status.get("status") != "running":
-        _emit_completion(store, run_id, status)
     return status
 
 
