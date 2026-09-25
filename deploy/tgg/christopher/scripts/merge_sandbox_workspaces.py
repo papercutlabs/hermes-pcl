@@ -9,8 +9,8 @@ changes no config and restarts nothing.  Run it as the Hermes user with
 ``HERMES_HOME`` set.
 
   check   read-only: earlier folders, their files and bytes, the names that
-          will be kept twice, and the merged size against ``scratch_mb``
-          (every sandbox run copies the whole folder into its /work).
+          will be kept twice, and the merged size against
+          ``limits.workspace_mb`` (runs are refused over it).
   apply   needs ``workspace: agent``: runs the merge, then proves that every
           file of every earlier folder is in the agent folder with the same
           bytes.  Earlier folders are never changed or removed.
@@ -75,7 +75,7 @@ def check() -> dict:
             folders.append(
                 {"folder": folder.name, "files": len(manifest), "bytes": _sizes(work, manifest)}
             )
-    scratch_mb = sandbox._limits(config)["scratch_mb"]
+    workspace_mb = sandbox._limits(config)["workspace_mb"]
     merged_bytes = sum(unique.values())
     return {
         "workspace_mode": sandbox._workspace_mode(config),
@@ -84,8 +84,8 @@ def check() -> dict:
         "earlier_folders": folders,
         "names_kept_twice": sorted(name for name, digests in by_name.items() if len(digests) > 1),
         "merged_bytes": merged_bytes,
-        "scratch_mb": scratch_mb,
-        "under_half_scratch": merged_bytes < scratch_mb * 1024 * 1024 // 2,
+        "workspace_mb": workspace_mb,
+        "under_half_limit": merged_bytes < workspace_mb * 1024 * 1024 // 2,
     }
 
 
