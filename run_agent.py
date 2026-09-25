@@ -11044,6 +11044,18 @@ class AIAgent:
         finally:
             self._executing_tools = False
 
+    def _dispatch_pa_workflow(self, function_name: str, function_args: dict) -> str:
+        """PA-203 workflow runner tools need their parent agent, like delegate_task."""
+        from tools.pa_workflow_tool import workflow_start, workflow_status
+        if function_name == "workflow_start":
+            return workflow_start(
+                script=function_args.get("script") or "",
+                title=function_args.get("title"),
+                wait=function_args.get("wait"),
+                parent_agent=self,
+            )
+        return workflow_status(run_id=function_args.get("run_id"), parent_agent=self)
+
     def _dispatch_delegate_task(self, function_args: dict) -> str:
         """Single call site for delegate_task dispatch.
 
@@ -11143,6 +11155,8 @@ class AIAgent:
             )
         elif function_name == "delegate_task":
             return self._dispatch_delegate_task(function_args)
+        elif function_name in ("workflow_start", "workflow_status"):
+            return self._dispatch_pa_workflow(function_name, function_args)
         else:
             call_kwargs = {
                 "tool_call_id": tool_call_id,
@@ -11810,6 +11824,9 @@ class AIAgent:
                         spinner.stop(cute_msg)
                     elif self._should_emit_quiet_tool_messages():
                         self._vprint(f"  {cute_msg}")
+            elif function_name in ("workflow_start", "workflow_status"):
+                function_result = self._dispatch_pa_workflow(function_name, function_args)
+                tool_duration = time.time() - tool_start_time
             elif self._context_engine_tool_names and function_name in self._context_engine_tool_names:
                 # Context engine tools (lcm_grep, lcm_describe, lcm_expand, etc.)
                 spinner = None

@@ -279,6 +279,14 @@ TOOLSETS = {
         "includes": []
     },
 
+    # PA-203 round 2: the workflow runner (agent/pa_workflow.py via
+    # tools/pa_workflow_tool.py); available only on the scoped TGG Management route.
+    "pa-workflow": {
+        "description": "Run a large read-only review as one recorded workflow of fixed-kind helpers",
+        "tools": ["workflow_start", "workflow_status"],
+        "includes": []
+    },
+
     # "honcho" toolset removed — Honcho is now a memory provider plugin.
     # Tools are injected via MemoryManager, not the toolset system.
 

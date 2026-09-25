@@ -4122,6 +4122,7 @@ def deliver_management_replies(
     gate_changed_at: str,
     handled_groups: Sequence[Mapping[str, Any]],
     continuation: Mapping[str, Any] | None = None,
+    completion: Mapping[str, Any] | None = None,
 ) -> dict[str, int]:
     """Deliver mgmt-selector responses through the rung-gated bridge.
 
@@ -4151,6 +4152,17 @@ def deliver_management_replies(
             str(continuation.get("internal_message_id") or ""),
         ):
             raise ConsumerError("management continuation internal turn identity invalid")
+    if completion is not None:
+        # PA-203 round 2: a background-completion turn replies to the original
+        # request under its own delivery key, so the original turn's earlier
+        # reply to the same message cannot suppress it.  Files may be sent.
+        if set(completion) != {"completion_id", "original_message_id", "internal_message_id"} or not (
+            completion.get("completion_id") and completion.get("original_message_id")
+        ) or str(completion.get("internal_message_id") or "") != (
+            f"background-completion:{completion['completion_id']}"
+        ):
+            raise ConsumerError("background completion delivery identity invalid")
+    anchored = continuation if continuation is not None else completion
 
     summary = {"delivered": 0, "undelivered": 0, "suppressed": 0, "duplicate": 0}
     sends: list[dict[str, Any]] = []
@@ -4205,8 +4217,8 @@ def deliver_management_replies(
             summary["suppressed"] += 1
             continue
         anchor = send["reply_to"] or newest_message_by_chat.get(chat_id)
-        if continuation is not None:
-            anchor = str(continuation["original_message_id"])
+        if anchored is not None:
+            anchor = str(anchored["original_message_id"])
         if anchor and "+" in str(anchor) and anchor not in handled_message_ids:
             # A multi-message WhatsApp turn bundle carries a synthetic
             # composite id ("id1+id2+..."; platforms/whatsapp.py join). The
@@ -4228,8 +4240,8 @@ def deliver_management_replies(
             anchor_item.get("timestamp") if anchor_item else None
         )
         handled_anchor = (
-            str(continuation["internal_message_id"])
-            if continuation is not None and continuation.get("internal_message_id")
+            str(anchored["internal_message_id"])
+            if anchored is not None and anchored.get("internal_message_id")
             else anchor
         )
         if (
@@ -4238,7 +4250,7 @@ def deliver_management_replies(
             or anchor_record is None
             or anchor_record.chat_id != chat_id
             or anchor_epoch is None
-            or (continuation is None and anchor_epoch < gate_epoch)
+            or (anchored is None and anchor_epoch < gate_epoch)
         ):
             summary["suppressed"] += 1
             continue
@@ -4306,9 +4318,11 @@ def deliver_management_replies(
             delivery_key = f"{chat_id}::{anchor or 'no-anchor'}"
         if continuation is not None:
             delivery_key = f"continuation::{continuation['list_id']}::{delivery_key}"
+        elif completion is not None:
+            delivery_key = f"completion::{completion['completion_id']}::{delivery_key}"
         if not inbox.claim_reply_delivery(
             delivery_key, chat_id=chat_id, reply_to_message_id=anchor,
-            **({"correlation": dict(continuation)} if continuation is not None else {}),
+            **({"correlation": dict(anchored)} if anchored is not None else {}),
         ):
             summary["duplicate"] += 1
             continue
@@ -5541,6 +5555,39 @@ async def _process_claimed_management_continuation(
             print(f"management continuation FAILED: {exc}", file=sys.stderr)
 
 
+async def _process_background_completion(
+    *,
+    row: Mapping[str, Any],
+    store: Any,
+    inbox: DurableInbox,
+    config_path: Path,
+    state_db: Path,
+    gate_changed_at: str,
+    runner: Any,
+    activity_lock_file: Path | None,
+) -> None:
+    """Run one claimed background completion under the ordinary activity lock."""
+    from gateway.pa_background_completions import process_claimed_completion
+
+    with SharedActivityLock(activity_lock_file):
+        try:
+            outcome = await process_claimed_completion(
+                row=row,
+                store=store,
+                inbox=inbox,
+                config_path=config_path,
+                state_db=state_db,
+                gate_changed_at=gate_changed_at,
+                runner=runner,
+            )
+            print(f"background completion turn: {outcome}", file=sys.stderr)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # The store kept the row pending (or failed after its retry limit).
+            print(f"background completion FAILED: {exc}", file=sys.stderr)
+
+
 async def run_consumer(args: argparse.Namespace) -> int:
     config_path = Path(args.config).resolve()
     source = Path(args.source).resolve()
@@ -5564,6 +5611,13 @@ async def run_consumer(args: argparse.Namespace) -> int:
     with SingletonLock(Path(args.lock_file).resolve()):
         recovery = inbox.reconcile_orphan_processing(state_db)
         expected_total = inbox.assert_and_record_conservation()
+        # PA-203 round 2: this process, not the gateway watcher, owns the
+        # return path of background work started from its turns.
+        from gateway import pa_background_completions as background
+
+        completion_store, completion_recovery, restore_completion_sink = (
+            background.start_for_consumer(inbox.db_path, state_db)
+        )
         runner: Any | None = None
         continuation_session_db: Any | None = None
         continuation_config: Any | None = None
@@ -5625,6 +5679,8 @@ async def run_consumer(args: argparse.Namespace) -> int:
                 gate = processing_gate_state(gate_path)
                 gate_enabled = gate["enabled"] is True
                 projection_enabled = _source_projection_config(config_path) is not None
+                # Keep every finished background result durable, even in standby.
+                background.maintain(completion_store)
 
                 # Capture staging and its Systems projection are independent
                 # from the business/model gate.  A paused Christopher must not
@@ -5703,6 +5759,10 @@ async def run_consumer(args: argparse.Namespace) -> int:
                             "oldest_active_claim": inbox.oldest_processing_updated_at(),
                             "state_total": expected_total,
                             "startup_recovery": recovery,
+                            "background_completions": {
+                                **completion_store.counts(),
+                                "startup_recovery": completion_recovery,
+                            },
                             "inbox": counts,
                         },
                     )
@@ -5812,6 +5872,10 @@ async def run_consumer(args: argparse.Namespace) -> int:
                         "oldest_active_claim": inbox.oldest_processing_updated_at(),
                         "state_total": expected_total,
                         "startup_recovery": recovery,
+                        "background_completions": {
+                            **completion_store.counts(),
+                            "startup_recovery": completion_recovery,
+                        },
                         "inbox": inbox.counts(),
                     },
                 )
@@ -5928,6 +5992,28 @@ async def run_consumer(args: argparse.Namespace) -> int:
                     )
                     lanes[chat_id] = "management"
 
+                # A finished background result is one ordinary turn in its
+                # conversation, taken only when that chat is otherwise idle.
+                completion_row = completion_store.next_pending(exclude_chats=set(tasks))
+                if completion_row is not None and runner is None:
+                    runner = _new_gateway_runner(config_path)
+                if completion_row is not None and completion_store.claim(
+                    str(completion_row["completion_id"])
+                ):
+                    tasks[completion_row["chat_id"]] = asyncio.create_task(
+                        _process_background_completion(
+                            row=completion_row,
+                            store=completion_store,
+                            inbox=inbox,
+                            config_path=config_path,
+                            state_db=state_db,
+                            gate_changed_at=gate_changed_at,
+                            runner=runner,
+                            activity_lock_file=activity_lock_file,
+                        )
+                    )
+                    lanes[completion_row["chat_id"]] = "management"
+
                 if not demo_management_only:
                     for chat_id, records in selected_site_batches:
                         tasks[chat_id] = asyncio.create_task(
@@ -6016,6 +6102,10 @@ async def run_consumer(args: argparse.Namespace) -> int:
                             "oldest_active_claim": inbox.oldest_processing_updated_at(),
                             "state_total": expected_total,
                             "startup_recovery": recovery,
+                            "background_completions": {
+                                **completion_store.counts(),
+                                "startup_recovery": completion_recovery,
+                            },
                             "inbox": counts,
                         },
                     )
@@ -6071,6 +6161,10 @@ async def run_consumer(args: argparse.Namespace) -> int:
                         "oldest_active_claim": inbox.oldest_processing_updated_at(),
                         "state_total": expected_total,
                         "startup_recovery": recovery,
+                        "background_completions": {
+                            **completion_store.counts(),
+                            "startup_recovery": completion_recovery,
+                        },
                         "inbox": counts,
                     },
                 )
@@ -6086,6 +6180,7 @@ async def run_consumer(args: argparse.Namespace) -> int:
             raise
         finally:
             _stop_cron_ticker(cron_stop, cron_thread)
+            restore_completion_sink()
             if continuation_session_db is not None:
                 continuation_session_db.close()
 

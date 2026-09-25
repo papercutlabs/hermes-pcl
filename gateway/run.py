@@ -1914,7 +1914,9 @@ def _drain_gateway_watch_events(completion_queue) -> "list[dict]":
         evt_type = evt.get("type", "completion")
         if evt_type in {"watch_match", "watch_disabled"}:
             watch_events.append(evt)
-        elif evt_type == "async_delegation":
+        elif evt_type in {"async_delegation", "workflow_run"}:
+            # PA-203 round 2: a workflow run's one completion is owned by the
+            # durable consumer's drain (gateway/pa_background_completions.py).
             requeue.append(evt)
         # else: process completion events are handled by the watcher task
     for evt in requeue:
