@@ -156,7 +156,9 @@ def inspect_reader_work_scope(
     workspace = work.parent
     workspace_root = workspace.parent
     expected_root = home / "sandbox_workspaces"
-    valid_work_name = work.name == "work" or (
+    # ``records`` is the agent workspace's host-written records folder
+    # (PA-203); the reader reads sent files from it.
+    valid_work_name = work.name in {"work", "records"} or (
         work.name.startswith(".work-") and work.name.endswith(".tmp")
     )
     if (

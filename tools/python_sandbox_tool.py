@@ -63,6 +63,8 @@ DEFAULTS = {
     # Size limit of the one agent workspace (``workspace: agent``), which is
     # mounted directly at /work instead of a tmpfs capped by scratch_mb.
     "workspace_mb": 2048,
+    # Stop or refuse an agent-mode run when the host disk has less free space.
+    "min_free_mb": 1024,
 }
 STDOUT_CAP = 16 * 1024
 STDERR_CAP = 4 * 1024
@@ -78,8 +80,8 @@ _WORKSPACE_LOCK_FILE = ".publish.lock"
 AGENT_WORKSPACE_OWNER = "hermes-agent-workspace"
 # Beside ``work/``: which earlier per-conversation folders were merged in.
 _MERGE_RECORD_FILE = ".merged-workspaces.json"
-# Inside ``work/``: one JSON line per file received, sent or delivered.
-FILES_LOG_NAME = "files-log.jsonl"
+# One JSON line per file received, sent or delivered.
+FILES_LOG_NAME = "files-log.jsonl"  # lives in records/, beside work/
 _LEGACY_WORKSPACE_RE = re.compile(r"^s_[0-9a-f]{64}$")
 _EXPORT_COMPLETE = ".hermes-export-complete"
 # A runtime-derived workspace owner bound by trusted scheduler code.  It is
@@ -129,7 +131,9 @@ completed = subprocess.run(
 
 # Writable sqlite datasets are run inputs, not output artifacts. Remove the
 # reserved copies after the payload exits so they are not exported or promoted.
-for name in json.loads(sys.argv[3]):
+# In direct mode the copies live on the per-run /scratch tmpfs instead.
+direct = len(sys.argv) >= 5 and sys.argv[4] == "direct"
+for name in [] if direct else json.loads(sys.argv[3]):
     try:
         os.unlink(f"/work/{name}.db")
     except FileNotFoundError:
@@ -372,6 +376,7 @@ def _generate_init_script(
     strip_seed_metadata: bool = False,
     *,
     direct_work: Path | None = None,
+    direct_records: Path | None = None,
 ) -> str:
     """Generate the mount plan executed as namespace-root.
 
@@ -428,6 +433,15 @@ def _generate_init_script(
     if direct_work is not None:
         lines.append(f'mount --bind {_q(direct_work)} "$JAIL/work"')
         lines.append('mount -o remount,bind,nosuid,nodev,noexec "$JAIL/work"')
+        # Records (received, sent, files log) are read-only to sandbox code;
+        # sqlite dataset copies, TMPDIR and HOME live on a per-run tmpfs.
+        lines.append('mkdir -p "$JAIL/records" "$JAIL/scratch"')
+        if direct_records is not None:
+            lines.append(f'ro_dir {_q(direct_records)} "$JAIL/records"')
+        lines.append(
+            f'mount -t tmpfs -o size={int(scratch_mb)}m,nosuid,nodev,noexec '
+            'tmpfs "$JAIL/scratch"'
+        )
     else:
         lines.append(
             f'mount -t tmpfs -o size={int(scratch_mb)}m,nosuid,nodev,noexec '
@@ -445,7 +459,11 @@ def _generate_init_script(
         lines.append('rm -f "$JAIL/work/result.json"')
     for name, source in mounts.items():
         if name in sqlite_datasets:
-            target = f'"$JAIL/work/{name}.db"'
+            target = (
+                f'"$JAIL/scratch/{name}.db"'
+                if direct_work is not None
+                else f'"$JAIL/work/{name}.db"'
+            )
             lines.append(f"cp {_q(source)} {target}")
             lines.append(f"chmod 600 {target}")
             continue
@@ -490,8 +508,11 @@ def _build_env(
     source_env: Mapping[str, str] | None = None,
     *,
     sqlite_datasets: set[str] | None = None,
+    direct: bool = False,
 ) -> dict[str, str]:
     source = dict(source_env or os.environ)
+    # Direct mode: scratch files never land in the persistent folder.
+    scratch = "/scratch" if direct else "/work"
     # Do not inherit execute_code's configurable passthrough allowlist here:
     # this boundary is deliberately fixed and credential-blind.
     sqlite_datasets = set(sqlite_datasets or ())
@@ -500,7 +521,7 @@ def _build_env(
         "SANDBOX_INPUTS": json.dumps(
             {
                 name: (
-                    f"/work/{name}.db"
+                    f"{scratch}/{name}.db"
                     if name in sqlite_datasets
                     else str(python_sandbox_dataset_path(name))
                 )
@@ -509,8 +530,8 @@ def _build_env(
             sort_keys=True,
         ),
         "RESULT_PATH": "/work/result.json",
-        "TMPDIR": "/work",
-        "HOME": "/work",
+        "TMPDIR": scratch,
+        "HOME": scratch,
         "TZ": source.get("HERMES_TIMEZONE", "UTC"),
         "LANG": "C.UTF-8",
         "PYTHONIOENCODING": "utf-8",
@@ -889,13 +910,18 @@ def resolve_sandbox_work_path(raw_path: Any, workspace_owner: str) -> Path:
     if agent_workspace_enabled(config):
         # One folder for everything: bring earlier folders in first so a
         # file made before the move still resolves at its old path.
-        owner = AGENT_WORKSPACE_OWNER
         try:
-            ensure_agent_workspace(config)
+            ensure_agent_workspace(config, timeout=5.0)
         except (OSError, RuntimeError):
             # Resolution still answers from the agent folder as it stands;
             # the merge is retried by the next caller.
             logger.exception("Could not merge earlier sandbox workspaces")
+        from tools.pa_agent_workspace import capture_work_file
+
+        # The owner is the requesting context.  The version is fixed now,
+        # read without following links, and recorded against it.
+        path, _sha = capture_work_file(text, owner)
+        return path
     if not owner:
         raise ValueError("sandbox workspace owner is unavailable")
     if text.startswith("/work/"):
@@ -974,6 +1000,16 @@ def current_workspace_owner(fallback: str | None = None) -> str:
     """
     if agent_workspace_enabled():
         return AGENT_WORKSPACE_OWNER
+    return current_run_context(fallback)
+
+
+def current_run_context(fallback: str | None = None) -> str:
+    """Which conversation or job this task works for.
+
+    A scheduler-bound owner, then the gateway's stable ``HERMES_SESSION_KEY``,
+    then the caller's fallback.  In agent mode it keys the record of which
+    context produced, captured and may send which version of a file.
+    """
     bound = _BOUND_WORKSPACE_OWNER.get().strip()
     if bound:
         return bound
@@ -986,7 +1022,9 @@ def current_workspace_owner(fallback: str | None = None) -> str:
 
 
 @contextmanager
-def _workspace_lock(session_id: str, workspace: Path) -> Iterator[None]:
+def _workspace_lock(
+    session_id: str, workspace: Path, timeout: float | None = None
+) -> Iterator[None]:
     """Hold one workspace's publication lock across threads and processes.
 
     The lock covers only the short seed snapshot and the per-file publication,
@@ -998,7 +1036,10 @@ def _workspace_lock(session_id: str, workspace: Path) -> Iterator[None]:
     key = str(workspace)
     with _WORKSPACE_LOCKS_GUARD:
         thread_lock = _WORKSPACE_LOCKS.setdefault(key, threading.Lock())
-    with thread_lock:
+    deadline = None if timeout is None else time.monotonic() + timeout
+    if not thread_lock.acquire(timeout=-1 if timeout is None else max(0.0, timeout)):
+        raise TimeoutError("the sandbox workspace is busy")
+    try:
         workspace.mkdir(parents=True, exist_ok=True, mode=0o700)
         if fcntl is None:  # pragma: no cover - sandbox is Linux-only
             yield
@@ -1009,13 +1050,25 @@ def _workspace_lock(session_id: str, workspace: Path) -> Iterator[None]:
             0o600,
         )
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
-            yield
-        finally:
+            if deadline is None:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+            else:
+                while True:
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError("the sandbox workspace is busy") from None
+                        time.sleep(0.2)
             try:
-                fcntl.flock(fd, fcntl.LOCK_UN)
+                yield
             finally:
-                os.close(fd)
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+    finally:
+        thread_lock.release()
 
 
 def _work_manifest(
@@ -1374,6 +1427,7 @@ def _merge_legacy_workspaces_locked(
 
 def ensure_agent_workspace(
     config: Mapping[str, Any] | None = None,
+    timeout: float | None = None,
 ) -> Path | None:
     """Return the agent workspace ``work/`` folder, merging earlier folders.
 
@@ -1392,7 +1446,7 @@ def ensure_agent_workspace(
         # folder (runs in agent mode hold the lock for their whole length).
         return workspace / "work"
     reader_uid = configured_reader_uid(config)
-    with _workspace_lock(AGENT_WORKSPACE_OWNER, workspace):
+    with _workspace_lock(AGENT_WORKSPACE_OWNER, workspace, timeout=timeout):
         _merge_legacy_workspaces_locked(
             workspace_root, workspace, hermes_home=hermes_home, reader_uid=reader_uid
         )
@@ -1417,11 +1471,6 @@ def _unmerged_legacy_folders(workspace_root: Path, workspace: Path) -> bool:
     )
 
 
-def _safe_import_name(name: str) -> str:
-    cleaned = re.sub(r"[^\w.\- ]", "_", Path(str(name or "")).name).strip(" .")
-    return cleaned or "file"
-
-
 def record_workspace_file(
     source: str | Path,
     *,
@@ -1430,173 +1479,133 @@ def record_workspace_file(
     name: str | None = None,
     details: Mapping[str, Any] | None = None,
 ) -> str | None:
-    """Keep one file that came in or went out in the agent workspace.
+    """Keep one file that came in or went out in the agent workspace records.
 
-    ``source`` is a host file.  When it already lives in the agent folder it
-    is not copied; otherwise it is copied to ``work/<folder>/<name>`` with the
-    publication rules, so an existing different file of that name keeps its
-    name and this one is saved beside it.  Either way one line is appended to
-    ``work/files-log.jsonl`` saying what the file is, which way it moved,
-    when, and where it is now.  Returns the ``work/...`` path, or ``None``
-    when the deployment has no agent workspace.
+    The canonical copy goes to ``records/<folder>/`` beside ``work/``, which
+    sandbox code sees read-only at ``/records``; the files log is there too.
+    Returns the ``records/...`` path, or ``None`` without an agent workspace.
+    Takes only the short records lock, never the sandbox run lock.
     """
-    config = _load_config()
-    if not agent_workspace_enabled(config):
+    if not agent_workspace_enabled():
         return None
-    source_path = Path(source)
-    if source_path.is_symlink() or not source_path.is_file():
-        raise ValueError("workspace import source is not a regular file")
-    hermes_home = get_hermes_home()
-    workspace_root = hermes_home / "sandbox_workspaces"
-    workspace = workspace_root / _workspace_key(AGENT_WORKSPACE_OWNER, config)
-    work = workspace / "work"
-    reader_uid = configured_reader_uid(config)
-    digest = hashlib.sha256()
-    with source_path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    sha256 = digest.hexdigest()
-    display_name = _safe_import_name(name or source_path.name)
-    tag = f"i_{uuid.uuid4().hex[:8]}"
-    staging_root = hermes_home / "sandbox_runs" / tag
-    with _workspace_lock(AGENT_WORKSPACE_OWNER, workspace):
-        _merge_legacy_workspaces_locked(
-            workspace_root, workspace, hermes_home=hermes_home, reader_uid=reader_uid
-        )
-        work.mkdir(parents=True, exist_ok=True, mode=0o700)
-        resolved = source_path.resolve()
-        if resolved.is_relative_to(work.resolve()):
-            relative = resolved.relative_to(work.resolve()).as_posix()
-        else:
-            relative = f"{folder.strip('/')}/{display_name}"
-            staged_work = staging_root / "work"
-            try:
-                (staged_work / relative).parent.mkdir(
-                    parents=True, exist_ok=True, mode=0o700
-                )
-                shutil.copyfile(source_path, staged_work / relative)
-                if _work_manifest(staged_work).get(relative) != sha256:
-                    raise OSError("workspace import changed while copying")
-                outcome = _publish_workspace(
-                    staged_work,
-                    work,
-                    {},
-                    run_id=tag,
-                    hermes_home=hermes_home,
-                    reader_uid=reader_uid,
-                )
-            finally:
-                shutil.rmtree(staging_root, ignore_errors=True)
-            if relative in outcome.get("unpublished", []):
-                raise OSError("workspace import could not be saved")
-            relative = (outcome.get("renamed") or {}).get(relative, relative)
-        entry = {
-            "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "direction": direction,
-            "path": f"work/{relative}",
-            "name": display_name,
-            "sha256": sha256,
-            **{key: value for key, value in dict(details or {}).items() if value},
-        }
-        log_path = work / FILES_LOG_NAME
-        if log_path.is_symlink() or (log_path.exists() and not log_path.is_file()):
-            raise OSError("workspace files log is not a regular file")
-        with open(
-            log_path,
-            "a",
-            encoding="utf-8",
-            opener=lambda path, flags: os.open(
-                path, flags | getattr(os, "O_NOFOLLOW", 0), 0o600
-            ),
-        ) as handle:
-            handle.write(json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n")
-        if reader_uid is not None:
-            grant_reader_work_access(hermes_home, work, reader_uid)
-    return f"work/{relative}"
+    from tools.pa_agent_workspace import keep_file
+
+    return keep_file(
+        source, direction=direction, folder=folder, name=name, details=details
+    )
 
 
-def _folder_bytes(work: Path) -> int:
-    """Bytes held by the regular files under ``work`` (links not followed)."""
-    total = 0
-    for current, _dirs, files in os.walk(work, followlinks=False):
-        for name in files:
-            try:
-                metadata = os.lstat(os.path.join(current, name))
-            except OSError:
-                continue
-            if stat.S_ISREG(metadata.st_mode):
-                total += metadata.st_size
-    return total
+def _prepare_agent_run(
+    workspace: Path, config: Mapping[str, Any]
+) -> str | tuple[dict[str, dict[str, Any]], int]:
+    """Check and index the agent folder before a run; the caller holds the lock.
 
-
-def _stat_manifest(work: Path) -> dict[str, tuple[int, int, int]]:
-    """Cheap change signature (size, mtime, inode) of each regular file."""
-    manifest: dict[str, tuple[int, int, int]] = {}
-    for current, _dirs, files in os.walk(work, followlinks=False):
-        for name in files:
-            path = os.path.join(current, name)
-            try:
-                metadata = os.lstat(path)
-            except OSError:
-                continue
-            if stat.S_ISREG(metadata.st_mode) and name != "result.json":
-                relative = Path(path).relative_to(work).as_posix()
-                manifest[relative] = (
-                    metadata.st_size,
-                    metadata.st_mtime_ns,
-                    metadata.st_ino,
-                )
-    return manifest
-
-
-def _confine_work_tree(work: Path) -> list[str]:
-    """Keep only real directories and regular files under ``work``.
-
-    Symlinks and special files are removed; a regular file with more than one
-    hard link is replaced by a private copy, so nothing in the folder can
-    point at, or share an inode with, anything outside it.  Returns the
-    relative paths that were removed or unlinked.
+    Returns a refusal message, or the pre-run index and the size the run may
+    grow the folder to.  A folder that cannot be inspected is quarantined.
     """
-    removed: list[str] = []
-    for current, dirnames, filenames in os.walk(work, topdown=True, followlinks=False):
-        current_path = Path(current)
-        for name in list(dirnames):
-            path = current_path / name
-            if path.is_symlink():
-                path.unlink()
-                dirnames.remove(name)
-                removed.append(path.relative_to(work).as_posix())
-        for name in filenames:
-            path = current_path / name
-            try:
-                metadata = path.lstat()
-            except OSError:
-                continue
-            if not stat.S_ISREG(metadata.st_mode):
-                path.unlink()
-                removed.append(path.relative_to(work).as_posix())
-            elif metadata.st_nlink > 1:
-                private = path.with_name(f".{name}.{uuid.uuid4().hex}.unlink")
-                shutil.copy2(path, private, follow_symlinks=False)
-                os.replace(private, path)
-    return removed
+    from tools import pa_agent_workspace as store
+
+    store.ensure_layout(workspace)
+    reason = store.quarantined(workspace)
+    if reason:
+        return (
+            f"the workspace is quarantined ({reason}); an operator must inspect "
+            "it and remove private/.quarantined"
+        )
+    work = workspace / "work"
+    with contextlib.suppress(FileNotFoundError, IsADirectoryError, PermissionError):
+        if not stat.S_ISDIR(os.lstat(work / "result.json").st_mode):
+            os.unlink(work / "result.json")
+    try:
+        files, used, _removed = store.inspect_work(work, strip=True)
+    except store.WorkspaceInspectionError as exc:
+        store.quarantine(workspace, str(exc))
+        return "the workspace could not be inspected and is quarantined"
+    limits = _limits(config)
+    limit = limits["workspace_mb"] * 1024 * 1024
+    if shutil.disk_usage(work).free < limits["min_free_mb"] * 1024 * 1024:
+        return (
+            f"the host disk has less than {limits['min_free_mb']}MB free; "
+            "the run was refused"
+        )
+    before = store.sync_index(workspace, files)
+    # Over the limit, a run may still delete: it must not grow the folder.
+    return before, (limit if used <= limit else used)
 
 
-def _remove_run_result(work: Path) -> None:
-    result = work / "result.json"
-    if result.is_symlink() or result.is_file():
-        result.unlink()
+def _agent_run_over_limit(
+    work: Path, cap: int, limits: Mapping[str, int]
+) -> str | bool:
+    """Why a running run must stop, or False.  Fails closed."""
+    from tools import pa_agent_workspace as store
+
+    try:
+        _files, used, _removed = store.inspect_work(work, strip=False)
+    except store.WorkspaceInspectionError as exc:
+        return f"the workspace could not be inspected ({exc})"
+    if used > cap:
+        return f"workspace size limit ({limits['workspace_mb']}MB) exceeded"
+    if shutil.disk_usage(work).free < limits["min_free_mb"] * 1024 * 1024:
+        return f"host disk free space fell below {limits['min_free_mb']}MB"
+    return False
+
+
+def _finish_agent_run(
+    workspace: Path,
+    run_work: Path,
+    *,
+    run_id: str,
+    context: str,
+    before: Mapping[str, Mapping[str, Any]],
+    killed: bool,
+) -> dict[str, Any]:
+    """Clean, record or roll back a finished run; the caller holds the lock."""
+    from tools import pa_agent_workspace as store
+
+    work = workspace / "work"
+    outcome: dict[str, Any] = {"changed": [], "shas": {}, "removed": []}
+    _take_run_result(work, run_work)
+    try:
+        after, used, removed = store.inspect_work(work, strip=True)
+    except store.WorkspaceInspectionError as exc:
+        store.quarantine(workspace, str(exc))
+        outcome["error"] = (
+            "the workspace could not be inspected after the run and is quarantined"
+        )
+        return outcome
+    outcome["removed"] = removed
+    if killed:
+        # A stopped run may have left a half-written file: undo it.
+        outcome["rolled_back"] = store.roll_back_run(
+            workspace, run_id=run_id, before=before, after=after
+        )
+        return outcome
+    changed, shas = store.record_run_outputs(
+        workspace, run_id=run_id, context=context, before=before, after=after
+    )
+    outcome["changed"], outcome["shas"] = changed, shas
+    limits = _limits(_load_config())
+    if used > limits["workspace_mb"] * 1024 * 1024:
+        outcome["over_limit"] = (
+            f"The workspace now holds {used / 1024**2:.0f}MB, over its "
+            f"{limits['workspace_mb']}MB limit. Until it is under the limit, a "
+            "run may only delete files or keep the folder the same size."
+        )
+    return outcome
 
 
 def _take_run_result(work: Path, run_work: Path) -> None:
     """Move this run's result.json out of the persistent folder."""
     result = work / "result.json"
-    if result.is_symlink():
-        result.unlink()
+    try:
+        mode = os.lstat(result).st_mode
+    except FileNotFoundError:
         return
-    if result.is_file():
+    if stat.S_ISREG(mode):
         run_work.mkdir(parents=True, exist_ok=True, mode=0o700)
         shutil.move(str(result), str(run_work / "result.json"))
+    elif not stat.S_ISDIR(mode):
+        result.unlink()
 
 
 def workspace_files_for_message(
@@ -1611,36 +1620,22 @@ def workspace_files_for_message(
     wanted = str(message_id or "").strip()
     if not wanted or not agent_workspace_enabled():
         return []
-    log_path = (
-        get_hermes_home()
-        / "sandbox_workspaces"
-        / _workspace_key(AGENT_WORKSPACE_OWNER)
-        / "work"
-        / FILES_LOG_NAME
-    )
-    if log_path.is_symlink() or not log_path.is_file():
-        return []
+    from tools.pa_agent_workspace import files_log_entries
+
     found: list[dict[str, Any]] = []
     seen: set[str] = set()
-    with log_path.open(encoding="utf-8") as handle:
-        for line in handle:
-            try:
-                entry = json.loads(line)
-            except ValueError:
-                continue
-            if not isinstance(entry, dict):
-                continue
-            if wanted not in {
-                str(entry.get("message_id") or ""),
-                str(entry.get("text_message_id") or ""),
-            }:
-                continue
-            if chat_id and entry.get("chat_id") and str(entry["chat_id"]) != str(chat_id):
-                continue
-            if entry.get("path") in seen:
-                continue
-            seen.add(str(entry.get("path")))
-            found.append(entry)
+    for entry in files_log_entries():
+        if wanted not in {
+            str(entry.get("message_id") or ""),
+            str(entry.get("text_message_id") or ""),
+        }:
+            continue
+        if chat_id and entry.get("chat_id") and str(entry["chat_id"]) != str(chat_id):
+            continue
+        if entry.get("path") in seen:
+            continue
+        seen.add(str(entry.get("path")))
+        found.append(entry)
     return found
 
 
@@ -1707,9 +1702,24 @@ def _prune_workspaces(
     except (TypeError, ValueError):
         ttl, keep = 7 * 86400, 40
     now = time.time()
+    # Never prune the agent workspace, or any earlier folder it merged: they
+    # are what a rollback from agent mode goes back to.
+    agent_name = _workspace_key(AGENT_WORKSPACE_OWNER, {"workspace": "agent"})
+    protected = {agent_name}
+    try:
+        record = json.loads(
+            (root / agent_name / _MERGE_RECORD_FILE).read_text(encoding="utf-8")
+        )
+        protected.update((record.get("merged") or {}).keys())
+    except (OSError, ValueError, AttributeError):
+        pass
     entries = (
         sorted(
-            (path for path in root.iterdir() if path.is_dir()),
+            (
+                path
+                for path in root.iterdir()
+                if path.is_dir() and path.name not in protected
+            ),
             key=lambda path: path.stat().st_mtime,
             reverse=True,
         )
@@ -1773,6 +1783,7 @@ def python_sandbox(
     timeout_seconds: Any = None,
     *,
     session_id: str | None = None,
+    run_context: str | None = None,
 ) -> str:
     config = _load_config()
     available, reason = _probe(force=True)
@@ -1787,14 +1798,29 @@ def python_sandbox(
             / "sandbox_workspaces"
             / _workspace_key(AGENT_WORKSPACE_OWNER, config)
         )
-        with _workspace_lock(AGENT_WORKSPACE_OWNER, workspace):
-            return _run_python_sandbox(
-                code,
-                datasets,
-                input_json,
-                timeout_seconds,
-                config=config,
-                session_id=AGENT_WORKSPACE_OWNER,
+        # The wait is bounded by one run's longest possible length.
+        wait = float(_limits(config)["max_wall_seconds"]) + 30.0
+        try:
+            with _workspace_lock(AGENT_WORKSPACE_OWNER, workspace, timeout=wait):
+                return _run_python_sandbox(
+                    code,
+                    datasets,
+                    input_json,
+                    timeout_seconds,
+                    config=config,
+                    session_id=AGENT_WORKSPACE_OWNER,
+                    run_context=run_context or session_id,
+                )
+        except TimeoutError:
+            return json.dumps(
+                {
+                    "status": "error",
+                    "error": (
+                        "another sandbox run kept the workspace busy for too long; "
+                        "try again shortly"
+                    ),
+                    "result": None,
+                }
             )
     if _workspace_mode(config) == "session":
         if not isinstance(session_id, str) or not session_id.strip():
@@ -1833,6 +1859,7 @@ def _run_python_sandbox(
     *,
     config: Mapping[str, Any],
     session_id: str | None,
+    run_context: str | None = None,
 ) -> str:
     if not isinstance(code, str) or not code.strip():
         return json.dumps(
@@ -1875,7 +1902,8 @@ def _run_python_sandbox(
     seed_work = None
     agent_mode = _workspace_mode(config) == "agent"
     direct_work: Path | None = None
-    direct_before: dict[str, tuple[int, int, int]] = {}
+    direct_before: dict[str, dict[str, Any]] = {}
+    growth_cap = 0
     if session_id is not None:
         workspace = workspace_root / _workspace_key(session_id, config)
     for path in (root, run, inputs, work):
@@ -1920,7 +1948,8 @@ def _run_python_sandbox(
                         }
                     )
             retained_work.mkdir(parents=True, exist_ok=True, mode=0o700)
-            if reader_uid is not None:
+            # In agent mode the reader reads only records/sent, never work/.
+            if reader_uid is not None and not agent_mode:
                 try:
                     grant_reader_work_access(hermes_home, retained_work, reader_uid)
                 except SandboxReaderPolicyError as exc:
@@ -1931,23 +1960,13 @@ def _run_python_sandbox(
                         {"status": "error", "error": str(exc), "result": None}
                     )
             if agent_mode:
-                limit_bytes = _limits(config)["workspace_mb"] * 1024 * 1024
-                used = _folder_bytes(retained_work)
-                if used > limit_bytes:
+                refusal = _prepare_agent_run(workspace, config)
+                if isinstance(refusal, str):
                     shutil.rmtree(run, ignore_errors=True)
                     return json.dumps(
-                        {
-                            "status": "error",
-                            "error": (
-                                f"the workspace holds {used / 1024**2:.0f}MB, over its "
-                                f"{limit_bytes // 1024**2}MB limit; the run was refused. "
-                                "An operator must free space in the workspace."
-                            ),
-                            "result": None,
-                        }
+                        {"status": "error", "error": refusal, "result": None}
                     )
-                _remove_run_result(retained_work)
-                direct_before = _stat_manifest(retained_work)
+                direct_before, growth_cap = refusal
                 direct_work = retained_work
             try:
                 if not agent_mode:
@@ -1985,7 +2004,14 @@ def _run_python_sandbox(
             sqlite_datasets,
             seed_work,
             reader_uid is not None,
-            **({"direct_work": direct_work} if direct_work is not None else {}),
+            **(
+                {
+                    "direct_work": direct_work,
+                    "direct_records": workspace / "records",
+                }
+                if direct_work is not None
+                else {}
+            ),
         ),
         encoding="utf-8",
     )
@@ -1994,7 +2020,7 @@ def _run_python_sandbox(
     status, stdout, stderr, returncode = "error", "", "", -1
     timed_out = False
     interrupted_requested = False
-    workspace_limit_hit = False
+    workspace_limit_hit: str | bool = False
     try:
         proc = subprocess.Popen(
             [
@@ -2012,7 +2038,11 @@ def _run_python_sandbox(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             stdin=subprocess.DEVNULL,
-            env=_build_env(mounts, sqlite_datasets=sqlite_datasets),
+            env=_build_env(
+                mounts,
+                sqlite_datasets=sqlite_datasets,
+                direct=direct_work is not None,
+            ),
             preexec_fn=_preexec(limits),
         )
         stdout_head: list[bytes] = []
@@ -2045,10 +2075,13 @@ def _run_python_sandbox(
         while proc.poll() is None:
             if direct_work is not None and time.monotonic() >= next_size_check:
                 # No tmpfs caps a directly mounted /work; stop a run that
-                # grows the workspace past its limit.
+                # grows the workspace past its limit or eats the disk's free
+                # space.  A folder that cannot be inspected counts as over.
                 next_size_check = time.monotonic() + 2.0
-                if _folder_bytes(direct_work) > limits["workspace_mb"] * 1024 * 1024:
-                    workspace_limit_hit = True
+                workspace_limit_hit = _agent_run_over_limit(
+                    direct_work, growth_cap, limits
+                )
+                if workspace_limit_hit:
                     _kill_group(proc)
                     break
             try:
@@ -2081,10 +2114,7 @@ def _run_python_sandbox(
             status = "timeout"
         elif workspace_limit_hit:
             status = "error"
-            stderr += (
-                f"\nworkspace size limit ({limits['workspace_mb']}MB) exceeded — "
-                "the run was stopped; delete files you no longer need"
-            )
+            stderr += f"\n{workspace_limit_hit} — the run was stopped and rolled back"
         elif returncode == 0:
             status = "success"
         elif interrupted_requested:
@@ -2110,33 +2140,29 @@ def _run_python_sandbox(
     export_complete = work / _EXPORT_COMPLETE
     publication_error: SandboxReaderPolicyError | None = None
     publication: dict[str, Any] = {"renamed": {}, "unpublished": [], "kept": []}
-    direct_changed: list[str] | None = None
-    direct_removed: list[str] = []
+    direct_outcome: dict[str, Any] | None = None
     if direct_work is not None:
-        # The run worked in the persistent folder itself.  Strip anything that
-        # is not a regular file (even if the in-jail walk never ran, as after
-        # a timeout), break hard links, drop the reserved dataset copies, and
-        # take result.json out: it is this run's return channel, not state.
-        direct_removed = _confine_work_tree(direct_work)
-        for name in sqlite_datasets:
-            with contextlib.suppress(FileNotFoundError, IsADirectoryError):
-                (direct_work / f"{name}.db").unlink()
-        _take_run_result(direct_work, work)
-        if reader_uid is not None:
-            try:
-                grant_reader_work_access(hermes_home, direct_work, reader_uid)
-            except SandboxReaderPolicyError as exc:
-                logger.exception("Could not apply sandbox reader ACL after the run")
-                publication_error = exc
-        after = _stat_manifest(direct_work)
-        direct_changed = sorted(
-            relative
-            for relative, signature in after.items()
-            if direct_before.get(relative) != signature
+        killed = bool(
+            timed_out
+            or workspace_limit_hit
+            or interrupted_requested
+            or returncode < 0
+            or returncode in (137, 128 + signal.SIGXCPU)
         )
+        direct_outcome = _finish_agent_run(
+            workspace,
+            work,
+            run_id=run_id,
+            context=run_context or "",
+            before=direct_before,
+            killed=killed,
+        )
+        if direct_outcome.get("error"):
+            status = "error"
+            stderr += f"\n{direct_outcome['error']}"
         collector = _BOUND_PUBLISHED.get()
         if collector is not None:
-            collector.update(direct_changed)
+            collector.update(direct_outcome.get("changed") or [])
     elif export_complete.exists():
         export_complete.unlink()
         if workspace is not None:
@@ -2167,26 +2193,29 @@ def _run_python_sandbox(
             artifact_url_base=config.get("artifact_url_base"),
             media_retention=config.get("media_retention"),
         )
-        if direct_changed is not None:
-            # Report what this run created or changed, not the whole folder.
+        if direct_outcome is not None:
+            # Report what this run created or changed, not the whole folder,
+            # with the exact version recorded for each file.
+            shas = direct_outcome.get("shas") or {}
             payload["files"] = _list_files(
                 direct_work,
                 run_id=run_id,
                 artifact_url_base=config.get("artifact_url_base"),
                 media_retention=config.get("media_retention"),
-                only=direct_changed,
+                only=list(direct_outcome.get("changed") or []),
             )
-            if direct_removed:
+            for item in payload["files"]:
+                sha = shas.get(str(item.get("path") or "")[len("work/"):])
+                if sha:
+                    item["sha256"] = sha
+            if direct_outcome.get("removed"):
                 payload["workspace_removed_links"] = [
-                    f"work/{relative}" for relative in direct_removed
+                    f"work/{relative}" for relative in direct_outcome["removed"]
                 ]
-            used = _folder_bytes(direct_work)
-            if used > limits["workspace_mb"] * 1024 * 1024:
-                payload["workspace_over_limit"] = (
-                    f"The workspace now holds {used / 1024**2:.0f}MB, over its "
-                    f"{limits['workspace_mb']}MB limit. Delete files you no longer "
-                    "need; further runs are refused until it is under the limit."
-                )
+            if direct_outcome.get("rolled_back"):
+                payload["workspace_rolled_back"] = direct_outcome["rolled_back"]
+            if direct_outcome.get("over_limit"):
+                payload["workspace_over_limit"] = direct_outcome["over_limit"]
     else:
         payload = {
             "status": "error",
@@ -2280,6 +2309,7 @@ def _handle_python_sandbox(
         args.get("input_json"),
         args.get("timeout_seconds"),
         session_id=workspace_owner,
+        run_context=current_run_context(session_id),
     )
 
 
@@ -2362,12 +2392,16 @@ def _schema_overrides() -> dict[str, str]:
         "your conversations, scheduled jobs and helpers, and it is kept when "
         "the model changes. Your code works in it directly: what you write, "
         "change or delete there is the folder's state, and runs take turns. "
-        "Files people send you (documents and photos) are saved under "
-        "/work/received/, files you send or a scheduled job delivers that were "
-        "not already in /work are saved under /work/sent/, and "
-        f"/work/{FILES_LOG_NAME} has one line per file with its time, "
-        "direction, chat and exact path. Check it for the newest version of "
-        "a file before reworking an older one."
+        "To change an existing file, write a new file and then os.replace it "
+        "over the old one; a run stopped by its time or size limit is rolled "
+        "back, and files it had only started are kept as "
+        "<name>.incomplete-<run>. Scratch files, TMPDIR and sqlite datasets "
+        "are under /scratch and are discarded after the run. /records is "
+        "read-only: files people send you (documents and photos) are in "
+        "/records/received/, files that were sent are in /records/sent/ "
+        f"exactly as sent, and /records/{FILES_LOG_NAME} has one line per file "
+        "with its time, direction, chat, WhatsApp message id and exact path. "
+        "Check it for the newest version of a file before reworking an older one."
         if agent_workspace_enabled(config)
         else ""
     )

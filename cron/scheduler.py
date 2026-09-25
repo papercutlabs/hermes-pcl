@@ -660,6 +660,21 @@ def _deliver_whatsapp_via_tgg_reply_bridge(
 
     def resolve_media_path(value: str) -> Path:
         text = str(value or "")
+        from tools.python_sandbox_tool import agent_workspace_enabled
+
+        if agent_workspace_enabled() and text.startswith(
+            ("work/", "/work/", "records/", "/records/")
+        ):
+            # PA-203: send an immutable, digest-checked copy of the version
+            # this job made or captured, never whatever sits at the path now.
+            from tools.pa_agent_workspace import delivery_snapshot
+
+            path, _sha = delivery_snapshot(
+                text,
+                str(workspace_owner or ""),
+                any_file_allowed=allowed_work_paths is None,
+            )
+            return path
         if text.startswith(("work/", "/work/")):
             from tools.python_sandbox_tool import resolve_sandbox_work_path
 

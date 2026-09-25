@@ -63,6 +63,7 @@ class _FakeMountJail:
         assert plan["direct_work"], "agent mode must mount the folder directly"
         assert plan["seed"] is None
         self.work = Path(plan["direct_work"])
+        self.records = Path(plan["direct_records"])
         code = (Path(plan["run"]) / "script.py").read_text(encoding="utf-8")
         self.stdout = io.BytesIO(b"")
         self.stderr = io.BytesIO(b"")
@@ -72,8 +73,8 @@ class _FakeMountJail:
 
         def body():
             try:
-                exec(code, {"WORK": self.work, "Path": Path, "HOOKS": HOOKS,
-                            "json": json, "KILLED": self.killed, "os": os})
+                exec(code, {"WORK": self.work, "RECORDS": self.records, "Path": Path,
+                            "HOOKS": HOOKS, "json": json, "KILLED": self.killed, "os": os})
                 code_rc = 0
             except BaseException:
                 code_rc = 1
@@ -100,6 +101,7 @@ def agent_home(home, monkeypatch):
             "run": str(run_dir),
             "seed": str(args[8]) if len(args) > 8 and args[8] else None,
             "direct_work": str(kwargs["direct_work"]) if kwargs.get("direct_work") else None,
+            "direct_records": str(kwargs.get("direct_records") or ""),
         }),
     )
     monkeypatch.setattr(sandbox.subprocess, "Popen", _FakeMountJail)
@@ -144,8 +146,12 @@ def _helper(code: str) -> dict:
     return result["tool"]
 
 
+def _records(home: Path) -> Path:
+    return _agent_work(home).parent / "records"
+
+
 def _files_log(home: Path) -> list[dict]:
-    path = _agent_work(home) / sandbox.FILES_LOG_NAME
+    path = _records(home) / sandbox.FILES_LOG_NAME
     return [json.loads(line) for line in path.read_text().splitlines()]
 
 
@@ -278,9 +284,9 @@ def test_attached_only_workbook_is_visible_to_a_later_chat_turn(agent_home, tmp_
     assert [item.get("fileName") for item in sent if "filePath" in item] == [reviewed.name]
     later = _turn(
         "import json\n"
-        "log = [json.loads(l) for l in (WORK / 'files-log.jsonl').read_text().splitlines()]\n"
+        "log = [json.loads(l) for l in (RECORDS / 'files-log.jsonl').read_text().splitlines()]\n"
         "delivered = [e for e in log if e['direction'] == 'scheduled_delivery']\n"
-        "path = WORK / delivered[-1]['path'][len('work/'):]\n"
+        "path = RECORDS / delivered[-1]['path'][len('records/'):]\n"
         "(WORK / 'result.json').write_text(json.dumps({'entry': delivered[-1], "
         "'text': path.read_text()}))\n",
         session_id="live-root-compressed-child",
@@ -288,7 +294,7 @@ def test_attached_only_workbook_is_visible_to_a_later_chat_turn(agent_home, tmp_
     assert later["status"] == "success", later
     assert later["result"]["text"] == "reviewed workbook: 47 blanks"
     entry = later["result"]["entry"]
-    assert entry["path"] == f"work/sent/{reviewed.name}"
+    assert entry["path"] == f"records/sent/{reviewed.name}"
     assert entry["chat_id"] == MANAGEMENT_CHAT
     assert entry["scheduled_job_id"] == "mgmt-morning-review"
     assert entry["sha256"] == hashlib.sha256(reviewed.read_bytes()).hexdigest()
@@ -313,13 +319,16 @@ def test_sent_and_received_files_are_kept_and_logged(agent_home, tmp_path):
     _turn(_write("built.xlsx", "built in the sandbox"))
     _keep_sent_file_in_workspace(_agent_work(agent_home) / "built.xlsx", chat_id=MANAGEMENT_CHAT)
 
-    work = _agent_work(agent_home)
-    assert (work / "sent" / retained.name).read_bytes() == b"sent from retained media"
-    assert not (work / "sent" / "built.xlsx").exists()
-    assert [(e["direction"], e["path"]) for e in _files_log(agent_home)] == [
-        ("sent", f"work/sent/{retained.name}"),
-        ("sent", "work/built.xlsx"),
+    records = _records(agent_home)
+    assert (records / "sent" / retained.name).read_bytes() == b"sent from retained media"
+    # Even a file sent straight from work/ gets an immutable copy in records.
+    assert (records / "sent" / "built.xlsx").read_text() == "built in the sandbox"
+    log = _files_log(agent_home)
+    assert [(e["direction"], e["path"]) for e in log] == [
+        ("sent", f"records/sent/{retained.name}"),
+        ("sent", "records/sent/built.xlsx"),
     ]
+    assert log[1]["sha256"] == hashlib.sha256(b"built in the sandbox").hexdigest()
 
 
 @pytest.mark.asyncio
@@ -351,9 +360,15 @@ async def test_a_received_document_is_saved_and_named_in_the_turn(agent_home, tm
 
     text = await runner._prepare_inbound_message_text(event=event, source=source, history=[])
 
-    assert "Saved in your workspace as /work/received/Outstanding Cases.xlsx." in text
-    later = _turn(_read("received/Outstanding Cases.xlsx"), chat=OTHER_MANAGEMENT_CHAT, key=OTHER_KEY)
+    assert "Saved in your workspace as /records/received/Outstanding Cases.xlsx." in text
+    later = _turn(
+        "import json\n"
+        "(WORK / 'result.json').write_text(json.dumps("
+        "{'text': (RECORDS / 'received' / 'Outstanding Cases.xlsx').read_text()}))\n",
+        chat=OTHER_MANAGEMENT_CHAT, key=OTHER_KEY,
+    )
     assert later["result"] == {"text": "Krisleen's workbook"}
+    assert not (_agent_work(agent_home) / "received").exists()
     [entry] = _files_log(agent_home)
     assert entry["direction"] == "received" and entry["message_id"] == "3EB0DOC"
 
@@ -369,11 +384,11 @@ def test_a_same_named_different_file_keeps_both_versions(agent_home, tmp_path):
     two = sandbox.record_workspace_file(second, direction="received", folder="received")
     again = sandbox.record_workspace_file(first, direction="received", folder="received")
 
-    work = _agent_work(agent_home)
-    assert one == again == "work/received/report.xlsx"
-    assert two != one and two.startswith("work/received/report.i_")
-    assert (work / one[5:]).read_text() == "first"
-    assert (work / two[5:]).read_text() == "second"
+    records = _records(agent_home)
+    assert one == again == "records/received/report.xlsx"
+    assert two != one and two.startswith("records/received/report.")
+    assert (records / one[len("records/"):]).read_text() == "first"
+    assert (records / two[len("records/"):]).read_text() == "second"
 
 
 # 3. The folder is unchanged after a model or provider change -----------------
@@ -550,7 +565,8 @@ def test_concurrent_imports_and_sandbox_runs_lose_nothing(agent_home, tmp_path):
         thread.join(30)
 
     work = _agent_work(agent_home)
-    kept = sorted((work / path[5:]).read_text() for path in results)
+    records = _records(agent_home)
+    kept = sorted((records / path[len("records/"):]).read_text() for path in results)
     assert kept == [f"version {index}" for index in range(6)]
     assert len(set(results)) == 6
     assert sorted((work / f"run{index}.txt").read_text() for index in range(3)) == ["0", "1", "2"]
@@ -704,7 +720,7 @@ def test_files_log_records_the_whatsapp_message_ids(s1_delivered, agent_home, tm
     [entry] = [e for e in _files_log(agent_home) if e["direction"] == "scheduled_delivery"]
     assert entry["message_id"] == DELIVERY_FILE_ID
     assert entry["text_message_id"] == DELIVERY_TEXT_ID
-    assert entry["path"] == "work/sent/TGG_AM_186_case_review_12_Sep_2026.xlsx"
+    assert entry["path"] == "records/sent/TGG_AM_186_case_review_12_Sep_2026.xlsx"
 
     from gateway.durable_jsonl_consumer import _keep_sent_file_in_workspace
 
@@ -720,7 +736,7 @@ def test_scheduled_delivery_is_in_the_conversation_history(s1_delivered):
     assert delivery["role"] == "assistant"
     assert "Scheduled job 'AM-186 review delivery' delivered this to the chat at" in delivery["content"]
     assert "90 remain blank" in delivery["content"]
-    assert "[Attached file: /work/sent/TGG_AM_186_case_review_12_Sep_2026.xlsx]" in delivery["content"]
+    assert "[Attached file: /records/sent/TGG_AM_186_case_review_12_Sep_2026.xlsx]" in delivery["content"]
 
 
 @pytest.mark.asyncio
@@ -733,7 +749,7 @@ async def test_quoting_the_delivery_names_the_delivered_file(s1_delivered, quote
 
     assert (
         "sent by the scheduled job 'AM-186 review delivery', which carried "
-        "/work/sent/TGG_AM_186_case_review_12_Sep_2026.xlsx.]"
+        "/records/sent/TGG_AM_186_case_review_12_Sep_2026.xlsx.]"
     ) in text
     assert "[The sender is replying to your " in text
     assert "v7" not in text
@@ -757,7 +773,7 @@ async def test_quoting_her_own_file_message_points_to_received(agent_home, tmp_p
 
     text = await _krisleen("use this one", quoted="3EB0KRISDOC", message_id="3EB0KRIS2")
 
-    assert "that sent you a file, now saved as /work/received/Outstanding_Cases_Update_v5.xlsx.]" in text
+    assert "that sent you a file, now saved as /records/received/Outstanding_Cases_Update_v5.xlsx.]" in text
     [entry] = _files_log(agent_home)
     assert entry["message_id"] == "3EB0KRISDOC"
 
@@ -779,7 +795,7 @@ def test_delivery_history_uses_the_real_session_database(agent_home, monkeypatch
 
     assert _record_delivery_in_conversation(
         {"id": "j1", "name": "Review"}, LIVE_KEY,
-        {"text": "done", "files": [{"name": "r.xlsx", "workspace_path": "work/sent/r.xlsx"}]},
+        {"text": "done", "files": [{"name": "r.xlsx", "workspace_path": "records/sent/r.xlsx"}]},
     )
     db = SessionDB()
     try:
@@ -787,7 +803,7 @@ def test_delivery_history_uses_the_real_session_database(agent_home, monkeypatch
     finally:
         db.close()
     assert message["role"] == "assistant"
-    assert "[Attached file: /work/sent/r.xlsx]" in message["content"]
+    assert "[Attached file: /records/sent/r.xlsx]" in message["content"]
     assert not _record_delivery_in_conversation({"id": "j2"}, "no-such-key", {"text": "x"})
 
 
@@ -871,13 +887,15 @@ def test_links_that_could_escape_are_removed_after_the_run(agent_home, tmp_path)
     ]
 
 
-def test_size_limit_refuses_and_stops_runs(agent_home, monkeypatch):
+def test_size_limit_stops_and_rolls_back_a_growing_run(agent_home, monkeypatch):
     monkeypatch.setattr(
         sandbox, "_load_config",
         lambda: {**SANDBOX_CONFIG, "limits": {"workspace_mb": 1}},
     )
-    # A run that grows the folder past the limit is stopped.
+    _turn(_write("keep.txt", "before"))
+    # A run that grows the folder past the limit is stopped and rolled back.
     grow = _turn(
+        "(WORK / 'keep.txt').write_text('half-writ')\n"
         "chunk = b'x' * 262144\n"
         "i = 0\n"
         "while not KILLED.is_set() and i < 400:\n"
@@ -885,15 +903,101 @@ def test_size_limit_refuses_and_stops_runs(agent_home, monkeypatch):
         "    i += 1\n"
         "    import time; time.sleep(0.02)\n"
     )
+    work = _agent_work(agent_home)
     assert grow["status"] == "error"
     assert "workspace size limit (1MB) exceeded" in grow["stderr"]
-    assert "workspace_over_limit" in grow
+    assert (work / "keep.txt").read_text() == "before"
+    assert "keep.txt" in grow["workspace_rolled_back"]["restored"]
+    assert not list(work.glob("big*.bin"))
+    assert list(work.glob("big*.bin.incomplete-*"))
 
-    # Over the limit, the next run is refused before it starts.
-    refused = _turn(_write("after.txt", "never written"))
+
+def test_over_the_limit_a_run_may_only_shrink_the_folder(agent_home, monkeypatch):
+    work = _agent_work(agent_home)
+    work.mkdir(parents=True)
+    (work / "big.bin").write_bytes(b"x" * (2 * 1024 * 1024))
+    monkeypatch.setattr(
+        sandbox, "_load_config",
+        lambda: {**SANDBOX_CONFIG, "limits": {"workspace_mb": 1}},
+    )
+
+    cleanup = _turn("(WORK / 'big.bin').unlink()\n")
+    assert cleanup["status"] == "success", cleanup
+    assert not (work / "big.bin").exists()
+
+    (work / "big.bin").write_bytes(b"x" * (2 * 1024 * 1024))
+    grow = _turn(
+        "import time\n"
+        "(WORK / 'more.bin').write_bytes(b'y' * 4096)\n"
+        "while not KILLED.is_set():\n"
+        "    time.sleep(0.05)\n"
+    )
+    assert grow["status"] == "error"
+    assert not (work / "more.bin").exists()
+
+
+def test_hidden_directory_cannot_escape_the_limit_or_the_link_strip(agent_home, monkeypatch):
+    """The reviewer's probe: chmod 0300 on a directory holding a big file,
+    a symlink and a FIFO."""
+    monkeypatch.setattr(
+        sandbox, "_load_config",
+        lambda: {**SANDBOX_CONFIG, "limits": {"workspace_mb": 1}},
+    )
+    code = (
+        "os.mkdir(WORK / 'd')\n"
+        "(WORK / 'd' / 'big.bin').write_bytes(b'z' * (3 * 1024 * 1024))\n"
+        "os.symlink('/etc/passwd', WORK / 'd' / 'link')\n"
+        "os.mkfifo(WORK / 'd' / 'fifo')\n"
+        "os.chmod(WORK / 'd', 0o300)\n"
+        "import time\n"
+        "while not KILLED.is_set():\n"
+        "    time.sleep(0.05)\n"
+    )
+    result = _turn(code)
+
+    work = _agent_work(agent_home)
+    assert result["status"] == "error"
+    assert "workspace size limit (1MB) exceeded" in result["stderr"]
+    assert not os.path.lexists(work / "d" / "link")
+    assert not os.path.lexists(work / "d" / "fifo")
+    assert not (work / "d" / "big.bin").exists()  # rolled back: set aside
+    assert (work / "d").stat().st_mode & 0o777 == 0o700
+
+
+def test_hidden_links_and_fifos_are_stripped_after_a_normal_run(agent_home):
+    result = _turn(
+        "os.makedirs(WORK / 'h' / 'deeper')\n"
+        "os.symlink('/etc/passwd', WORK / 'h' / 'deeper' / 'link')\n"
+        "os.mkfifo(WORK / 'h' / 'fifo')\n"
+        "(WORK / 'h' / 'deeper' / 'ok.txt').write_text('kept')\n"
+        "os.chmod(WORK / 'h' / 'deeper', 0o300)\n"
+        "os.chmod(WORK / 'h', 0o100)\n"
+    )
+
+    work = _agent_work(agent_home)
+    assert result["status"] == "success", result
+    assert sorted(result["workspace_removed_links"]) == ["work/h/deeper/link", "work/h/fifo"]
+    assert (work / "h" / "deeper" / "ok.txt").read_text() == "kept"
+    assert "work/h/deeper/ok.txt" in {item["path"] for item in result["files"]}
+
+
+def test_an_uninspectable_folder_is_quarantined(agent_home, monkeypatch):
+    from tools import pa_agent_workspace as store
+
+    _turn(_write("a.txt", "a"))
+    real = store.inspect_work
+
+    def broken(work, *, strip):
+        raise store.WorkspaceInspectionError("cannot list d: denied")
+
+    monkeypatch.setattr(store, "inspect_work", broken)
+    refused = _turn(_write("b.txt", "b"))
     assert refused["status"] == "error"
-    assert "over its 1MB limit" in refused["error"]
-    assert not (_agent_work(agent_home) / "after.txt").exists()
+    assert "quarantined" in refused["error"]
+    monkeypatch.setattr(store, "inspect_work", real)
+    again = _turn(_write("b.txt", "b"))
+    assert "quarantined" in again["error"]
+    assert not (_agent_work(agent_home) / "b.txt").exists()
 
 
 @pytest.mark.asyncio
@@ -916,12 +1020,12 @@ async def test_received_photos_land_in_the_folder(agent_home, tmp_path, monkeypa
 
     text = await runner._prepare_inbound_message_text(event=event, source=source, history=[])
 
-    assert "[The image is also saved in your workspace as /work/received/3EB0PHOTO.jpg.]" in text
-    assert (_agent_work(agent_home) / "received" / "3EB0PHOTO.jpg").read_bytes() == photo.read_bytes()
+    assert "[The image is also saved in your workspace as /records/received/3EB0PHOTO.jpg.]" in text
+    assert (_records(agent_home) / "received" / "3EB0PHOTO.jpg").read_bytes() == photo.read_bytes()
     [entry] = _files_log(agent_home)
     assert entry["message_id"] == "3EB0PHOTO" and entry["direction"] == "received"
     later = await _krisleen("what is in this photo?", quoted="3EB0PHOTO", message_id="3EB0K3")
-    assert "now saved as /work/received/3EB0PHOTO.jpg" in later
+    assert "now saved as /records/received/3EB0PHOTO.jpg" in later
 
 
 def _real_jail_available() -> bool:
@@ -963,15 +1067,225 @@ try:
     executed = True
 except (PermissionError, OSError, subprocess.CalledProcessError):
     executed = False
-assert os.path.exists("/work/records.db")
-open(os.environ["RESULT_PATH"], "w").write(json.dumps({"seen": seen, "executed": executed}))
+assert json.loads(os.environ["SANDBOX_INPUTS"])["records"] == "/scratch/records.db"
+assert os.path.exists("/scratch/records.db") and not os.path.exists("/work/records.db")
+assert os.environ["TMPDIR"] == "/scratch"
+try:
+    open("/records/forged.txt", "w").write("x")
+    records_writable = True
+except OSError:
+    records_writable = False
+os.mkdir("/work/hidden")
+open("/work/hidden/big.bin", "wb").write(b"z" * 1024)
+os.symlink("/etc/passwd", "/work/hidden/link")
+os.mkfifo("/work/hidden/fifo")
+os.chmod("/work/hidden", 0o300)
+open(os.environ["RESULT_PATH"], "w").write(json.dumps(
+    {"seen": seen, "executed": executed, "records_writable": records_writable}))
 '''
     response = json.loads(sandbox.python_sandbox(code, ["records"], timeout_seconds=20))
 
     assert response["status"] == "success", response
-    assert response["result"] == {"seen": "before", "executed": False}
+    assert response["result"] == {
+        "seen": "before", "executed": False, "records_writable": False,
+    }
+    assert not os.path.lexists(work / "hidden" / "link")
+    assert not os.path.lexists(work / "hidden" / "fifo")
+    assert (work / "hidden" / "big.bin").stat().st_size == 1024
+    assert "work/hidden/big.bin" in {item["path"] for item in response["files"]}
     assert (work / "made.txt").read_text() == "in the jail"
     assert not os.path.lexists(work / "escape")
     assert not (work / "records.db").exists()
     assert not (work / "result.json").exists()
     assert "work/made.txt" in {item["path"] for item in response["files"]}
+
+
+# Review fixes (review-r2.md findings 2 to 7) -----------------------------------
+
+
+def test_session_mode_prune_never_removes_the_agent_or_merged_folders(home, monkeypatch):
+    root = home / "sandbox_workspaces"
+    agent = _agent_work(home).parent
+    (agent / "work").mkdir(parents=True)
+    (agent / "work" / "kept.txt").write_text("made in agent mode")
+    legacy = _legacy(home, LIVE_KEY, {"old.txt": "merged"}, mtime=1_000_000_000).parent
+    (agent / sandbox._MERGE_RECORD_FILE).write_text(
+        json.dumps({"merged": {legacy.name: {}}})
+    )
+    stale = root / ("s_" + "f" * 64)
+    (stale / "work").mkdir(parents=True)
+    old = time.time() - 30 * 86400
+    for path in (agent, legacy, stale):
+        os.utime(path, (old, old))
+
+    # Rolled back to session mode: a session run prunes by age.
+    result = _turn(_write("x.txt", "session run"))
+
+    assert result["status"] == "success", result
+    assert (agent / "work" / "kept.txt").read_text() == "made in agent mode"
+    assert (legacy / "work" / "old.txt").read_text() == "merged"
+    assert not stale.exists()
+
+
+def test_two_contexts_writing_one_name_each_send_their_own_version(agent_home, tmp_path):
+    from tools.pa_agent_workspace import delivery_snapshot
+
+    group_a = f"agent:live-drain:persistent-chat:{PROVIDER}:{MODEL}:whatsapp:group:site-a@g.us"
+    a = _turn(_write("report.xlsx", "site A figures"), chat="site-a@g.us", key=group_a)
+    m = _turn(_write("report.xlsx", "Management case data"))
+    assert a["files"][0]["sha256"] != m["files"][0]["sha256"]
+
+    sent_a, sha_a = delivery_snapshot("work/report.xlsx", group_a, any_file_allowed=True)
+    sent_m, sha_m = delivery_snapshot("work/report.xlsx", LIVE_KEY, any_file_allowed=True)
+
+    assert sent_a.read_text() == "site A figures"
+    assert sent_m.read_text() == "Management case data"
+    assert sha_a == a["files"][0]["sha256"]
+    assert sent_a != sent_m
+    assert sent_a.parent == _records(agent_home) / "sent"
+    # Later sandbox writes never change what was sent.
+    _turn(_write("report.xlsx", "rewritten later"))
+    assert sent_a.read_text() == "site A figures"
+
+
+def test_capture_fixes_the_version_at_request_time(agent_home):
+    """tgg_file_return resolves at request time; delivery sends that version."""
+    from tools.pa_agent_workspace import delivery_snapshot
+
+    _turn(_write("report.xlsx", "requested version"))
+    captured = sandbox.resolve_sandbox_work_path("work/report.xlsx", LIVE_KEY)
+    requested_sha = hashlib.sha256(b"requested version").hexdigest()
+    # The capability copies the file under work/ for delivery ...
+    copy = _agent_work(agent_home) / "file-return-x" / "Named.xlsx"
+    copy.parent.mkdir()
+    copy.write_bytes(captured.read_bytes())
+    # ... and another context's run overwrites both paths before delivery.
+    other = f"agent:live-drain:persistent-chat:{PROVIDER}:{MODEL}:whatsapp:group:site-b@g.us"
+    _turn(_write("report.xlsx", "other") + _write("file-return-x/Named.xlsx", "other"),
+          chat="site-b@g.us", key=other)
+
+    sent, sha = delivery_snapshot("work/report.xlsx", LIVE_KEY, any_file_allowed=False)
+    assert sha == requested_sha and sent.read_text() == "requested version"
+    with pytest.raises(ValueError):
+        # The tampered copy matches nothing this context captured.
+        delivery_snapshot("work/file-return-x/Named.xlsx", LIVE_KEY, any_file_allowed=False)
+
+
+def test_job_may_not_attach_a_file_it_did_not_make(agent_home):
+    from tools.pa_agent_workspace import delivery_snapshot
+
+    _turn(_write("mgmt.xlsx", "Management workbook"))
+    with pytest.raises(ValueError, match="did not make or capture"):
+        delivery_snapshot("work/mgmt.xlsx", "cron_ops-job_1", any_file_allowed=False)
+
+
+def test_host_reads_never_follow_a_swapped_link(agent_home, tmp_path):
+    from tools.pa_agent_workspace import delivery_snapshot
+
+    secret = tmp_path / "secret.env"
+    secret.write_text("TOKEN=1")
+    work = _agent_work(agent_home)
+    work.mkdir(parents=True)
+    (work / "x.xlsx").symlink_to(secret)
+    (work / "dir").symlink_to(tmp_path)
+    with pytest.raises(ValueError):
+        sandbox.resolve_sandbox_work_path("work/x.xlsx", LIVE_KEY)
+    with pytest.raises(ValueError):
+        sandbox.resolve_sandbox_work_path("work/dir/secret.env", LIVE_KEY)
+    with pytest.raises(ValueError):
+        delivery_snapshot("work/x.xlsx", LIVE_KEY, any_file_allowed=True)
+    os.mkfifo(work / "pipe.xlsx")
+    with pytest.raises(ValueError):
+        delivery_snapshot("work/pipe.xlsx", LIVE_KEY, any_file_allowed=True)
+
+
+def test_records_are_outside_the_writable_folder(agent_home, tmp_path):
+    document = tmp_path / "d.xlsx"
+    document.write_text("original")
+    kept = sandbox.record_workspace_file(document, direction="received", folder="received",
+                                         details={"message_id": "3EB0D"})
+    # Sandbox code writing /work cannot touch the records or the log.
+    _turn(
+        "import shutil\n"
+        "(WORK / 'files-log.jsonl').write_text('forged')\n"
+        "os.makedirs(WORK / 'received', exist_ok=True)\n"
+        "(WORK / 'received' / 'd.xlsx').write_text('forged')\n"
+    )
+    assert (_records(agent_home) / kept[len("records/"):]).read_text() == "original"
+    [entry] = _files_log(agent_home)
+    assert entry["message_id"] == "3EB0D"
+
+
+def test_records_are_mounted_read_only(tmp_path):
+    script = sandbox._generate_init_script(
+        tmp_path / "run", {}, tmp_path / "venv", 64, tmp_path, 64, 60, 64,
+        set(), None, False, direct_work=tmp_path / "a" / "work",
+        direct_records=tmp_path / "a" / "records",
+    )
+    assert f'ro_dir {tmp_path / "a" / "records"} "$JAIL/records"' in script
+
+
+def test_keeping_a_file_does_not_wait_for_a_running_run(agent_home, tmp_path):
+    HOOKS["running"] = threading.Event()
+    HOOKS["release"] = threading.Event()
+    runner = threading.Thread(target=_turn, args=(
+        "HOOKS['running'].set()\nassert HOOKS['release'].wait(10)\n",
+    ))
+    runner.start()
+    assert HOOKS["running"].wait(10)
+    document = tmp_path / "late.xlsx"
+    document.write_text("arrived mid-run")
+    started = time.monotonic()
+    kept = sandbox.record_workspace_file(document, direction="received", folder="received")
+    elapsed = time.monotonic() - started
+    HOOKS["release"].set()
+    runner.join(20)
+    assert kept == "records/received/late.xlsx"
+    assert elapsed < 2
+
+
+def test_run_lock_waits_are_bounded(tmp_path):
+    workspace = tmp_path / "s_lock"
+    held = threading.Event()
+    release = threading.Event()
+
+    def holder():
+        with sandbox._workspace_lock("x", workspace):
+            held.set()
+            release.wait(10)
+
+    thread = threading.Thread(target=holder)
+    thread.start()
+    assert held.wait(10)
+    with pytest.raises(TimeoutError):
+        with sandbox._workspace_lock("x", workspace, timeout=0.3):
+            pass
+    release.set()
+    thread.join(10)
+
+
+def test_sqlite_copies_and_temp_files_stay_off_the_persistent_folder(tmp_path):
+    work = tmp_path / "work"
+    script = sandbox._generate_init_script(
+        tmp_path / "run", {"cases": tmp_path / "cases.db"}, tmp_path / "venv", 64,
+        tmp_path, 64, 60, 64, {"cases"}, None, False, direct_work=work,
+    )
+    assert f'cp {tmp_path / "cases.db"} "$JAIL/scratch/cases.db"' in script
+    assert 'tmpfs "$JAIL/scratch"' in script
+    env = sandbox._build_env({"cases": tmp_path / "cases.db"}, {}, sqlite_datasets={"cases"}, direct=True)
+    assert json.loads(env["SANDBOX_INPUTS"]) == {"cases": "/scratch/cases.db"}
+    assert env["TMPDIR"] == env["HOME"] == "/scratch"
+    assert env["RESULT_PATH"] == "/work/result.json"
+    assert "direct = len(sys.argv) >= 5" in sandbox._SUPERVISOR_SOURCE
+
+
+def test_a_newer_run_version_beats_an_older_capture(agent_home):
+    from tools.pa_agent_workspace import delivery_snapshot
+
+    _turn(_write("report.xlsx", "v1"))
+    sandbox.resolve_sandbox_work_path("work/report.xlsx", LIVE_KEY)  # captured v1
+    time.sleep(1.1)
+    _turn(_write("report.xlsx", "v2"))
+
+    sent, _sha = delivery_snapshot("work/report.xlsx", LIVE_KEY, any_file_allowed=True)
+    assert sent.read_text() == "v2"
