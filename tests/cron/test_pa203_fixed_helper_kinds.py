@@ -156,3 +156,24 @@ def test_other_routes_keep_native_toolset_selection(context):
     scope_delegation_children(parent, enabled, context)
     _, built, _ = _delegate(parent, goal="look something up", toolsets=["web"])
     assert built == [["web"]]
+
+
+# ── Review fixes (review-r2.md B2, B6.1) ──────────────────────────────────
+
+
+def test_acp_transport_from_the_model_is_refused_on_the_management_route():
+    """B2: a model-supplied ACP command would start a host process as the helper."""
+    parent = _scoped_parent()
+    for kwargs in (
+        {"goal": "review", "acp_command": "/bin/sh", "acp_args": ["-c", "id"]},
+        {"goal": "review", "acp_args": ["--acp"]},
+        {"tasks": [{"goal": "a"}, {"goal": "b", "acp_command": "/bin/sh"}]},
+    ):
+        result, built, runs = _delegate(parent, **kwargs)
+        assert "transport comes from configuration" in result["error"], result
+        assert built == [] and runs == []
+
+
+def test_batch_task_name_is_not_a_helper_kind():
+    _, built, _ = _delegate(_scoped_parent(), tasks=[{"goal": "a", "name": "set-1"}, {"goal": "b"}])
+    assert built == [[READONLY], [READONLY]]

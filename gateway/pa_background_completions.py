@@ -14,10 +14,15 @@ starts that watcher.  This module is the consumer's own drain:
    limit.  A dispatch that cannot be written is refused, not started.
 2. **Completion is durable.**  The consumer loop drains the queue; each
    completion turns its row ``pending`` with the result, in one transaction.
-3. **A restart loses nothing.**  At start-up a row still ``running`` belongs
-   to a helper the restart killed: it becomes a ``pending`` completion whose
-   outcome says the helper was interrupted.  A row left ``processing`` is
-   completed when a completed turn already cites it, otherwise retried.
+3. **A restart loses no result.**  At start-up a row still ``running``
+   belongs to a helper the restart killed: it becomes a ``pending``
+   completion whose outcome says the helper was interrupted.  A workflow run
+   is instead resumed, once processing is enabled.  A finished turn's reply
+   is stored (``delivering``) before any send, so delivery is retried after a
+   failure or restart; each send is claimed first, so none repeats.  One
+   window remains: a turn that finished just before a restart, before its
+   reply was stored, is recorded ``failed`` rather than re-run, because a
+   re-run could repeat the turn's writes.
 4. **Failure and time limits still complete.**  A helper that raises already
    completes with an error; one still running past its time limit is
    interrupted and completes as ``timeout``.
@@ -47,9 +52,11 @@ CREATE TABLE IF NOT EXISTS background_completions (
     origin_json TEXT NOT NULL,
     task_json TEXT NOT NULL,
     status TEXT NOT NULL
-        CHECK (status IN ('running','pending','processing','completed','failed')),
+        CHECK (status IN ('running','pending','processing','delivering','completed','failed')),
     outcome TEXT,
     result_json TEXT,
+    outbound_json TEXT,
+    handled_json TEXT,
     deadline_at REAL,
     attempts INTEGER NOT NULL DEFAULT 0,
     turn_id TEXT,
@@ -205,9 +212,13 @@ class CompletionStore:
             ).fetchall():
                 turn_id = completed_turn_refs.get(internal_message_id(row["completion_id"]))
                 if turn_id:
+                    # The turn finished but its reply was never handed to
+                    # delivery.  Re-running the turn could repeat its writes,
+                    # so the loss is recorded rather than hidden (review item 9).
                     conn.execute(
-                        "UPDATE background_completions SET status='completed',turn_id=?,updated_at=? "
-                        "WHERE completion_id=?",
+                        "UPDATE background_completions SET status='failed',turn_id=?,updated_at=?,"
+                        "last_error='the completion turn finished but the process stopped before "
+                        "its reply was handed to delivery' WHERE completion_id=?",
                         (turn_id, now, row["completion_id"]),
                     )
                     summary["processing_completed"] += 1
@@ -228,7 +239,32 @@ class CompletionStore:
                 "updated_at=? WHERE completion_id=? AND status='pending'",
                 (_now(), completion_id),
             )
+            if cur.rowcount == 1:
+                return True
+            # A reply already handed to delivery is retried as delivery only.
+            cur = conn.execute(
+                "UPDATE background_completions SET attempts=attempts+1,updated_at=? "
+                "WHERE completion_id=? AND status='delivering'",
+                (_now(), completion_id),
+            )
             return cur.rowcount == 1
+
+    def hand_to_delivery(
+        self, completion_id: str, *, turn_id: str | None,
+        captured_outbound: Sequence[Mapping[str, Any]], handled: Sequence[Mapping[str, Any]],
+    ) -> None:
+        """Keep the finished turn's reply durably before any send is tried."""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE background_completions SET status='delivering',turn_id=?,outbound_json=?,"
+                "handled_json=?,last_error=NULL,updated_at=? WHERE completion_id=?",
+                (
+                    turn_id,
+                    json.dumps([dict(x) for x in captured_outbound], ensure_ascii=False, default=str),
+                    json.dumps([dict(x) for x in handled], ensure_ascii=False, default=str),
+                    _now(), completion_id,
+                ),
+            )
 
     def finish(self, completion_id: str, *, turn_id: str | None) -> None:
         with self._connect() as conn:
@@ -239,14 +275,15 @@ class CompletionStore:
             )
 
     def release(self, completion_id: str, *, error: str) -> str:
-        """Return a failed turn attempt to pending, or fail it after the limit."""
+        """Return a failed attempt for retry, or fail it after the limit."""
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT attempts FROM background_completions WHERE completion_id=?",
+                "SELECT attempts,status FROM background_completions WHERE completion_id=?",
                 (completion_id,),
             ).fetchone()
             terminal = row is not None and int(row["attempts"]) >= MAX_TURN_ATTEMPTS
-            status = "failed" if terminal else "pending"
+            retry = "delivering" if row is not None and row["status"] == "delivering" else "pending"
+            status = "failed" if terminal else retry
             conn.execute(
                 "UPDATE background_completions SET status=?,last_error=?,updated_at=? "
                 "WHERE completion_id=?",
@@ -274,14 +311,15 @@ class CompletionStore:
     def next_pending(self, *, exclude_chats: set[str] | frozenset[str] = frozenset()) -> dict[str, Any] | None:
         with self._connect() as conn:
             for row in conn.execute(
-                "SELECT * FROM background_completions WHERE status='pending' ORDER BY created_at"
+                "SELECT * FROM background_completions WHERE status IN ('pending','delivering') "
+                "ORDER BY created_at"
             ):
                 if row["chat_id"] not in exclude_chats:
                     return dict(row)
         return None
 
     def counts(self) -> dict[str, int]:
-        counts = {name: 0 for name in ("running", "pending", "processing", "completed", "failed")}
+        counts = {name: 0 for name in ("running", "pending", "processing", "delivering", "completed", "failed")}
         with self._connect() as conn:
             for row in conn.execute(
                 "SELECT status,COUNT(*) AS n FROM background_completions GROUP BY status"
@@ -318,9 +356,9 @@ def start_for_consumer(inbox_db: Path, state_db: Path) -> tuple[CompletionStore,
 
     store = CompletionStore(inbox_db)
     try:
-        from tools.pa_workflow_tool import prepare_workflow_recovery, resume_workflow_runs
+        from tools.pa_workflow_tool import prepare_workflow_recovery
     except ImportError:  # pragma: no cover - workflow adapter absent
-        prepare_workflow_recovery = resume_workflow_runs = None
+        prepare_workflow_recovery = None
     # Results already queued in this process are kept before anything
     # still running is treated as lost.
     drain_completion_queue(store)
@@ -329,8 +367,8 @@ def start_for_consumer(inbox_db: Path, state_db: Path) -> tuple[CompletionStore,
         keep = set(prepare_workflow_recovery(store))
     summary = dict(store.recover_after_restart(_completed_turn_refs(state_db), keep_running=keep))
     previous = install_sink(store)
-    if resume_workflow_runs is not None and keep:
-        resume_workflow_runs(sorted(keep))
+    # Workflow runs resume only while processing is enabled: set_processing()
+    # does it on the first enabled loop (review item 8).
 
     def restore() -> None:
         set_durable_sink(previous)
@@ -344,10 +382,35 @@ def maintain(store: CompletionStore) -> dict[str, int]:
     expired = store.expire_overdue()
     if expired:
         from tools.async_delegation import interrupt_delegation
+        from tools.pa_workflow_tool import stop_workflow
 
         for completion_id in expired:
-            interrupt_delegation(completion_id)
+            # A helper is interrupted; a workflow run stops before its next
+            # helper and ends failed (review item 8 and B3).
+            if not interrupt_delegation(completion_id):
+                stop_workflow(completion_id, "timeout")
     return {"recorded": recorded, "expired": len(expired)}
+
+
+def set_processing(store: CompletionStore, enabled: bool) -> dict[str, int]:
+    """Each consumer loop: workflow runs follow Christopher's pause state.
+
+    Paused: every active run stops before its next helper and stays
+    resumable.  Enabled: every unfinished run with a waiting completion that
+    is not already executing here resumes from its stored results.
+    """
+    from tools.pa_workflow_tool import (
+        active_workflow_ids, pause_all_workflows, resume_workflow_runs,
+    )
+
+    if not enabled:
+        return {"paused": pause_all_workflows(), "resumed": 0}
+    active = active_workflow_ids()
+    waiting = [
+        str(row["completion_id"]) for row in store.running(source="workflow")
+        if str(row["completion_id"]) not in active
+    ]
+    return {"paused": 0, "resumed": len(resume_workflow_runs(waiting)) if waiting else 0}
 
 
 def drain_completion_queue(store: CompletionStore, completion_queue: Any = None) -> int:
@@ -501,6 +564,20 @@ async def process_claimed_completion(
         ] if flat else []
         if not originals:
             raise CompletionError("the original request is not in this consumer's inbox")
+        internal_id = internal_message_id(completion_id)
+        current = store.get(completion_id) or dict(row)
+        if current.get("status") == "delivering":
+            # The turn already finished; only its stored reply is retried.
+            # Delivery claims each send before trying it, so nothing repeats.
+            captured_outbound = json.loads(current.get("outbound_json") or "[]")
+            handled = json.loads(current.get("handled_json") or "[]")
+            turn_id = current.get("turn_id")
+            return await _deliver_stored(
+                store=store, durable=durable, inbox=inbox, config_path=config_path,
+                completion_id=completion_id, originals=originals, internal_id=internal_id,
+                captured_outbound=captured_outbound, handled=handled, turn_id=turn_id,
+                gate_changed_at=gate_changed_at,
+            )
         internal_id, event = completion_event(row, originals)
         override = _session_key_override(row, config_path)
         if override is None:
@@ -531,25 +608,51 @@ async def process_claimed_completion(
                 + "; ".join(str(e) for e in result.get("provider_errors") or [])
             )
         turn_id = str(handled[0].get("turn_id") or "") or None
-        store.finish(completion_id, turn_id=turn_id)
+        captured_outbound = [dict(x) for x in result.get("captured_outbound") or []]
+        # The reply is kept durably before any send is tried (review item 9).
+        store.hand_to_delivery(
+            completion_id, turn_id=turn_id, captured_outbound=captured_outbound, handled=handled,
+        )
     except BaseException as exc:
         store.release(completion_id, error=str(exc) or type(exc).__name__)
         raise
-    delivery: dict[str, Any] = {}
+    return await _deliver_stored(
+        store=store, durable=durable, inbox=inbox, config_path=config_path,
+        completion_id=completion_id, originals=originals, internal_id=internal_id,
+        captured_outbound=captured_outbound, handled=handled, turn_id=turn_id,
+        gate_changed_at=gate_changed_at,
+    )
+
+
+async def _deliver_stored(
+    *, store: CompletionStore, durable: Any, inbox: Any, config_path: Path,
+    completion_id: str, originals: Sequence[Any], internal_id: str,
+    captured_outbound: Sequence[Mapping[str, Any]], handled: Sequence[Mapping[str, Any]],
+    turn_id: str | None, gate_changed_at: str,
+) -> dict[str, Any]:
+    """Hand a completion's reply to delivery; complete the row once it returns.
+
+    Delivery follows the ordinary at-most-once contract: each send is claimed
+    durably before it is tried, and a claimed send is never tried again.  If
+    delivery raises or the process stops first, the row stays ``delivering``
+    and the next loop retries only the sends not yet claimed.
+    """
     try:
         delivery = durable.deliver_management_replies(
             inbox,
             config_path=config_path,
-            captured_outbound=result.get("captured_outbound") or [],
-            batch_records=originals,
+            captured_outbound=list(captured_outbound),
+            batch_records=list(originals),
             gate_changed_at=gate_changed_at,
-            handled_groups=handled,
+            handled_groups=list(handled),
             completion={
                 "completion_id": completion_id,
                 "original_message_id": originals[-1].message_id,
                 "internal_message_id": internal_id,
             },
         )
-    except Exception as exc:  # delivery never re-runs the turn
-        delivery = {"error": str(exc)}
+    except BaseException as exc:
+        store.release(completion_id, error=f"delivery: {exc}" or type(exc).__name__)
+        raise
+    store.finish(completion_id, turn_id=turn_id)
     return {"completion_id": completion_id, "turn_id": turn_id, "delivery": delivery}

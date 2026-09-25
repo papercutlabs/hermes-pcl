@@ -4311,6 +4311,8 @@ def deliver_management_replies(
                 )
                 refusal_digest = hashlib.sha256(refusal_identity.encode()).hexdigest()
                 delivery_key = f"media-refused::{chat_id}::{anchor}::{refusal_digest}"
+                if completion is not None:
+                    delivery_key = f"completion::{completion['completion_id']}::{delivery_key}"
                 if not inbox.claim_reply_delivery(
                     delivery_key,
                     chat_id=chat_id,
@@ -4474,6 +4476,10 @@ def deliver_management_replies(
     # neither the attachment nor fallback is retried after an uncertain outcome.
     for (chat_id, anchor), failure in media_failures.items():
         fallback_key = f"media-fallback::{chat_id}::{anchor}"
+        if completion is not None:
+            # A completion's fallback must not collide with the original
+            # turn's fallback for the same message (integration finding 5).
+            fallback_key = f"completion::{completion['completion_id']}::{fallback_key}"
         if not inbox.claim_reply_delivery(
             fallback_key, chat_id=chat_id, reply_to_message_id=anchor
         ):
@@ -5700,8 +5706,10 @@ async def run_consumer(args: argparse.Namespace) -> int:
                 gate = processing_gate_state(gate_path)
                 gate_enabled = gate["enabled"] is True
                 projection_enabled = _source_projection_config(config_path) is not None
-                # Keep every finished background result durable, even in standby.
+                # Keep every finished background result durable, even in standby,
+                # and let workflow runs follow the pause state (review item 8).
                 background.maintain(completion_store)
+                background.set_processing(completion_store, config_enabled and gate_enabled)
 
                 # Capture staging and its Systems projection are independent
                 # from the business/model gate.  A paused Christopher must not

@@ -162,6 +162,8 @@ def check_helper_tools(
     parent_agent: Any,
     helper_tools: Iterable[str],
     parent_tool_names: Iterable[str] | None = None,
+    *,
+    check_width: bool = True,
 ) -> set[str]:
     """Refuse a scoped helper whose tools are empty or wider than its parent's.
 
@@ -173,6 +175,8 @@ def check_helper_tools(
         raise HelperScopeError(
             "The helper would start with no tools, so it was not started."
         )
+    if not check_width:
+        return tools
     parent_tools = parent_tool_names
     if parent_tools is None:
         candidate = getattr(parent_agent, "valid_tool_names", None)

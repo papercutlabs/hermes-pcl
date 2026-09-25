@@ -42,6 +42,13 @@ WORKFLOW_TOOLSET = "pa-workflow"
 RUNNER_KINDS = ("readonly-investigation",)
 RUN_TIME_LIMIT_SECONDS = 3 * 3600
 _MAX_CONCURRENCY = 4
+# At most this many runs execute at once in one process (review B6.3).
+MAX_ACTIVE_RUNS = 3
+
+# run_id -> the reason the host wants it stopped (None while it may run).
+# "paused" leaves the run unfinished so it resumes; "timeout" ends it.
+_active_runs: Dict[str, Optional[str]] = {}
+_active_lock = threading.Lock()
 
 _construction_lock = threading.Lock()
 # run_id -> in-memory credentials of the live parent (never persisted)
@@ -73,9 +80,14 @@ class _ParentSpec:
     """
 
     def __init__(self, spec: Dict[str, Any], credentials: Dict[str, Any]):
+        from agent.pa_delegation import HELPER_KIND_TOOLSETS
+
         for name in _PARENT_FIELDS:
             setattr(self, name, spec.get(name))
-        self.enabled_toolsets = list(spec.get("enabled_toolsets") or [])
+        # Only the read-only toolset, whatever the starting parent had, so no
+        # path through this parent can build an edit helper (review B1).
+        readonly = HELPER_KIND_TOOLSETS[RUNNER_KINDS[0]]
+        self.enabled_toolsets = [readonly] if readonly in (spec.get("enabled_toolsets") or []) else []
         self.valid_tool_names = set(spec.get("valid_tool_names") or [])
         self.api_key = credentials.get("api_key")
         if credentials.get("base_url"):
@@ -174,10 +186,53 @@ def _emit_completion(store: WorkflowStore, run_id: str, status: Dict[str, Any]) 
     return True
 
 
+def stop_workflow(run_id: str, reason: str) -> bool:
+    """Ask a run executing in this process to stop before its next helper."""
+    with _active_lock:
+        if run_id not in _active_runs:
+            return False
+        _active_runs[run_id] = reason
+        return True
+
+
+def pause_all_workflows() -> int:
+    """Christopher is paused: stop every active run; each stays resumable."""
+    with _active_lock:
+        for run_id in _active_runs:
+            _active_runs[run_id] = _active_runs[run_id] or "paused"
+        return len(_active_runs)
+
+
+def active_workflow_ids() -> set[str]:
+    with _active_lock:
+        return set(_active_runs)
+
+
+def _register_active(run_id: str) -> bool:
+    with _active_lock:
+        if run_id in _active_runs:
+            return False
+        if len(_active_runs) >= MAX_ACTIVE_RUNS:
+            return False
+        _active_runs[run_id] = None
+        return True
+
+
 def _run(run_id: str, parent: Any, *, emit: bool) -> Dict[str, Any]:
     store = _store()
+    record = store.get_run(run_id) or {}
+    deadline = float(record.get("created_at") or time.time()) + RUN_TIME_LIMIT_SECONDS
+
+    def stop_reason() -> Optional[str]:
+        with _active_lock:
+            reason = _active_runs.get(run_id)
+        if reason:
+            return reason
+        return "timeout" if time.time() > deadline else None
+
     runner = WorkflowRunner(
         store, _make_executor(parent), kinds=RUNNER_KINDS, max_concurrency=_MAX_CONCURRENCY,
+        stop_reason=stop_reason, max_script_seconds=RUN_TIME_LIMIT_SECONDS,
     )
     try:
         status = runner.run(run_id)
@@ -187,7 +242,10 @@ def _run(run_id: str, parent: Any, *, emit: bool) -> Dict[str, Any]:
         status = store.run_status(run_id)
     finally:
         _live_credentials.pop(run_id, None)
-    if emit:
+        with _active_lock:
+            _active_runs.pop(run_id, None)
+    # A paused run is still unfinished: no completion until it resumes and ends.
+    if emit and status.get("status") != "running":
         _emit_completion(store, run_id, status)
     return status
 
@@ -240,6 +298,11 @@ def workflow_start(
     except ScriptRefused as exc:
         return tool_error(f"Script refused: {exc}")
     run_id = f"wf-{uuid.uuid4().hex[:12]}"
+    if not _register_active(run_id):
+        return tool_error(
+            f"{MAX_ACTIVE_RUNS} workflow runs are already running; wait for one to finish "
+            "(workflow_status shows their progress) before starting another."
+        )
     title = (title or "").strip()[:200] or "workflow run"
     origin = _origin(parent_agent)
     started_by = {
@@ -287,6 +350,23 @@ def workflow_start(
     return json.dumps(status, ensure_ascii=False, default=str)
 
 
+def _release_on_error(fn):
+    """Free the active-run slot if workflow_start fails before a run starts."""
+    def wrapper(*args, **kwargs):
+        before = active_workflow_ids()
+        try:
+            return fn(*args, **kwargs)
+        except BaseException:
+            with _active_lock:
+                for run_id in active_workflow_ids() - before:
+                    _active_runs.pop(run_id, None)
+            raise
+    return wrapper
+
+
+workflow_start = _release_on_error(workflow_start)
+
+
 def workflow_status(run_id: Optional[str] = None, parent_agent: Any = None) -> str:
     from gateway.session_context import get_session_env
     from tools.registry import tool_error
@@ -299,7 +379,7 @@ def workflow_status(run_id: Optional[str] = None, parent_agent: Any = None) -> s
     if run is None:
         return tool_error(f"No workflow run {run_id}.")
     run_chat = str(((run.get("started_by") or {}).get("chat_id")) or "")
-    if chat_id and run_chat and chat_id != run_chat:
+    if not chat_id or not run_chat or chat_id != run_chat:
         return tool_error(f"Workflow run {run_id} belongs to another conversation.")
     return json.dumps(store.run_status(run_id), ensure_ascii=False, default=str)
 
@@ -313,9 +393,16 @@ def prepare_workflow_recovery(completion_store: Any) -> list[str]:
     completed from its stored status now.  Unfinished runs are returned.
     """
     rows = completion_store.running(source="workflow")
-    if not rows:
-        return []
     store = _store()
+    tracked = {str(row["completion_id"]) for row in rows}
+    # A run carried out inside a turn has no completion row; if the process
+    # stopped during it, nothing can resume it, so it ends failed (review B6.4).
+    for run in store.unfinished_runs():
+        if run["run_id"] not in tracked and run["run_id"] not in active_workflow_ids():
+            store.finish_run(
+                run["run_id"], status="failed", output=None,
+                error="the process stopped while this run was being carried out inside a turn",
+            )
     keep: list[str] = []
     for row in rows:
         run_id = str(row["completion_id"])
@@ -339,12 +426,19 @@ def prepare_workflow_recovery(completion_store: Any) -> list[str]:
     return keep
 
 
-def resume_workflow_runs(run_ids: list[str]) -> None:
-    """Resume unfinished runs in this process from their stored results."""
+def resume_workflow_runs(run_ids: list[str]) -> list[str]:
+    """Resume unfinished runs in this process from their stored results.
+
+    Called by the consumer only while processing is enabled (review item 8).
+    Returns the runs actually started.
+    """
     store = _store()
     credentials: Dict[str, Any] = {}
+    started: list[str] = []
     for run_id in run_ids:
         run = store.get_run(run_id) or {}
+        if run.get("status") != "running" or not _register_active(run_id):
+            continue
         spec = dict((run.get("origin") or {}).get("parent") or {})
         if not credentials:
             try:
@@ -353,6 +447,8 @@ def resume_workflow_runs(run_ids: list[str]) -> None:
                 logger.error("workflow resume: no runtime credentials: %s", exc)
                 credentials = {}
         _start_thread(run_id, _ParentSpec(spec, credentials))
+        started.append(run_id)
+    return started
 
 
 # ── registry ────────────────────────────────────────────────────────────────
