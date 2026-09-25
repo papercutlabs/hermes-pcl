@@ -25,6 +25,7 @@ import yaml
 import gateway.run as gateway_run
 import toolsets as toolsets_module
 from agent.pa_delegation import (
+    HelperScopeError,
     MANAGEMENT_EXPLICIT_EDIT_CHILD_TOOLSET,
     MANAGEMENT_READONLY_CHILD_TOOLSET,
     delegation_child_toolsets,
@@ -180,8 +181,12 @@ def _parent(enabled_toolsets):
     return parent
 
 
-def _child_toolsets(parent, requested):
-    """Build one child with the real native builder; return its toolsets."""
+def _child_toolsets(parent, requested, profile=None):
+    """Build one child with the real native builder; return its toolsets.
+
+    PA-203 round 2: on the Management route the helper kind (``profile``)
+    fixes the toolsets and ``requested`` is ignored.
+    """
     with patch("run_agent.AIAgent") as child_cls:
         child_cls.return_value = MagicMock()
         _build_child_agent(
@@ -193,6 +198,7 @@ def _child_toolsets(parent, requested):
             max_iterations=10,
             task_count=1,
             parent_agent=parent,
+            profile=profile,
         )
     return child_cls.call_args.kwargs["enabled_toolsets"]
 
@@ -217,31 +223,32 @@ def test_policy_scopes_only_the_management_route():
     assert delegation_child_toolsets(None, MANAGEMENT_ENABLED) is None
 
 
-def test_management_parent_without_either_child_toolset_gives_children_nothing():
+def test_management_parent_without_either_child_toolset_starts_no_helper():
+    """Round 2: a helper never starts with no tools; it is refused instead."""
     enabled = [name for name in MANAGEMENT_ENABLED if name not in BOTH]
     assert delegation_child_toolsets(_context(), enabled) == []
 
     parent = _parent(list(enabled))
     scope_delegation_children(parent, enabled, _context())
 
-    assert _child_toolsets(parent, None) == []
-    assert _child_toolsets(parent, WRITE_REQUEST) == []
-    assert _child_toolsets(parent, [EXPLICIT]) == []
+    for requested, profile in ((None, None), (WRITE_REQUEST, None), ([EXPLICIT], "explicit-case-edit")):
+        with pytest.raises(HelperScopeError):
+            _child_toolsets(parent, requested, profile)
 
 
 # ── (a) omitted toolsets → only the two allowed toolsets ──────────────────
 
 
-def test_omitted_toolsets_give_the_child_only_the_two_allowed_toolsets():
+def test_omitted_toolsets_give_the_child_only_the_readonly_kind():
+    """Round 2: no kind named means a read-only investigation helper."""
     parent = _parent(list(MANAGEMENT_ENABLED))
     scope_delegation_children(parent, list(MANAGEMENT_ENABLED), _context())
 
     child = _child_toolsets(parent, None)
 
-    assert child == BOTH
-    assert _tools(child) == set(EXPLICIT_TOOLS)
-    # The result recorder is the only recording tool; no other write arrives.
-    assert _tools(child) & WRITE_TOOLS == {RECORD}
+    assert child == [READONLY]
+    assert _tools(child) == set(READONLY_TOOLS)
+    assert not (_tools(child) & WRITE_TOOLS)
 
 
 def test_named_readonly_child_gets_exactly_the_readonly_set():
@@ -256,11 +263,14 @@ def test_named_readonly_child_gets_exactly_the_readonly_set():
 
 
 def test_explicit_edit_child_gets_exactly_the_explicit_edit_set():
-    """The per-case investigator profile names only the explicit-edit toolset."""
+    """The explicit single-case edit kind gets only the explicit-edit toolset."""
     parent = _parent(list(MANAGEMENT_ENABLED))
     scope_delegation_children(parent, list(MANAGEMENT_ENABLED), _context())
 
-    child = _child_toolsets(parent, [EXPLICIT])
+    # Naming the toolset alone no longer selects it (round 2): the kind does.
+    assert _child_toolsets(parent, [EXPLICIT]) == [READONLY]
+    assert _child_toolsets(parent, None, "whatsapp_case_investigator") == [EXPLICIT]
+    child = _child_toolsets(parent, ["pa-business"], "explicit-case-edit")
 
     assert child == [EXPLICIT]
     assert _tools(child) == set(EXPLICIT_TOOLS)
@@ -326,9 +336,7 @@ def test_explicit_mixed_request_keeps_only_the_readonly_part():
         [*WRITE_REQUEST, READONLY, "tgg-management-skill-readonly"],
     )
 
-    assert READONLY in child
-    assert EXPLICIT not in child
-    assert "tgg-management-skill-readonly" in child
+    assert child == [READONLY]
     assert _tools(child) <= set(READONLY_TOOLS)
     assert not (_tools(child) & WRITE_TOOLS)
 
@@ -430,10 +438,11 @@ def test_scheduled_management_job_children_are_readonly(tmp_path):
     assert READONLY in kwargs["enabled_toolsets"]
     assert "delegation" in kwargs["enabled_toolsets"]
     assert "delegation" not in (kwargs["disabled_toolsets"] or [])
-    # Its children get only the two allowed toolsets.
+    # Its children get only the toolset their kind fixes (round 2).
     assert parent.enabled_toolsets == BOTH
-    assert _child_toolsets(parent, None) == BOTH
-    assert _child_toolsets(parent, [EXPLICIT]) == [EXPLICIT]
+    assert _child_toolsets(parent, None) == [READONLY]
+    assert _child_toolsets(parent, [EXPLICIT]) == [READONLY]
+    assert _child_toolsets(parent, None, "explicit-case-edit") == [EXPLICIT]
     assert not (_tools(_child_toolsets(parent, WRITE_REQUEST)) & WRITE_TOOLS)
 
 
@@ -592,8 +601,9 @@ async def test_interactive_management_turn_children_are_readonly(gateway_runner,
     assert agent.constructed_enabled_toolsets == MANAGEMENT_ENABLED
     # During its turn, delegation sees only the two allowed child toolsets.
     assert agent.child_scopes == [BOTH]
-    assert _child_toolsets(agent, None) == BOTH
-    assert _child_toolsets(agent, [EXPLICIT]) == [EXPLICIT]
+    assert _child_toolsets(agent, None) == [READONLY]
+    assert _child_toolsets(agent, [EXPLICIT]) == [READONLY]
+    assert _child_toolsets(agent, None, "explicit-case-edit") == [EXPLICIT]
     stripped = _child_toolsets(agent, WRITE_REQUEST)
     assert not (_tools(stripped) & WRITE_TOOLS)
 
@@ -666,6 +676,10 @@ _ALLOWED_READS = {
     "cli.py": (16, "the interactive CLI's own attribute and its own agent; not the TGG gateway"),
     "acp_adapter/server.py": (2, "editor ACP sessions; not the TGG gateway"),
     "tui_gateway/server.py": (4, "TUI session display and tool listing; not the TGG gateway"),
+    # PA-203 round 2: both read the scoped child list itself, which is what
+    # they bound; neither narrows or rereads a parent's own tool list.
+    "agent/pa_delegation.py": (1, "fixed_helper_toolsets checks the kind's toolset is in the child scope"),
+    "tools/pa_workflow_tool.py": (2, "workflow start records and checks the scoped child list"),
 }
 
 

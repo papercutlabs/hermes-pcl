@@ -19,6 +19,14 @@ scheduling) can reach a child on this route.  Background mode is not gated
 here; it builds its child through the same function and gets the same scope.
 
 Any other route is left exactly as native delegation has it.
+
+PA-203 round 2 (Teren, 25 Sep): on this route the *kind* of helper fixes its
+tools; the model does not choose them.  There are two kinds, read-only
+investigation (the default) and explicit single-case edit, selected by the
+delegation ``profile``.  Any toolset names the model passes are ignored.  A
+helper whose kind's toolset the parent lacks, or whose tools would be empty or
+wider than the parent's, is refused before it starts: no helper starts with
+no tools, and none gets more than its parent.
 """
 
 from __future__ import annotations
@@ -33,6 +41,29 @@ MANAGEMENT_CHILD_TOOLSETS = (
     MANAGEMENT_READONLY_CHILD_TOOLSET,
     MANAGEMENT_EXPLICIT_EDIT_CHILD_TOOLSET,
 )
+
+# The two helper kinds and the one toolset each receives.  The model selects a
+# kind through the delegation ``profile``; the aliases are the names earlier
+# guidance and the per-case plugin already use.
+HELPER_KIND_READONLY = "readonly-investigation"
+HELPER_KIND_EXPLICIT_EDIT = "explicit-case-edit"
+HELPER_KIND_TOOLSETS = {
+    HELPER_KIND_READONLY: MANAGEMENT_READONLY_CHILD_TOOLSET,
+    HELPER_KIND_EXPLICIT_EDIT: MANAGEMENT_EXPLICIT_EDIT_CHILD_TOOLSET,
+}
+_HELPER_KIND_ALIASES = {
+    HELPER_KIND_READONLY: HELPER_KIND_READONLY,
+    MANAGEMENT_READONLY_CHILD_TOOLSET: HELPER_KIND_READONLY,
+    HELPER_KIND_EXPLICIT_EDIT: HELPER_KIND_EXPLICIT_EDIT,
+    MANAGEMENT_EXPLICIT_EDIT_CHILD_TOOLSET: HELPER_KIND_EXPLICIT_EDIT,
+    # tgg-per-case-whatsapp's investigator profile (the prepare -> delegate spec).
+    "whatsapp_case_investigator": HELPER_KIND_EXPLICIT_EDIT,
+}
+
+
+class HelperScopeError(ValueError):
+    """A helper cannot be started with a fixed, non-empty, parent-bounded scope."""
+
 
 # Marks an agent whose ``enabled_toolsets`` the PA layer replaced, so a cached
 # gateway agent that later serves another route gets its own list back.
@@ -80,3 +111,77 @@ def scope_delegation_children(
         return
     agent.enabled_toolsets = scope
     setattr(agent, _SCOPED_MARKER, True)
+
+
+def is_scoped(agent: Any) -> bool:
+    """True when the PA layer fixed this agent's delegation children."""
+    return bool(getattr(agent, "__dict__", {}).get(_SCOPED_MARKER))
+
+
+def helper_kind(profile: Any) -> str:
+    """Resolve a delegation profile to one of the two helper kinds.
+
+    No profile means read-only investigation.  Any other unknown name is
+    refused, so a typo cannot silently widen or empty a helper.
+    """
+    name = str(profile or "").strip()
+    if not name:
+        return HELPER_KIND_READONLY
+    kind = _HELPER_KIND_ALIASES.get(name)
+    if kind is None:
+        raise HelperScopeError(
+            f"Unknown helper kind {name!r}. On this route a helper is either "
+            f"profile={HELPER_KIND_READONLY!r} (the default) or "
+            f"profile={HELPER_KIND_EXPLICIT_EDIT!r} for one explicitly requested case edit; "
+            "toolsets are fixed by the kind."
+        )
+    return kind
+
+
+def fixed_helper_toolsets(parent_agent: Any, profile: Any) -> list[str] | None:
+    """The only toolsets a helper of this parent may receive, or ``None``.
+
+    ``None`` means the parent is not on the scoped Management route and native
+    delegation applies unchanged.  Otherwise the answer is exactly one toolset,
+    chosen by the helper kind; it must be one the parent itself has.
+    """
+    if not is_scoped(parent_agent):
+        return None
+    kind = helper_kind(profile)
+    toolset = HELPER_KIND_TOOLSETS[kind]
+    available = list(getattr(parent_agent, "enabled_toolsets", None) or [])
+    if toolset not in available:
+        raise HelperScopeError(
+            f"A {kind} helper needs the {toolset} toolset, which this conversation "
+            "does not have, so no helper was started."
+        )
+    return [toolset]
+
+
+def check_helper_tools(
+    parent_agent: Any,
+    helper_tools: Iterable[str],
+    parent_tool_names: Iterable[str] | None = None,
+) -> set[str]:
+    """Refuse a scoped helper whose tools are empty or wider than its parent's.
+
+    ``helper_tools`` are the helper's tool names.  The parent's are read from
+    its ``valid_tool_names`` unless given.  Returns the helper's tool names.
+    """
+    tools = {str(name) for name in helper_tools}
+    if not tools:
+        raise HelperScopeError(
+            "The helper would start with no tools, so it was not started."
+        )
+    parent_tools = parent_tool_names
+    if parent_tools is None:
+        candidate = getattr(parent_agent, "valid_tool_names", None)
+        parent_tools = candidate if isinstance(candidate, (set, frozenset, list, tuple)) else None
+    if parent_tools is not None:
+        extra = tools - {str(name) for name in parent_tools}
+        if extra:
+            raise HelperScopeError(
+                "The helper would receive tools its parent does not have "
+                f"({', '.join(sorted(extra))}), so it was not started."
+            )
+    return tools
