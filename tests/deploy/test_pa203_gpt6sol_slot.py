@@ -79,7 +79,7 @@ def test_deployment_spec_validates_with_the_slot():
     )
     result = json.loads(completed.stdout)
     assert result["ok"] is True
-    assert result["allowed_slots"][-2:] == ["gpt-5.6-terra-high", SLOT]
+    assert result["allowed_slots"][-3:-1] == ["gpt-5.6-terra-high", SLOT]
     spec = yaml.safe_load((DEPLOY / "client-agent-deployment.yaml").read_text())
     assert SLOT in spec["spec"]["engine"]["allowedSlots"]
     assert spec["spec"]["engine"]["switchCommand"].startswith(

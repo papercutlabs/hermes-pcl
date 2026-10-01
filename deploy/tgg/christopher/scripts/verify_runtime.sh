@@ -415,6 +415,7 @@ SLOT_MODELS = {
     "gpt-5.6-terra-medium": "gpt-5.6-terra",
     "gpt-5.6-terra-high": "gpt-5.6-terra",
     "gpt-6-sol-medium": "gpt-6-sol",
+    "gpt-6.1-sol-medium": "gpt-6.1-sol",
 }
 SLOT_REASONING_EFFORT = {
     "gpt-5.6-luna-low": "low",
@@ -422,6 +423,7 @@ SLOT_REASONING_EFFORT = {
     "gpt-5.6-terra-medium": "medium",
     "gpt-5.6-terra-high": "high",
     "gpt-6-sol-medium": "medium",
+    "gpt-6.1-sol-medium": "medium",
 }
 assert slot in SLOT_MODELS, slot
 slot_model = SLOT_MODELS[slot]
@@ -840,6 +842,7 @@ SLOT_MODELS = {
     "gpt-5.6-terra-medium": "gpt-5.6-terra",
     "gpt-5.6-terra-high": "gpt-5.6-terra",
     "gpt-6-sol-medium": "gpt-6-sol",
+    "gpt-6.1-sol-medium": "gpt-6.1-sol",
 }
 SLOT_REASONING_EFFORT = {
     "gpt-5.6-luna-low": "low",
@@ -847,6 +850,7 @@ SLOT_REASONING_EFFORT = {
     "gpt-5.6-terra-medium": "medium",
     "gpt-5.6-terra-high": "high",
     "gpt-6-sol-medium": "medium",
+    "gpt-6.1-sol-medium": "medium",
 }
 assert slot in SLOT_MODELS, slot
 assert p["ok"] is True
