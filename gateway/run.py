@@ -1143,6 +1143,40 @@ _TGG_NIGHTLY_ANALYZER_JOB_TYPE = "tgg_nightly_whatsapp"
 # fixed turn allowance can stop a healthy large-chat run.  Two hours remains
 # a hard operational ceiling for a genuinely stuck analyzer.
 _TGG_NIGHTLY_MAX_ANALYZER_SECONDS = 2 * 60 * 60
+# The TGG capability plugin (tgg-whatsapp-evidence post_compaction.py,
+# CONTINUOUS_TASK) routes any turn whose text carries this trigger to the
+# controller-owned continuous lane, and there refuses case lookups unless the
+# continuous controller holds an in-flight record for the batch.  The nightly
+# runner writes no such record, so a nightly analyzer's continuation must not
+# carry it (PA-203, 1 Oct AMK).  The continuous lane keeps it.
+_TGG_CONTINUOUS_INTERVAL_TRIGGER = re.compile(
+    r"\bContinuous WhatsApp interval\. batch_id=(nightly:\d{4}-\d{2}-\d{2}:[0-9a-f]{12})\. "
+    r"authoritative_chat_id=(\d+@g\.us)\."
+)
+
+
+def _tgg_nightly_continuation_lead(
+    original_message: Any,
+    batch_id: str,
+    authoritative_chat_id: str,
+) -> str:
+    """Return the lane-identifying opening of a same-session continuation.
+
+    The lane follows the turn being continued: a continuous-interval trigger
+    keeps its continuous wording; a nightly analyzer (or retry) continues as
+    the nightly lane, so the plugin treats its case lookups as plain reads.
+    """
+    if isinstance(original_message, str) and _TGG_CONTINUOUS_INTERVAL_TRIGGER.search(
+        original_message
+    ):
+        return (
+            f"Continuous WhatsApp interval. batch_id={batch_id}. "
+            f"authoritative_chat_id={authoritative_chat_id}. "
+        )
+    return (
+        f"Nightly WhatsApp analyzer continuation. batch_id={batch_id}. "
+        f"authoritative_chat_id={authoritative_chat_id}. "
+    )
 
 
 def _tgg_nightly_analyzer_trigger(
@@ -18738,9 +18772,10 @@ class GatewayRunner:
                                 f"classified. Start at exact cursor={resume_cursor}."
                             )
                         completion_prompt = (
-                            f"Continuous WhatsApp interval. batch_id={batch_id}. "
-                            f"authoritative_chat_id={authoritative_chat_id}. "
-                            "The immutable nightly chat receipt is still missing for "
+                            _tgg_nightly_continuation_lead(
+                                message, batch_id, authoritative_chat_id
+                            )
+                            + "The immutable nightly chat receipt is still missing for "
                             f"batch_id={batch_id} and authoritative_chat_id={authoritative_chat_id}. "
                             "Previous pages, image inspections and findings are durably saved. "
                             f"{page_instruction} Do not load the full chat ledger and do not revisit "
