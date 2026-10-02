@@ -1200,6 +1200,63 @@ def _tgg_nightly_analyzer_trigger(
     return batch_id, chat_id
 
 
+_TGG_NIGHTLY_ANALYZER_ROLES = frozenset({"amk", "hg", "pg", "sk", "rental", "backend"})
+_TGG_NIGHTLY_ASSIGNMENT_TRIGGER_MAX_CHARS = 4000
+
+
+def _tgg_nightly_assignment_prompt(
+    pa_job_type: str | None,
+    pa_context: Mapping[str, Any] | None,
+    original_message: Any,
+) -> str:
+    """Return the session-instruction block that pins a nightly analyzer's assignment.
+
+    PA compaction (preserve-recent) never keeps the first user message, and a
+    wide parallel tool turn at the cut can leave only the compaction marker, so
+    the trigger carrying the batch identity can vanish from the conversation
+    (PA-203, 1 Oct AMK: messages=110->1).  The agent appends its ephemeral
+    system prompt to the system instructions on every provider call; it never
+    passes through the compressor.  The assignment is carried there.
+
+    Only a nightly analyzer turn (the trigger or a retry; same-session
+    continuations reuse that agent) gets the block.  The continuous lane, the
+    consolidator and every other job return "", so their instructions stay
+    byte-identical.
+    """
+    trigger = _tgg_nightly_analyzer_trigger(pa_job_type, pa_context)
+    if trigger is None:
+        return ""
+    if pa_context.get("continuous_interval") is True:
+        return ""
+    if isinstance(original_message, str) and _TGG_CONTINUOUS_INTERVAL_TRIGGER.search(
+        original_message
+    ):
+        return ""
+    role = pa_context.get("nightly_role")
+    if not isinstance(role, str) or role not in _TGG_NIGHTLY_ANALYZER_ROLES:
+        return ""
+    batch_id, authoritative_chat_id = trigger
+    lines = [
+        "[PA NIGHTLY ANALYZER ASSIGNMENT]",
+        "This session is one nightly WhatsApp analyzer. The runtime fixes this assignment "
+        "for the whole session: it holds after context compaction, in every same-session "
+        "continuation and in a retry of this analyzer. If the conversation no longer shows "
+        "the original trigger, this block is the assignment. Do not switch batch, chat or role.",
+        f"batch_id: {batch_id}",
+        f"authoritative_chat_id: {authoritative_chat_id}",
+        f"role: {role}",
+        f"frozen evidence: the frozen chat of batch_id={batch_id} for "
+        f"authoritative_chat_id={authoritative_chat_id}; work already saved durably for it is kept.",
+    ]
+    if (
+        isinstance(original_message, str)
+        and f"batch_id={batch_id}." in original_message
+        and len(original_message) <= _TGG_NIGHTLY_ASSIGNMENT_TRIGGER_MAX_CHARS
+    ):
+        lines.append("original trigger (verbatim): " + original_message.strip())
+    return "\n".join(lines)
+
+
 def _tgg_nightly_chat_receipt_snapshot(
     batch_id: str,
     authoritative_chat_id: str,
@@ -17978,6 +18035,23 @@ class GatewayRunner:
                     combined_ephemeral = (
                         combined_ephemeral + "\n\n" + _case_prompt
                     ).strip()
+            _nightly_assignment = _tgg_nightly_assignment_prompt(
+                pa_job_type, pa_context, message
+            )
+            if _nightly_assignment:
+                import hashlib as _hashlib
+
+                combined_ephemeral = (
+                    combined_ephemeral + "\n\n" + _nightly_assignment
+                ).strip()
+                logger.info(
+                    "nightly analyzer assignment pinned in session instructions: "
+                    "batch_id=%s authoritative_chat_id=%s role=%s sha256=%s",
+                    pa_context.get("nightly_batch_id"),
+                    pa_context.get("authoritative_chat_id"),
+                    pa_context.get("nightly_role"),
+                    _hashlib.sha256(_nightly_assignment.encode("utf-8")).hexdigest()[:16],
+                )
             if self._ephemeral_system_prompt:
                 combined_ephemeral = (combined_ephemeral + "\n\n" + self._ephemeral_system_prompt).strip()
             _record_pa_behavior_event(
