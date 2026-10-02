@@ -16,9 +16,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import concurrent.futures
 import copy
 import contextlib
 import fcntl
+import functools
 import hashlib
 import json
 import os
@@ -1681,6 +1683,26 @@ class DurableInbox:
             retention_file_error=file_error,
         )
 
+    def retention_attempt_due(
+        self, record: InboxRecord, *, retry_interval_seconds: float
+    ) -> bool:
+        """Whether a retention attempt on this row is due now (PA-203).
+
+        A row nobody has attempted is due.  A row with an attempt is due only
+        after the retry interval, the same spacing the capture lane keeps.
+        """
+        interval = max(0.0, float(retry_interval_seconds))
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT retention_attempts,retention_updated_at IS NULL "
+                "OR julianday(retention_updated_at) <= julianday('now', ?) AS spaced "
+                "FROM ingress_events WHERE seq=?",
+                (f"-{interval:.6f} seconds", record.seq),
+            ).fetchone()
+        if row is None:
+            raise ConsumerError(f"inbox record {record.seq} disappeared")
+        return int(row["retention_attempts"] or 0) == 0 or bool(row["spaced"])
+
     def retention_result(self, record: InboxRecord) -> dict[str, Any] | None:
         with self.connect() as conn:
             row = conn.execute(
@@ -2862,21 +2884,130 @@ _RETENTION_IN_FLIGHT: set[int] = set()
 _RETENTION_IN_FLIGHT_LOCK = threading.Lock()
 # Claim-path attempts run beside the turn, never ahead of it.
 _BACKGROUND_RETENTION: set[asyncio.Task] = set()
+# Retention threads have their own small pool, so a stalled Systems never
+# takes the default pool's threads from the turn's evidence write or presence
+# calls.  run_consumer shuts it down (waiting) before it returns.
+_RETENTION_WORKERS = 2
+_RETENTION_EXECUTOR: concurrent.futures.ThreadPoolExecutor | None = None
+_RETENTION_EXECUTOR_LOCK = threading.Lock()
+_CLAIM_PATH_NOT_COMPLETED = (
+    "media-retention-retry: claim-path attempt did not complete"
+)
+
+
+def _retention_executor() -> concurrent.futures.ThreadPoolExecutor:
+    global _RETENTION_EXECUTOR
+    with _RETENTION_EXECUTOR_LOCK:
+        if _RETENTION_EXECUTOR is None:
+            _RETENTION_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+                max_workers=_RETENTION_WORKERS,
+                thread_name_prefix="pa-media-retention",
+            )
+        return _RETENTION_EXECUTOR
+
+
+def _shutdown_retention_executor() -> None:
+    """Drop queued attempts and wait for running ones; none outlive the caller."""
+    global _RETENTION_EXECUTOR
+    with _RETENTION_EXECUTOR_LOCK:
+        executor, _RETENTION_EXECUTOR = _RETENTION_EXECUTOR, None
+    if executor is not None:
+        executor.shutdown(wait=True, cancel_futures=True)
+
+
+async def _in_retention_thread(function: Any, /, *args: Any, **kwargs: Any) -> Any:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        _retention_executor(), functools.partial(function, *args, **kwargs)
+    )
+
+
+def _retention_retry_cap(config_path: Path) -> int:
+    config = _retention_config(config_path)
+    return int(config["max_attempts"]) if config is not None else 5
+
+
+def _retention_retry_interval(config_path: Path) -> float:
+    config = _retention_config(config_path)
+    return float(config["retry_interval_seconds"]) if config is not None else 60.0
+
+
+@contextlib.contextmanager
+def _retention_claim(record: InboxRecord) -> Iterable[bool]:
+    """Hold this row's in-flight slot; yields False when another caller has it."""
+    with _RETENTION_IN_FLIGHT_LOCK:
+        if record.seq in _RETENTION_IN_FLIGHT:
+            owned = False
+        else:
+            _RETENTION_IN_FLIGHT.add(record.seq)
+            owned = True
+    try:
+        yield owned
+    finally:
+        if owned:
+            with _RETENTION_IN_FLIGHT_LOCK:
+                _RETENTION_IN_FLIGHT.discard(record.seq)
 
 
 def _ensure_retained_unless_in_flight(
-    inbox: DurableInbox, record: InboxRecord, *, config_path: Path
+    inbox: DurableInbox,
+    record: InboxRecord,
+    *,
+    config_path: Path,
+    claim_path: bool = False,
 ) -> dict[str, Any] | None:
-    """ensure_record_media_retained(), or None when another caller holds the row."""
-    with _RETENTION_IN_FLIGHT_LOCK:
-        if record.seq in _RETENTION_IN_FLIGHT:
+    """ensure_record_media_retained(), or None when the row is not ours to try.
+
+    None when another caller holds the row.  On the claim path, also None when
+    the row's state, re-read inside the claim, shows an attempt within the
+    retry interval (the capture lane just tried it).  On the claim path an
+    unexpected error is recorded as a retryable failure, so the row stays open
+    and counted, and is raised as MediaRetentionError.
+    """
+    with _retention_claim(record) as owned:
+        if not owned:
             return None
-        _RETENTION_IN_FLIGHT.add(record.seq)
-    try:
-        return ensure_record_media_retained(inbox, record, config_path=config_path)
-    finally:
-        with _RETENTION_IN_FLIGHT_LOCK:
-            _RETENTION_IN_FLIGHT.discard(record.seq)
+        if claim_path and not inbox.retention_attempt_due(
+            record, retry_interval_seconds=_retention_retry_interval(config_path)
+        ):
+            return None
+        try:
+            return ensure_record_media_retained(inbox, record, config_path=config_path)
+        except MediaRetentionError:
+            raise
+        except Exception as exc:
+            if not claim_path:
+                raise
+            error = f"media-retention-retry: claim-path attempt failed: {type(exc).__name__}: {exc}"
+            with contextlib.suppress(Exception):
+                inbox.record_retention(
+                    record, error=error, retry_cap=_retention_retry_cap(config_path)
+                )
+            raise MediaRetentionError(error) from exc
+
+
+def _record_claim_path_not_completed(
+    inbox: DurableInbox, record: InboxRecord, *, config_path: Path
+) -> bool:
+    """Keep a claimed row open when its claim-path attempt never recorded.
+
+    The row is about to become terminal; the capture lane retries terminal
+    rows only after an attempt, so an unrecorded attempt is recorded as a
+    retryable failure.  Skipped while another caller holds the row: its
+    attempt records.
+    """
+    with _retention_claim(record) as owned:
+        if not owned:
+            return False
+        view = inbox.with_retention_view(record)
+        if view.retention_state != "pending" or view.retention_attempts:
+            return False
+        inbox.record_retention(
+            record,
+            error=_CLAIM_PATH_NOT_COMPLETED,
+            retry_cap=_retention_retry_cap(config_path),
+        )
+        return True
 
 
 async def _retain_claimed_records(
@@ -2884,11 +3015,12 @@ async def _retain_claimed_records(
 ) -> None:
     for record in records:
         try:
-            await asyncio.to_thread(
+            await _in_retention_thread(
                 _ensure_retained_unless_in_flight,
                 inbox,
                 record,
                 config_path=config_path,
+                claim_path=True,
             )
         except MediaRetentionError as exc:
             print(
@@ -2896,24 +3028,23 @@ async def _retain_claimed_records(
                 f"chat={record.chat_id} message={record.message_id} error={exc}",
                 file=sys.stderr,
             )
-        except Exception as exc:
-            # Best effort only: the capture lane retries the row (it has an
-            # attempt recorded, or is still pending business).
-            print(
-                "media retention claim-path attempt FAILED: "
-                f"chat={record.chat_id} message={record.message_id} error={exc}",
-                file=sys.stderr,
-            )
+
+
+@dataclass
+class _ClaimPathRetention:
+    task: asyncio.Task
+    records: list[InboxRecord]
 
 
 def _start_claim_path_retention(
     inbox: DurableInbox, records: Sequence[InboxRecord], *, config_path: Path
-) -> asyncio.Task | None:
+) -> _ClaimPathRetention | None:
     """One best-effort attempt for claimed rows nobody has attempted yet (PA-203).
 
     It runs beside the turn, so a slow or stalled Systems never delays the
     turn's start.  Rows that already have an attempt are left to the capture
-    lane, which keeps retrying them after the turn.
+    lane, which keeps retrying them after the turn.  The caller settles it
+    with _settle_claim_path_retention() before the rows become terminal.
     """
     owed = [
         record for record in records
@@ -2926,7 +3057,43 @@ def _start_claim_path_retention(
     )
     _BACKGROUND_RETENTION.add(task)
     task.add_done_callback(_BACKGROUND_RETENTION.discard)
-    return task
+    return _ClaimPathRetention(task=task, records=owed)
+
+
+async def _settle_claim_path_retention(
+    inbox: DurableInbox, pending: _ClaimPathRetention | None, *, config_path: Path
+) -> None:
+    """Wait for the claim-path attempt, then make sure each row stays open.
+
+    Errors are suppressed: the turn's outcome never depends on retention.  A
+    row whose attempt was cancelled before it ran, or failed without being
+    recorded, gets a recorded retryable failure, so it is never terminal with
+    no attempt, which the capture lane would never retry.
+    """
+    if pending is None:
+        return
+    await asyncio.wait({pending.task})
+    if pending.task.cancelled():
+        reason = "cancelled"
+    else:
+        failure = pending.task.exception()
+        reason = f"{type(failure).__name__}: {failure}" if failure else None
+    if reason:
+        print(f"media retention claim-path task ended early: {reason}", file=sys.stderr)
+    for record in pending.records:
+        try:
+            if _record_claim_path_not_completed(inbox, record, config_path=config_path):
+                print(
+                    "media retention claim-path attempt did not complete; recorded for retry: "
+                    f"chat={record.chat_id} message={record.message_id}",
+                    file=sys.stderr,
+                )
+        except Exception as exc:
+            print(
+                "media retention claim-path settle FAILED: "
+                f"chat={record.chat_id} message={record.message_id} error={exc}",
+                file=sys.stderr,
+            )
 
 
 async def _drain_background_retention() -> None:
@@ -2955,7 +3122,7 @@ async def retain_pending_media(
     ):
         summary["examined"] += 1
         try:
-            result = await asyncio.to_thread(
+            result = await _in_retention_thread(
                 _ensure_retained_unless_in_flight,
                 inbox,
                 record,
@@ -5617,20 +5784,28 @@ async def _process_claimed_chat_batch_unlocked(
     ):
         # Retain the reason: a consumed-no-turn row must not look like an
         # unexplained model failure during nightly recovery.
-        # The row becomes terminal, so it gets its retention attempt now:
+        # The row becomes terminal, so it gets its retention attempt first:
         # the capture lane retries only terminal rows that have had one
-        # (PA-203).  Best effort, beside the lane, never ahead of it.
-        _start_claim_path_retention(
+        # (PA-203).  There is no turn here to delay.
+        claim_retention = _start_claim_path_retention(
             inbox,
             [inbox.with_retention_view(record) for record in records],
             config_path=config_path,
         )
+        try:
+            await _settle_claim_path_retention(
+                inbox, claim_retention, config_path=config_path
+            )
+        except asyncio.CancelledError:
+            inbox.requeue(records, reason="graceful-cancellation")
+            raise
         inbox.finish(
             records,
             status="skipped",
             error="PRIORITY_DIRECT_TRIGGER_NOT_RECOGNIZED",
         )
         return
+    claim_retention: _ClaimPathRetention | None = None
     try:
         # PA-203: retention never gates or delays the turn.  The turn reads
         # each attachment from capture.  Its retention state is re-read
@@ -5639,7 +5814,9 @@ async def _process_claimed_chat_batch_unlocked(
         # Rows nobody has attempted get one best-effort attempt beside the
         # turn; see _start_claim_path_retention.
         records = [inbox.with_retention_view(record) for record in records]
-        _start_claim_path_retention(inbox, records, config_path=config_path)
+        claim_retention = _start_claim_path_retention(
+            inbox, records, config_path=config_path
+        )
         # Systems validates business-write citations against bridge_message_log.
         # Project the exact claimed source rows before Hermes can run the model
         # and emit a business write.  The shared helper preserves the bounded
@@ -5766,6 +5943,11 @@ async def _process_claimed_chat_batch_unlocked(
                 result=result,
                 config_path=config_path,
             )
+        # The turn has run; settle the claim-path attempt before the rows
+        # become terminal, so none ends terminal without one (PA-203).
+        await _settle_claim_path_retention(
+            inbox, claim_retention, config_path=config_path
+        )
         # One transaction: a multi-turn batch can never land partially
         # terminal if the process exits between turn groups.
         inbox.finish_processed_batch(records, turn_for_message=turn_for_message)
@@ -5779,6 +5961,10 @@ async def _process_claimed_chat_batch_unlocked(
         inbox.requeue(records, reason=f"source-evidence-projection-retry: {exc}")
         raise
     except Exception as exc:
+        with contextlib.suppress(Exception):
+            await _settle_claim_path_retention(
+                inbox, claim_retention, config_path=config_path
+            )
         inbox.finish(records, status="failed", error=str(exc))
         raise
 
@@ -6554,6 +6740,17 @@ async def run_consumer(args: argparse.Namespace) -> int:
                 )
             raise
         finally:
+            # PA-203: no retention thread may write after run_consumer
+            # returns.  Cancel what is left, then wait for running attempts.
+            leftover = [
+                task for task in (retention_task, *_BACKGROUND_RETENTION)
+                if task is not None and not task.done()
+            ]
+            for task in leftover:
+                task.cancel()
+            if leftover:
+                await asyncio.gather(*leftover, return_exceptions=True)
+            _shutdown_retention_executor()
             _stop_cron_ticker(cron_stop, cron_thread)
             restore_completion_sink()
             if continuation_session_db is not None:

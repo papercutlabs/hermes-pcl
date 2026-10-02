@@ -18,6 +18,14 @@ from gateway.replay import replay_context
 from gateway.session import SessionSource, SessionStore
 
 
+@pytest.fixture(autouse=True)
+def _stop_media_retention_threads():
+    """Retention runs on its own pool (PA-203); run_consumer shuts it down,
+    and tests that call the retention paths directly do so here."""
+    yield
+    consumer._shutdown_retention_executor()
+
+
 def _message(message_id: str, chat_id: str = "test-group@g.us") -> dict:
     return {
         "messageId": message_id,

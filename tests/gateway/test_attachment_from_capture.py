@@ -7,6 +7,7 @@ Neither ever delays the turn's start.
 """
 
 import asyncio
+import concurrent.futures
 import json
 import sqlite3
 import threading
@@ -23,6 +24,14 @@ from gateway import durable_jsonl_consumer as consumer
 MANAGEMENT = "management@g.us"
 SITE = "site@g.us"
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+
+@pytest.fixture(autouse=True)
+def _stop_media_retention_threads():
+    """Retention runs on its own pool (PA-203); run_consumer shuts it down,
+    and tests that call the retention paths directly do so here."""
+    yield
+    consumer._shutdown_retention_executor()
 
 
 def _message(message_id: str, chat_id: str, *, body: str = "fixture message") -> dict:
@@ -332,22 +341,149 @@ async def test_a_stalled_systems_does_not_delay_the_turn_start(tmp_path, monkeyp
         _with_document(_message("DOC", MANAGEMENT), workbook),
     )
     started = time.monotonic()
+    batch = asyncio.create_task(env.process(_management_batch(env)))
     try:
-        await asyncio.wait_for(env.process(_management_batch(env), drain=False), timeout=5)
-        elapsed = time.monotonic() - started
-        # The turn ran and the rows finished while Systems was still stalled.
-        assert len(env.plans) == 1
-        assert elapsed < 3
-        assert env.row("IMG")["status"] == "completed"
-        assert env.row("DOC")["status"] == "completed"
+        while not env.plans and time.monotonic() - started < 5:
+            await asyncio.sleep(0.01)
+        # The turn started while Systems was stalled on the first attempt.
+        assert env.plans, "turn did not start while Systems was stalled"
+        assert time.monotonic() - started < 3
         assert systems.calls == 1
+        # The rows become terminal only after the claim-path attempt settles.
+        assert env.row("IMG")["status"] == "processing"
     finally:
         systems.stall.set()
-        await consumer._drain_background_retention()
-    # The attempts then ran one at a time and were recorded once each.
+        await asyncio.wait_for(batch, timeout=30)
+    assert env.row("IMG")["status"] == "completed"
+    assert env.row("DOC")["status"] == "completed"
+    # The attempts ran one at a time and were recorded once each.
     assert systems.calls == 2
     assert env.row("IMG")["retention_attempts"] == 1
     assert env.row("DOC")["retention_attempts"] == 1
+
+
+def _cancel_claim_path_before_it_runs(monkeypatch):
+    real = consumer._start_claim_path_retention
+
+    def start_then_cancel(*args, **kwargs):
+        pending = real(*args, **kwargs)
+        if pending is not None:
+            pending.task.cancel()
+        return pending
+
+    monkeypatch.setattr(consumer, "_start_claim_path_retention", start_then_cancel)
+
+
+def _fail_claim_path_unexpectedly(monkeypatch):
+    def locked(*_args, **_kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(consumer, "retain_record_media", locked)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["turn", "skip"])
+@pytest.mark.parametrize(
+    "failure, expected_error",
+    [
+        (_cancel_claim_path_before_it_runs, "claim-path attempt did not complete"),
+        (_fail_claim_path_unexpectedly, "claim-path attempt failed: OperationalError: database is locked"),
+    ],
+    ids=["cancelled-before-start", "generic-exception"],
+)
+async def test_a_claim_path_attempt_that_never_records_leaves_the_row_open(
+    tmp_path, monkeypatch, path, failure, expected_error
+):
+    env = _Env(tmp_path)
+    systems = _Systems(monkeypatch)
+    photo = _png(env.capture / "img_343434343434.png")
+    env.capture_events(_with_image(_message("IMG", MANAGEMENT, body="photo"), photo))
+    failure(monkeypatch)
+
+    await env.process(_management_batch(env), direct_trigger_required=(path == "skip"))
+
+    row = env.row("IMG")
+    assert row["status"] == ("completed" if path == "turn" else "skipped")
+    # Never terminal with no attempt: the row stays open, counted and retried.
+    assert row["retention_attempts"] == 1
+    assert row["retention_state"] == "held"
+    assert expected_error in row["retention_last_error"]
+    assert env.inbox.retention_counts()["retention_held"] == 1
+    env.make_retained_entries_old()
+    assert [r.message_id for r in env.inbox.retention_candidates(limit=5)] == ["IMG"]
+    # And the capture lane converges it once Systems answers.
+    monkeypatch.undo()
+    systems = _Systems(monkeypatch)
+    systems.available = True
+    await consumer.retain_pending_media(env.inbox, config_path=env.config, limit=25)
+    assert env.row("IMG")["retention_state"] == "complete"
+
+
+@pytest.mark.asyncio
+async def test_turn_work_proceeds_while_retention_threads_are_stalled(tmp_path, monkeypatch):
+    """Retention has its own pool: stalled attempts never take the default
+    pool's threads from the turn's evidence write."""
+    env = _Env(tmp_path)
+    systems = _Systems(monkeypatch)
+    systems.stall = threading.Event()
+    loop = asyncio.get_running_loop()
+    small_default_pool = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+    loop.set_default_executor(small_default_pool)
+    photos = [_png(env.capture / f"img_56565656565{i}.png") for i in range(3)]
+    env.capture_events(
+        _with_image(_message("A", "chat-a@g.us"), photos[0]),
+        _with_image(_message("B", "chat-b@g.us"), photos[1]),
+        _message("C", "chat-c@g.us"),  # no media: no retention of its own
+    )
+    _, site = env.inbox.pending_chat_batches(batch_size=25, priority_chats=set())
+    batches = {chat: records for chat, records in site}
+    # Two retention attempts stall at Systems: the dedicated pool is full.
+    stalled = [
+        asyncio.create_task(env.process(batches["chat-a@g.us"], drain=False)),
+        asyncio.create_task(env.process(batches["chat-b@g.us"], drain=False)),
+    ]
+    try:
+        deadline = time.monotonic() + 5
+        while systems.calls < 2 and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        assert systems.calls == 2
+        # A third chat's turn, with its evidence write on the default pool,
+        # still runs and finishes.
+        await asyncio.wait_for(
+            env.process(batches["chat-c@g.us"], drain=False), timeout=5
+        )
+        assert env.row("C")["status"] == "completed"
+    finally:
+        systems.stall.set()
+        await asyncio.wait_for(asyncio.gather(*stalled), timeout=30)
+        small_default_pool.shutdown(wait=True)
+    assert env.row("A")["status"] == "completed"
+    assert env.row("B")["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_claim_path_does_not_retry_a_row_the_capture_lane_just_attempted(
+    tmp_path, monkeypatch
+):
+    env = _Env(tmp_path)
+    systems = _Systems(monkeypatch)
+    photo = _png(env.capture / "img_787878787878.png")
+    env.capture_events(_with_image(_message("IMG", SITE), photo))
+    stale = env.inbox.retention_candidates(limit=1)[0]  # read before any attempt
+    await consumer.retain_pending_media(env.inbox, config_path=env.config, limit=25)
+    assert systems.calls == 1
+    # Re-read inside the claim: attempted just now, so not due.
+    assert consumer._ensure_retained_unless_in_flight(
+        env.inbox, stale, config_path=env.config, claim_path=True
+    ) is None
+    assert systems.calls == 1
+    # Once the retry interval has passed it is due again.
+    env.make_retained_entries_old()
+    with pytest.raises(consumer.MediaRetentionError):
+        consumer._ensure_retained_unless_in_flight(
+            env.inbox, stale, config_path=env.config, claim_path=True
+        )
+    assert systems.calls == 2
 
 
 @pytest.mark.asyncio
