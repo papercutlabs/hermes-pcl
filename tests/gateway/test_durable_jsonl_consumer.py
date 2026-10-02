@@ -1429,7 +1429,7 @@ async def test_pending_production_video_bypasses_retention_and_completes(
 
 
 @pytest.mark.asyncio
-async def test_production_normalized_missing_image_stays_pending_and_once_survives(
+async def test_production_normalized_missing_image_is_not_held_and_hold_stays_visible(
     tmp_path, monkeypatch
 ):
     args = _enabled_consumer_args(tmp_path, [])
@@ -1456,8 +1456,12 @@ async def test_production_normalized_missing_image_stays_pending_and_once_surviv
     )
     assert await consumer.run_consumer(args) == 0
     inbox = consumer.DurableInbox(Path(args.inbox))
-    assert inbox.counts() == {"pending": 1}
-    assert inbox.retention_counts()["retention_failures"] == 1
+    # PA-203: retention no longer holds the row.  It takes its normal path
+    # (here the fixture's mention rule skips it); the hold stays visible.
+    assert inbox.counts() == {"skipped": 1}
+    counts = inbox.retention_counts()
+    assert counts["retention_failures"] == 2
+    assert counts["retention_held"] == 1
     status = json.loads(Path(args.status_file).read_text())
     assert status["state"] == "held-pending"
     assert "media source is unavailable" in status["retention_hold"]
@@ -1498,13 +1502,15 @@ async def test_one_chat_retention_hold_does_not_kill_other_chat(tmp_path, monkey
     monkeypatch.setattr(consumer, "_new_gateway_runner", lambda *_a, **_k: object())
     assert await consumer.run_consumer(args) == 0
     inbox = consumer.DurableInbox(Path(args.inbox))
-    assert inbox.counts() == {"completed": 1, "pending": 1}
+    assert inbox.counts() == {"completed": 1, "skipped": 1}
     with inbox.connect() as conn:
         states = {
             row["message_id"]: row["status"]
             for row in conn.execute("SELECT message_id,status FROM ingress_events")
         }
-    assert states == {"MISSING": "pending", "HEALTHY": "completed"}
+    # PA-203: the held row is no longer kept pending; the fixture's mention
+    # rule skips it exactly as it would skip the same text without media.
+    assert states == {"MISSING": "skipped", "HEALTHY": "completed"}
     assert "media source is unavailable" in (inbox.retention_last_error() or "")
 
 
@@ -1942,7 +1948,7 @@ def test_retention_last_error_preserves_systems_status_code_and_error(
 
 
 @pytest.mark.asyncio
-async def test_retention_failure_requeues_before_model(tmp_path, monkeypatch):
+async def test_retention_failure_does_not_requeue_or_hold_the_turn(tmp_path, monkeypatch):
     inbox = consumer.DurableInbox(tmp_path / "inbox.db")
     source = tmp_path / "events.jsonl"
     _write_jsonl(source, [_message("retry-media")])
@@ -1960,20 +1966,25 @@ async def test_retention_failure_requeues_before_model(tmp_path, monkeypatch):
     model_called = False
     def fail_retention(*args, **kwargs):
         raise consumer.MediaRetentionError("systems unavailable")
-    async def model(*args, **kwargs):
+    async def model(records, **kwargs):
         nonlocal model_called
         model_called = True
+        return {
+            "submitted_message_ids": ["retry-media"],
+            "handled": [{"message_ids": ["retry-media"], "turn_id": "turn-1"}],
+            "captured_outbound": [],
+        }
     monkeypatch.setattr(consumer, "retain_record_media", fail_retention)
     monkeypatch.setattr(consumer, "process_live_records", model)
-    with pytest.raises(consumer.MediaRetentionError, match="systems unavailable"):
-        await consumer._process_claimed_chat_batch(
-            inbox, records, config_path=config, state_db=tmp_path / "state.db",
-            case_db=_write_case_db(tmp_path / "case.db"),
-            source_before_image_dir=tmp_path / "source-before-images",
-            gate_changed_at="2026-07-21T00:00:00+00:00", runner=object(),
-        )
-    assert model_called is False
-    assert inbox.counts() == {"pending": 1}
+    await consumer._process_claimed_chat_batch(
+        inbox, records, config_path=config, state_db=tmp_path / "state.db",
+        case_db=_write_case_db(tmp_path / "case.db"),
+        source_before_image_dir=tmp_path / "source-before-images",
+        gate_changed_at="2026-07-21T00:00:00+00:00", runner=object(),
+    )
+    # PA-203: the failure is recorded on the row and the turn runs anyway.
+    assert model_called is True
+    assert inbox.counts() == {"completed": 1}
     assert inbox.retention_counts() == {
         "retention_total": 0,
         "retention_failures": 1,
