@@ -1458,9 +1458,10 @@ async def test_production_normalized_missing_image_is_not_held_and_hold_stays_vi
     inbox = consumer.DurableInbox(Path(args.inbox))
     # PA-203: retention no longer holds the row.  It takes its normal path
     # (here the fixture's mention rule skips it); the hold stays visible.
+    # The capture lane and the skip path both reach it; one attempt counts.
     assert inbox.counts() == {"skipped": 1}
     counts = inbox.retention_counts()
-    assert counts["retention_failures"] == 2
+    assert counts["retention_failures"] == 1
     assert counts["retention_held"] == 1
     status = json.loads(Path(args.status_file).read_text())
     assert status["state"] == "held-pending"

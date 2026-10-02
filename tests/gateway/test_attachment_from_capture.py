@@ -1,12 +1,16 @@
 """PA-203: Christopher's turn does not wait on Systems media retention.
 
 The turn reads its attachments from capture.  Retention still runs: once,
-best effort, when the batch is claimed, and then in the capture lane until it
-converges, including after the row has been answered.
+best effort, beside the turn for a claimed row nobody has attempted, and in
+the capture lane until it converges, including after the row is answered.
+Neither ever delays the turn's start.
 """
 
+import asyncio
 import json
 import sqlite3
+import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -146,7 +150,9 @@ class _Env:
 
         return Runner()
 
-    async def process(self, records, *, direct_trigger_required: bool = False):
+    async def process(
+        self, records, *, direct_trigger_required: bool = False, drain: bool = True
+    ):
         # The real turn builder runs; the fixture runner has no state.db, so
         # the turn id the gateway would record is supplied here.
         real = consumer.process_live_records
@@ -161,6 +167,9 @@ class _Env:
             await self._process(records, direct_trigger_required=direct_trigger_required)
         finally:
             consumer.process_live_records = real
+        if drain:
+            # Claim-path retention runs beside the turn; wait for it here.
+            await consumer._drain_background_retention()
 
     async def _process(self, records, *, direct_trigger_required: bool):
         await consumer._process_claimed_chat_batch(
@@ -197,10 +206,14 @@ class _Systems:
     def __init__(self, monkeypatch):
         self.available = False
         self.calls = 0
+        self.stall: threading.Event | None = None
         monkeypatch.setattr(consumer, "_converge_retained_media", self)
 
     def __call__(self, *_args, **_kwargs):
         self.calls += 1
+        if self.stall is not None:
+            # A Systems that does not answer: held until released (20 s cap).
+            self.stall.wait(timeout=20)
         if not self.available:
             raise consumer.MediaRetentionError(
                 "status_code=400 code=MEDIA_NOT_FOUND "
@@ -254,24 +267,27 @@ async def test_batch_with_media_still_retaining_is_processed_immediately_with_it
     # No retained-copy line: retention had not converged, the capture path stands.
     assert "[Attachment retained" not in sent["DOC"]["body"]
     assert "Attachment unavailable" not in sent["DOC"]["body"]
-    # Answered, not requeued; the claim-path attempt was made and recorded.
+    # Answered, not requeued.  Both rows already had an attempt, so the claim
+    # path made no second call; the capture lane keeps retrying them.
     assert env.row("DOC")["status"] == "completed"
     assert env.row("IMG")["status"] == "completed"
-    assert env.row("DOC")["retention_attempts"] == 2
-    assert systems.calls == 4
+    assert env.row("DOC")["retention_attempts"] == 1
+    assert systems.calls == 2
 
 
 @pytest.mark.asyncio
-async def test_claim_path_retention_success_still_adds_the_retained_copy_line(
+async def test_retention_complete_at_turn_time_still_adds_the_retained_copy_line(
     tmp_path, monkeypatch
 ):
     env = _Env(tmp_path)
     systems = _Systems(monkeypatch)
+    systems.available = True
     workbook = _xlsx(env.capture / "doc_abcdefabcdef_jobs.xlsx")
     env.capture_events(_with_document(_message("DOC", MANAGEMENT), workbook))
     records = _management_batch(env)
     assert records[0].retention_state == "pending"
-    systems.available = True
+    # The capture lane converges it after selection and before the turn.
+    await consumer.retain_pending_media(env.inbox, config_path=env.config, limit=25)
 
     await env.process(records)
 
@@ -280,6 +296,229 @@ async def test_claim_path_retention_success_still_adds_the_retained_copy_line(
     assert "[Attachment retained for analysis in python_sandbox: /inputs/media/" in body
     assert env.row("DOC")["retention_state"] == "complete"
     assert env.row("DOC")["status"] == "completed"
+    assert systems.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_unattempted_claimed_row_gets_one_attempt_beside_the_turn(
+    tmp_path, monkeypatch
+):
+    env = _Env(tmp_path)
+    systems = _Systems(monkeypatch)
+    systems.available = True
+    workbook = _xlsx(env.capture / "doc_aaaaaaaaaaaa_jobs.xlsx")
+    env.capture_events(_with_document(_message("DOC", MANAGEMENT), workbook))
+
+    await env.process(_management_batch(env))
+
+    # The turn used capture (retention was not complete when it started); the
+    # claim-path attempt then converged the row.
+    assert "[Attachment retained" not in env.plans[0].messages[0]["body"]
+    assert env.plans[0].messages[0]["mediaUrls"] == [str(workbook)]
+    assert env.row("DOC")["retention_state"] == "complete"
+    assert env.row("DOC")["retention_attempts"] == 1
+    assert systems.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_a_stalled_systems_does_not_delay_the_turn_start(tmp_path, monkeypatch):
+    env = _Env(tmp_path)
+    systems = _Systems(monkeypatch)
+    systems.stall = threading.Event()
+    photo = _png(env.capture / "img_bbbbbbbbbbbb.png")
+    workbook = _xlsx(env.capture / "doc_cccccccccccc_w.xlsx")
+    env.capture_events(
+        _with_image(_message("IMG", MANAGEMENT), photo),
+        _with_document(_message("DOC", MANAGEMENT), workbook),
+    )
+    started = time.monotonic()
+    try:
+        await asyncio.wait_for(env.process(_management_batch(env), drain=False), timeout=5)
+        elapsed = time.monotonic() - started
+        # The turn ran and the rows finished while Systems was still stalled.
+        assert len(env.plans) == 1
+        assert elapsed < 3
+        assert env.row("IMG")["status"] == "completed"
+        assert env.row("DOC")["status"] == "completed"
+        assert systems.calls == 1
+    finally:
+        systems.stall.set()
+        await consumer._drain_background_retention()
+    # The attempts then ran one at a time and were recorded once each.
+    assert systems.calls == 2
+    assert env.row("IMG")["retention_attempts"] == 1
+    assert env.row("DOC")["retention_attempts"] == 1
+
+
+@pytest.mark.asyncio
+async def test_a_stalled_systems_does_not_delay_batch_selection_in_the_loop(
+    tmp_path, monkeypatch
+):
+    """The capture-lane pass runs beside batch selection in run_consumer."""
+    from tests.gateway.test_durable_jsonl_consumer import _enabled_consumer_args
+
+    args = _enabled_consumer_args(tmp_path, [])
+    capture = tmp_path / "capture"
+    capture.mkdir()
+    photo = _png(capture / "img_dddddddddddd.png")
+    config = Path(args.config)
+    data = yaml.safe_load(config.read_text())
+    data["pa"]["media_retention"] = {
+        "enabled": True, "media_root": str(tmp_path / "retained"),
+        "media_ref_prefix": "/media/tgg/hermes",
+        "source_roots": [str(capture)], "operation": "tgg_media_retention",
+        "min_free_percent": 0,
+    }
+    config.write_text(yaml.safe_dump(data), encoding="utf-8")
+    Path(args.source).write_text(
+        json.dumps({"type": "whatsapp_capture_event",
+                    "normalized": _with_image(_message("SITE-IMG", SITE), photo)}) + "\n",
+        encoding="utf-8",
+    )
+    systems = _Systems(monkeypatch)
+    systems.stall = threading.Event()
+    turn_started: list[float] = []
+
+    async def fake_process(records, **kwargs):
+        turn_started.append(time.monotonic())
+        return {
+            "submitted_message_ids": [r.message_id for r in records],
+            "handled": [{"message_ids": [r.message_id for r in records], "turn_id": "t"}],
+            "captured_outbound": [],
+        }
+
+    monkeypatch.setattr(consumer, "process_live_records", fake_process)
+    monkeypatch.setattr(consumer, "_new_gateway_runner", lambda *_a, **_k: object())
+    started = time.monotonic()
+    timer = threading.Timer(4, systems.stall.set)
+    timer.start()
+    try:
+        assert await consumer.run_consumer(args) == 0
+    finally:
+        timer.cancel()
+        systems.stall.set()
+    assert turn_started and turn_started[0] - started < 2
+    inbox = consumer.DurableInbox(Path(args.inbox))
+    assert inbox.counts() == {"completed": 1}
+    with inbox.connect() as conn:
+        attempts = conn.execute(
+            "SELECT retention_attempts FROM ingress_events WHERE message_id='SITE-IMG'"
+        ).fetchone()[0]
+    # The capture lane and the claim path both reached the row; one attempt.
+    assert attempts == 1
+    assert systems.calls == 1
+
+
+def test_concurrent_attempts_on_one_row_count_once(tmp_path, monkeypatch):
+    env = _Env(tmp_path)
+    systems = _Systems(monkeypatch)
+    systems.stall = threading.Event()
+    photo = _png(env.capture / "img_eeeeeeeeeeee.png")
+    env.capture_events(_with_image(_message("IMG", SITE), photo))
+    record = env.inbox.retention_candidates(limit=1)[0]
+    results: list = []
+    first = threading.Thread(target=lambda: results.append(_swallow(env, record)))
+    first.start()
+    deadline = time.monotonic() + 5
+    while systems.calls == 0 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    # A second caller (active steering, or the capture lane) skips the row.
+    assert consumer._ensure_retained_unless_in_flight(
+        env.inbox, record, config_path=env.config
+    ) is None
+    systems.stall.set()
+    first.join(timeout=10)
+    assert systems.calls == 1
+    assert env.row("IMG")["retention_attempts"] == 1
+
+
+def _swallow(env, record):
+    try:
+        return consumer._ensure_retained_unless_in_flight(
+            env.inbox, record, config_path=env.config
+        )
+    except consumer.MediaRetentionError as exc:
+        return exc
+
+
+@pytest.mark.asyncio
+async def test_turn_input_warns_when_a_held_file_is_missing(tmp_path, monkeypatch):
+    env = _Env(tmp_path)
+    _Systems(monkeypatch)
+    photo = _png(env.capture / "img_ffffffffffff.png")
+    env.capture_events(_with_image(_message("GONE", MANAGEMENT, body="see photo"), photo))
+    photo.unlink()
+    # The capture lane's attempt fails on the file itself: held, file level.
+    await consumer.retain_pending_media(env.inbox, config_path=env.config, limit=25)
+    assert env.row("GONE")["retention_state"] == "held"
+
+    await env.process(_management_batch(env))
+
+    body = env.plans[0].messages[0]["body"]
+    assert body.startswith("see photo\n\n")
+    assert (
+        "[Attachment unavailable: the captured file for message GONE is missing or "
+        "failed its file check. Do not infer or claim the attachment's contents.]"
+    ) in body
+    assert env.row("GONE")["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_turn_input_warns_for_a_failed_download_before_any_attempt(
+    tmp_path, monkeypatch
+):
+    env = _Env(tmp_path)
+    systems = _Systems(monkeypatch)
+    failed = _message("NO-FILE", MANAGEMENT, body="")
+    failed.update({"hasMedia": True, "mediaType": "image", "mediaUrls": []})
+    env.capture_events(failed)
+
+    await env.process(_management_batch(env), drain=False)
+
+    body = env.plans[0].messages[0]["body"]
+    assert "[Attachment unavailable: the captured file for message NO-FILE" in body
+    await consumer._drain_background_retention()
+    assert systems.calls == 0
+    assert env.row("NO-FILE")["retention_state"] == "held"
+
+
+@pytest.mark.asyncio
+async def test_a_systems_failure_on_a_present_file_carries_no_warning(
+    tmp_path, monkeypatch
+):
+    env = _Env(tmp_path)
+    _Systems(monkeypatch)
+    photo = _png(env.capture / "img_121212121212.png")
+    env.capture_events(_with_image(_message("IMG", MANAGEMENT, body="photo"), photo))
+    await consumer.retain_pending_media(env.inbox, config_path=env.config, limit=25)
+    assert env.row("IMG")["retention_state"] == "held"
+
+    await env.process(_management_batch(env))
+
+    assert env.plans[0].messages[0]["body"] == "photo"
+
+
+def test_retention_queue_queries_use_the_open_retention_index(tmp_path):
+    env = _Env(tmp_path)
+    statements: list[str] = []
+    real_connect = env.inbox.connect
+
+    def tracing_connect():
+        conn = real_connect()
+        conn.set_trace_callback(statements.append)
+        return conn
+
+    env.inbox.connect = tracing_connect
+    env.inbox.retention_candidates(limit=25, retry_interval_seconds=60)
+    env.inbox.retention_last_error()
+    queries = [q for q in statements if q.lstrip().upper().startswith("SELECT")]
+    assert len(queries) == 2
+    with real_connect() as conn:
+        for query in queries:
+            plan = " ".join(
+                str(row[3]) for row in conn.execute("EXPLAIN QUERY PLAN " + query)
+            )
+            assert "ingress_events_retention_open_idx" in plan, plan
 
 
 @pytest.mark.asyncio

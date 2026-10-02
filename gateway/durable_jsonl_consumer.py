@@ -404,6 +404,9 @@ class InboxRecord:
     source_envelope: dict[str, Any] | None = None
     retention_state: str | None = None
     retention_quarantined: bool = False
+    # PA-203: read at turn time by DurableInbox.with_retention_view().
+    retention_attempts: int = 0
+    retention_file_error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -433,6 +436,15 @@ def _is_management_document_delivery_key(
         _management_document_delivery_key(entry_id=entry_id, chat_id=chat_id),
         f"human-resolution:{entry_id}",
     }
+
+
+# PA-203: rows whose retention is still owed.  Pending business rows, and
+# rows already answered after at least one attempt.  Written once so the
+# partial index and every query that should use it carry identical terms.
+_RETENTION_OPEN = (
+    "retention_state IN ('pending','held') "
+    "AND (status='pending' OR retention_attempts>0)"
+)
 
 
 def _initial_retention_state(item: Mapping[str, Any]) -> str:
@@ -698,6 +710,14 @@ class DurableInbox:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS ingress_events_retention_queue_idx "
                 "ON ingress_events(status,retention_state,seq)"
+            )
+            # PA-203: open retention work only.  Answered rows stay here
+            # until retention converges; the 21 July legacy rows (no
+            # attempt, no longer pending) never enter it.
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS ingress_events_retention_open_idx "
+                "ON ingress_events(retention_state,retention_updated_at,seq) "
+                f"WHERE {_RETENTION_OPEN}"
             )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS ingress_events_projection_queue_idx "
@@ -1491,9 +1511,8 @@ class DurableInbox:
             rows = conn.execute(
                 "SELECT seq,message_id,chat_id,start_offset,end_offset,raw_json,"
                 "retention_state "
-                "FROM ingress_events WHERE status!='processing' "
-                "AND (status='pending' OR retention_attempts>0) "
-                "AND retention_state IN ('pending','held') "
+                f"FROM ingress_events WHERE {_RETENTION_OPEN} "
+                "AND status!='processing' "
                 "AND (retention_state='pending' OR retention_updated_at IS NULL "
                 "OR julianday(retention_updated_at) <= "
                 "julianday('now', ?)) "
@@ -1635,18 +1654,31 @@ class DurableInbox:
         """Return ``record`` with its current retention state and quarantine flag."""
         with self.connect() as conn:
             row = conn.execute(
-                "SELECT e.retention_state,"
-                "q.ingress_seq IS NOT NULL AS retention_quarantined "
+                "SELECT e.retention_state,e.retention_attempts,e.retention_last_error,"
+                "q.ingress_seq IS NOT NULL AS retention_quarantined,"
+                "(SELECT f.quarantine_eligible FROM media_retention_failures f "
+                "WHERE f.ingress_seq=e.seq ORDER BY f.attempt DESC LIMIT 1) "
+                "AS last_failure_file_level "
                 "FROM ingress_events e LEFT JOIN media_retention_quarantine q "
                 "ON q.ingress_seq=e.seq AND q.status='quarantined' WHERE e.seq=?",
                 (record.seq,),
             ).fetchone()
         if row is None:
             raise ConsumerError(f"inbox record {record.seq} disappeared")
+        state = str(row["retention_state"])
+        # A held row whose latest failure was about the file itself (missing,
+        # unreadable, not the declared type), not about Systems.
+        file_error = (
+            str(row["retention_last_error"] or "media file check failed")
+            if state == "held" and row["last_failure_file_level"]
+            else None
+        )
         return replace(
             record,
-            retention_state=str(row["retention_state"]),
+            retention_state=state,
             retention_quarantined=bool(row["retention_quarantined"]),
+            retention_attempts=int(row["retention_attempts"] or 0),
+            retention_file_error=file_error,
         )
 
     def retention_result(self, record: InboxRecord) -> dict[str, Any] | None:
@@ -1800,13 +1832,12 @@ class DurableInbox:
                 "SELECT COALESCE(SUM(retained_media_count),0),"
                 "COALESCE(SUM(retention_failures),0),"
                 "COALESCE(SUM(retention_attempts),0),"
-                "COALESCE(SUM(CASE WHEN retention_state='pending' "
-                "AND (status='pending' OR retention_attempts>0) THEN 1 ELSE 0 END),0),"
+                f"COALESCE(SUM(CASE WHEN {_RETENTION_OPEN} "
+                "AND retention_state='pending' THEN 1 ELSE 0 END),0),"
                 "COALESCE(SUM(CASE WHEN retention_state='complete' THEN 1 ELSE 0 END),0),"
                 "COALESCE(SUM(CASE WHEN retention_state='bypassed' THEN 1 ELSE 0 END),0),"
-                "COALESCE(SUM(CASE WHEN retention_state='held' "
-                "AND (status IN ('pending','processing') OR retention_attempts>0) "
-                "THEN 1 ELSE 0 END),0) "
+                f"COALESCE(SUM(CASE WHEN {_RETENTION_OPEN} "
+                "AND retention_state='held' THEN 1 ELSE 0 END),0) "
                 "FROM ingress_events"
             ).fetchone()
             quarantine_row = conn.execute(
@@ -1851,8 +1882,7 @@ class DurableInbox:
         with self.connect() as conn:
             row = conn.execute(
                 "SELECT retention_last_error FROM ingress_events "
-                "WHERE (status IN ('pending','processing') OR retention_attempts>0) "
-                "AND retention_state='held' "
+                f"WHERE {_RETENTION_OPEN} AND retention_state='held' "
                 "ORDER BY retention_updated_at DESC, seq DESC LIMIT 1"
             ).fetchone()
         return str(row[0]) if row else None
@@ -2825,6 +2855,86 @@ def ensure_record_media_retained(
     return result
 
 
+# PA-203: one retention attempt per row at a time.  The capture lane and the
+# claim path (including active steering) can reach the same row at once; the
+# second caller skips, so each recorded attempt is one actual attempt.
+_RETENTION_IN_FLIGHT: set[int] = set()
+_RETENTION_IN_FLIGHT_LOCK = threading.Lock()
+# Claim-path attempts run beside the turn, never ahead of it.
+_BACKGROUND_RETENTION: set[asyncio.Task] = set()
+
+
+def _ensure_retained_unless_in_flight(
+    inbox: DurableInbox, record: InboxRecord, *, config_path: Path
+) -> dict[str, Any] | None:
+    """ensure_record_media_retained(), or None when another caller holds the row."""
+    with _RETENTION_IN_FLIGHT_LOCK:
+        if record.seq in _RETENTION_IN_FLIGHT:
+            return None
+        _RETENTION_IN_FLIGHT.add(record.seq)
+    try:
+        return ensure_record_media_retained(inbox, record, config_path=config_path)
+    finally:
+        with _RETENTION_IN_FLIGHT_LOCK:
+            _RETENTION_IN_FLIGHT.discard(record.seq)
+
+
+async def _retain_claimed_records(
+    inbox: DurableInbox, records: Sequence[InboxRecord], *, config_path: Path
+) -> None:
+    for record in records:
+        try:
+            await asyncio.to_thread(
+                _ensure_retained_unless_in_flight,
+                inbox,
+                record,
+                config_path=config_path,
+            )
+        except MediaRetentionError as exc:
+            print(
+                "media retention not yet converged; turn proceeds from capture: "
+                f"chat={record.chat_id} message={record.message_id} error={exc}",
+                file=sys.stderr,
+            )
+        except Exception as exc:
+            # Best effort only: the capture lane retries the row (it has an
+            # attempt recorded, or is still pending business).
+            print(
+                "media retention claim-path attempt FAILED: "
+                f"chat={record.chat_id} message={record.message_id} error={exc}",
+                file=sys.stderr,
+            )
+
+
+def _start_claim_path_retention(
+    inbox: DurableInbox, records: Sequence[InboxRecord], *, config_path: Path
+) -> asyncio.Task | None:
+    """One best-effort attempt for claimed rows nobody has attempted yet (PA-203).
+
+    It runs beside the turn, so a slow or stalled Systems never delays the
+    turn's start.  Rows that already have an attempt are left to the capture
+    lane, which keeps retrying them after the turn.
+    """
+    owed = [
+        record for record in records
+        if record.retention_state == "pending" and record.retention_attempts == 0
+    ]
+    if not owed:
+        return None
+    task = asyncio.create_task(
+        _retain_claimed_records(inbox, owed, config_path=config_path)
+    )
+    _BACKGROUND_RETENTION.add(task)
+    task.add_done_callback(_BACKGROUND_RETENTION.discard)
+    return task
+
+
+async def _drain_background_retention() -> None:
+    """Wait for claim-path attempts (the --once boundary and tests)."""
+    while _BACKGROUND_RETENTION:
+        await asyncio.gather(*list(_BACKGROUND_RETENTION), return_exceptions=True)
+
+
 async def retain_pending_media(
     inbox: DurableInbox, *, config_path: Path, limit: int
 ) -> dict[str, int]:
@@ -2846,11 +2956,13 @@ async def retain_pending_media(
         summary["examined"] += 1
         try:
             result = await asyncio.to_thread(
-                ensure_record_media_retained,
+                _ensure_retained_unless_in_flight,
                 inbox,
                 record,
                 config_path=config_path,
             )
+            if result is None:
+                continue
         except MediaRetentionError as exc:
             summary["held"] += 1
             print(
@@ -3072,6 +3184,34 @@ def _mutable_bridge_item(value: dict[str, Any]) -> dict[str, Any]:
     return item
 
 
+def _capture_media_unavailable(
+    item: Mapping[str, Any], source_roots: Sequence[Path]
+) -> str | None:
+    """Why this event's attachment cannot be read from capture, or None.
+
+    PA-203: the turn reads attachments from capture and no longer waits for
+    retention, so the turn itself must say when a file it was told about is
+    not there (for example a failed download).  Local checks only, the same
+    ones retention applies to the source file; Systems is never asked.
+    """
+    try:
+        images = _event_media(item)
+        documents = _event_retainable_documents(item)
+    except ItemMediaRetentionError as exc:
+        return str(exc)
+    if not images and not documents:
+        coarse = str(item.get("mediaType") or item.get("mimeType") or "")
+        if coarse.split("/", 1)[0].strip().lower() == "image" and item.get("hasMedia") is True:
+            return "mandatory inbound media has no resolvable capture path"
+        return None
+    for _ordinal, raw_path, _declared in (*documents, *images):
+        try:
+            _contained_existing_file(raw_path, source_roots)
+        except ItemMediaRetentionError as exc:
+            return str(exc)
+    return None
+
+
 def _replay_messages_with_retained_documents(
     records: Sequence[InboxRecord],
     *,
@@ -3138,6 +3278,18 @@ def _replay_messages_with_retained_documents(
             warning = (
                 "[Attachment unavailable: retention quarantine for message "
                 f"{record.message_id}. Do not infer or claim the attachment's contents.]"
+            )
+            body = str(item.get("body") or item.get("text") or "").rstrip()
+            item["body"] = (body + "\n\n" if body else "") + warning
+            continue
+        if record.retention_file_error is not None or (
+            config is not None
+            and _capture_media_unavailable(item, config["source_roots"]) is not None
+        ):
+            warning = (
+                "[Attachment unavailable: the captured file for message "
+                f"{record.message_id} is missing or failed its file check. "
+                "Do not infer or claim the attachment's contents.]"
             )
             body = str(item.get("body") or item.get("text") or "").rstrip()
             item["body"] = (body + "\n\n" if body else "") + warning
@@ -5437,37 +5589,6 @@ async def run_management_document_canary(args: argparse.Namespace) -> int:
     return 0
 
 
-async def _attempt_media_retention_once(
-    inbox: DurableInbox,
-    records: Sequence[InboxRecord],
-    *,
-    config_path: Path,
-) -> list[InboxRecord]:
-    """One best-effort retention attempt per claimed record (PA-203).
-
-    A retryable failure is recorded on the row and the capture lane keeps
-    retrying it after the turn, so the batch is neither held nor requeued.
-    Permanent refusal and quarantine keep their handling inside
-    ``ensure_record_media_retained``.  The records are re-read so a retained
-    copy or a quarantine warning reached in this attempt reaches the turn.
-    """
-    for record in records:
-        try:
-            await asyncio.to_thread(
-                ensure_record_media_retained,
-                inbox,
-                record,
-                config_path=config_path,
-            )
-        except MediaRetentionError as exc:
-            print(
-                "media retention not yet converged; turn proceeds from capture: "
-                f"chat={record.chat_id} message={record.message_id} error={exc}",
-                file=sys.stderr,
-            )
-    return [inbox.with_retention_view(record) for record in records]
-
-
 async def _process_claimed_chat_batch_unlocked(
     inbox: DurableInbox,
     records: Sequence[InboxRecord],
@@ -5496,19 +5617,14 @@ async def _process_claimed_chat_batch_unlocked(
     ):
         # Retain the reason: a consumed-no-turn row must not look like an
         # unexplained model failure during nightly recovery.
-        # The row is about to become terminal, so record one retention
-        # attempt while it is still claimed: the capture lane retries only
-        # terminal rows that have had one (PA-203).  Best effort only.
-        try:
-            await _attempt_media_retention_once(
-                inbox, records, config_path=config_path
-            )
-        except Exception as exc:
-            print(
-                "media retention attempt before skip FAILED "
-                f"chat={records[0].chat_id}: {exc}",
-                file=sys.stderr,
-            )
+        # The row becomes terminal, so it gets its retention attempt now:
+        # the capture lane retries only terminal rows that have had one
+        # (PA-203).  Best effort, beside the lane, never ahead of it.
+        _start_claim_path_retention(
+            inbox,
+            [inbox.with_retention_view(record) for record in records],
+            config_path=config_path,
+        )
         inbox.finish(
             records,
             status="skipped",
@@ -5516,11 +5632,14 @@ async def _process_claimed_chat_batch_unlocked(
         )
         return
     try:
-        # PA-203: retention never gates the turn.  The turn reads each
-        # attachment from capture; see _attempt_media_retention_once.
-        records = await _attempt_media_retention_once(
-            inbox, records, config_path=config_path
-        )
+        # PA-203: retention never gates or delays the turn.  The turn reads
+        # each attachment from capture.  Its retention state is re-read
+        # locally (no Systems call), so a retained-copy line, a quarantine
+        # warning or a missing-file warning reflects the latest attempt.
+        # Rows nobody has attempted get one best-effort attempt beside the
+        # turn; see _start_claim_path_retention.
+        records = [inbox.with_retention_view(record) for record in records]
+        _start_claim_path_retention(inbox, records, config_path=config_path)
         # Systems validates business-write citations against bridge_message_log.
         # Project the exact claimed source rows before Hermes can run the model
         # and emit a business write.  The shared helper preserves the bounded
@@ -5867,6 +5986,11 @@ async def run_consumer(args: argparse.Namespace) -> int:
         tasks: dict[str, asyncio.Task[None]] = {}
         lanes: dict[str, str] = {}
         source_projection_holds: dict[str, str] = {}
+        # PA-203: the capture-lane retention pass runs beside batch selection.
+        retention_task: asyncio.Task[dict[str, int]] | None = None
+        retention_cycle: dict[str, int] = {
+            "examined": 0, "retained": 0, "bypassed": 0, "held": 0, "quarantined": 0,
+        }
         cron_stop, cron_thread = _start_cron_ticker()
         try:
             while True:
@@ -6113,13 +6237,22 @@ async def run_consumer(args: argparse.Namespace) -> int:
                 )
 
                 # Retention is a capture-lane concern, not a model/business
-                # concern.  It runs before demo-pause lane selection and never
-                # claims or terminals the business row.
-                retention_cycle = await retain_pending_media(
-                    inbox,
-                    config_path=config_path,
-                    limit=retention_batch_size,
-                )
+                # concern.  It never claims or terminals the business row.
+                # PA-203: one pass at a time runs as a background task, so a
+                # slow Systems never delays batch selection or a turn.  The
+                # status reports the last finished pass; a failure other than
+                # a recorded retention hold stays fatal, as before.
+                if retention_task is not None and retention_task.done():
+                    finished, retention_task = retention_task, None
+                    retention_cycle = finished.result()
+                if retention_task is None:
+                    retention_task = asyncio.create_task(
+                        retain_pending_media(
+                            inbox,
+                            config_path=config_path,
+                            limit=retention_batch_size,
+                        )
+                    )
 
                 try:
                     priority_chats = _priority_selector_chats(config_path)
@@ -6264,6 +6397,9 @@ async def run_consumer(args: argparse.Namespace) -> int:
                         lanes[chat_id] = "site"
 
                 if args.once:
+                    if retention_task is not None:
+                        finished, retention_task = retention_task, None
+                        retention_cycle = await finished
                     if tasks:
                         task_items = list(tasks.items())
                         outcomes = await asyncio.gather(
@@ -6288,6 +6424,7 @@ async def run_consumer(args: argparse.Namespace) -> int:
                                 source_projection_holds.pop(chat_id, None)
                         tasks.clear()
                         lanes.clear()
+                    await _drain_background_retention()
                     counts = inbox.counts()
                     if sum(counts.values()) != expected_total:
                         raise ConsumerError(
@@ -6405,6 +6542,12 @@ async def run_consumer(args: argparse.Namespace) -> int:
             for task in tasks.values():
                 task.cancel()
             await asyncio.gather(*tasks.values(), return_exceptions=True)
+            pending_retention = [
+                task for task in (retention_task, *_BACKGROUND_RETENTION) if task is not None
+            ]
+            for task in pending_retention:
+                task.cancel()
+            await asyncio.gather(*pending_retention, return_exceptions=True)
             if inbox.total() != expected_total:
                 raise ConsumerError(
                     "inbox conservation failed during graceful cancellation"
