@@ -85,6 +85,52 @@ def _stop_cron_ticker(stop_event: threading.Event, thread: threading.Thread) -> 
     thread.join(timeout=5)
 
 
+# PA-333: the capability's photo-fill lane, a third background lane beside the
+# scheduler tick and media retention.  Its own thread: no site_concurrency slot,
+# no chat lock; a lane failure is logged and retried at the next loop.
+PHOTO_FILL_LANE = Path("runtime/capabilities/christopher-tgg/current/scripts/photo_fill_lane.py")
+_PHOTO_FILL: dict[str, Any] = {}
+
+
+def _photo_fill_lane(stop_event: threading.Event, config_path: Path, case_db: Path, status: dict, interval_seconds: float = 60.0) -> None:
+    import importlib.util
+    import logging
+
+    lane_path = config_path.parent / PHOTO_FILL_LANE
+    while not stop_event.is_set():
+        try:
+            if not lane_path.is_file():
+                status["last_outcome"] = "lane_not_installed"
+            else:
+                spec = importlib.util.spec_from_file_location("christopher_photo_fill_lane", lane_path)
+                module = importlib.util.module_from_spec(spec)
+                sys.modules[spec.name] = module
+                spec.loader.exec_module(module)
+                module.run_lane(stop_event, config_path, case_db, status=status)
+        except Exception as exc:
+            status["last_error_class"] = type(exc).__name__
+            logging.getLogger(__name__).exception("Christopher photo-fill lane failed")
+        stop_event.wait(interval_seconds)
+
+
+def _start_photo_fill_lane(config_path: Path, case_db: Path) -> tuple[threading.Event, threading.Thread]:
+    stop_event, status = threading.Event(), {"mode": None, "last_loop_at": None, "last_outcome": None, "last_case": None, "last_error_class": None}
+    thread = threading.Thread(target=_photo_fill_lane, args=(stop_event, config_path, case_db, status), name="christopher-photo-fill-lane", daemon=True)
+    _PHOTO_FILL.update(status=status, thread=thread)
+    thread.start()
+    return stop_event, thread
+
+
+def _stop_photo_fill_lane(stop_event: threading.Event, thread: threading.Thread) -> None:
+    stop_event.set()
+    thread.join(timeout=5)
+
+
+def _photo_fill_status() -> dict[str, Any]:
+    thread = _PHOTO_FILL.get("thread")
+    return {"photo_fill_lane": {**_PHOTO_FILL["status"], "thread_alive": thread.is_alive()}} if thread else {}
+
+
 def _parse_ingress_timestamp(value: Any) -> datetime:
     """Normalize bridge timestamps without guessing the timezone.
 
@@ -5656,6 +5702,7 @@ def _write_status(path: Path, payload: Mapping[str, Any]) -> None:
             "updated_at": _utc_now(),
             **dict(payload),
             "loaded_catalog": _loaded_catalog_status(),
+            **_photo_fill_status(),
         },
     )
 
@@ -6178,6 +6225,7 @@ async def run_consumer(args: argparse.Namespace) -> int:
             "examined": 0, "retained": 0, "bypassed": 0, "held": 0, "quarantined": 0,
         }
         cron_stop, cron_thread = _start_cron_ticker()
+        fill_stop, fill_thread = _start_photo_fill_lane(config_path, case_db)
         try:
             while True:
                 # Keep the existing opt-in configuration reload behaviour.
@@ -6752,6 +6800,7 @@ async def run_consumer(args: argparse.Namespace) -> int:
                 await asyncio.gather(*leftover, return_exceptions=True)
             _shutdown_retention_executor()
             _stop_cron_ticker(cron_stop, cron_thread)
+            _stop_photo_fill_lane(fill_stop, fill_thread)
             restore_completion_sink()
             if continuation_session_db is not None:
                 continuation_session_db.close()
