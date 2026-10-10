@@ -3240,6 +3240,23 @@ def configured_engine(config_path: Path) -> tuple[str, str]:
     return provider, selected
 
 
+def configured_fallback_engines(config_path: Path) -> frozenset[tuple[str, str]]:
+    """(provider, model) pairs the config lists under fallback_providers.
+
+    A turn that ran on a listed fallback, from the start or after a mid-turn
+    switch, is an accepted engine; any other engine still fails the check.
+    """
+    data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    entries = data.get("fallback_providers") if isinstance(data, dict) else None
+    if not isinstance(entries, list):
+        return frozenset()
+    return frozenset(
+        (str(entry["provider"]).strip(), str(entry["model"]).strip())
+        for entry in entries
+        if isinstance(entry, dict) and entry.get("provider") and entry.get("model")
+    )
+
+
 def _turn_row(
     state_db: Path,
     *,
@@ -3274,6 +3291,7 @@ def _assert_completed_turn(
     provider: str,
     model: str,
     require_response: bool,
+    fallback_engines: frozenset[tuple[str, str]] = frozenset(),
 ) -> str:
     if row is None:
         raise ConsumerError("Hermes produced no pa_turn record")
@@ -3281,7 +3299,8 @@ def _assert_completed_turn(
         raise ConsumerError(
             f"Hermes pa_turn {row['turn_id']} status={row['turn_status']}"
         )
-    if str(row["provider"]) != provider or str(row["model"]) != model:
+    served = (str(row["provider"]), str(row["model"]))
+    if served != (provider, model) and served not in fallback_engines:
         raise ConsumerError(
             f"Hermes pa_turn engine mismatch: {row['provider']}/{row['model']}"
         )
@@ -3325,6 +3344,7 @@ async def process_replay_records(
         provider=provider,
         model=model,
         require_response=True,
+        fallback_engines=configured_fallback_engines(config_path),
     )
     return {
         "turn_id": turn_id,
@@ -3584,6 +3604,7 @@ async def process_live_records(
     from gateway.run import GatewayRunner
 
     provider, model = configured_engine(config_path)
+    fallback_engines = configured_fallback_engines(config_path)
     business_write_mode = "apply"
     if capture_business_writes_for_test_management:
         # This is the only PA-75 selector.  It is evaluated by the durable
@@ -3666,6 +3687,7 @@ async def process_live_records(
                 provider=provider,
                 model=model,
                 require_response=False,
+                fallback_engines=fallback_engines,
             )
         except ConsumerError as exc:
             detail = str(exc)

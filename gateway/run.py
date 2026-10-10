@@ -840,6 +840,13 @@ def _try_resolve_fallback_provider() -> dict | None:
                     "args": list(runtime.get("args") or []),
                     "credential_pool": runtime.get("credential_pool"),
                     "model": entry.get("model"),
+                    # The listed entry this runtime came from.  A PA job brief
+                    # must not relabel it as the primary provider, and the
+                    # turn record then names the engine that served the turn.
+                    "fallback_entry": {
+                        "provider": str(entry.get("provider") or "").strip(),
+                        "model": str(entry.get("model") or "").strip(),
+                    },
                 }
             except Exception as fb_exc:
                 logger.debug("Fallback entry %s failed: %s", entry.get("provider"), fb_exc)
@@ -1480,6 +1487,12 @@ def _apply_pa_job_runtime(
     get duplicated in gateway config.
     """
     next_runtime = dict(runtime_kwargs or {})
+    fallback_entry = next_runtime.get("fallback_entry")
+    if isinstance(fallback_entry, Mapping) and fallback_entry.get("provider") and fallback_entry.get("model"):
+        # The primary login was unavailable at resolution time.  Keep the fallback's own
+        # credentials, endpoint and engine; the job brief names the primary engine only.
+        next_runtime["provider"] = fallback_entry["provider"]
+        return fallback_entry["model"], next_runtime
     job_brief = getattr(pa_context, "job_brief", None) if pa_context is not None else None
     job_runtime = getattr(job_brief, "runtime", None) if job_brief is not None else None
     if not isinstance(job_runtime, Mapping) or not job_runtime:
@@ -2934,6 +2947,8 @@ class GatewayRunner:
             )
             model = runtime_model
         model, runtime_kwargs = _apply_pa_job_runtime(model, runtime_kwargs, pa_context)
+        # The marker has done its work; no caller builds an agent from it.
+        runtime_kwargs.pop("fallback_entry", None)
         if override and resolved_session_key:
             model, runtime_kwargs = self._apply_session_model_override(
                 resolved_session_key, model, runtime_kwargs
