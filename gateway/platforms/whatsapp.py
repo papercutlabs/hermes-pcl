@@ -33,6 +33,31 @@ from hermes_constants import get_hermes_dir
 
 logger = logging.getLogger(__name__)
 
+# The gateway and the turn-bundle renderer keep this many characters of a
+# reply context (gateway/run.py reply snippet; _build_turn_event).
+_REPLY_CONTEXT_LIMIT = 500
+# PA-396: a reply correlated to a human-resolution document carries the
+# record id line, the question and the quoted message's own text.
+_CORRELATED_REPLY_CONTEXT_LIMIT = 2000
+
+
+def _fit_reply_context_part(text: str, budget: int) -> str:
+    """Shorten one part to ``budget`` characters with an ellipsis, or drop it."""
+    if len(text) <= budget:
+        return text
+    if budget <= 1:
+        return ""
+    return text[: budget - 1].rstrip() + "…"
+
+
+def reply_context_limit(pa_context: Any) -> int:
+    """How much of a reply context the caller keeps for this message."""
+    if isinstance(pa_context, dict) and isinstance(
+        pa_context.get("management_document_correlation"), dict
+    ):
+        return _CORRELATED_REPLY_CONTEXT_LIMIT
+    return _REPLY_CONTEXT_LIMIT
+
 
 def _kill_port_process(port: int) -> None:
     """Kill any process listening on the given TCP port."""
@@ -600,14 +625,61 @@ class WhatsAppAdapter(BasePlatformAdapter):
                 out.append(normalized)
         return out
 
-    def _reply_context_text(self, data: Dict[str, Any]) -> str | None:
-        quoted_text = str(data.get("quotedText") or "").strip()
-        if not quoted_text:
+    @staticmethod
+    def _management_document_reply_parts(data: Dict[str, Any]) -> tuple[str, str] | None:
+        """PA-396: the record line and question line for a correlated reply.
+
+        The consumer attaches ``management_document_correlation`` only when the
+        quote matches one of our own delivered document messages.  These lines
+        go in the reply context, never the body, so the human's words stay
+        exactly as written.  The question line is present only when the quote
+        is a photo or follow-up of the question (``question_text``).
+        """
+        context = data.get("_hermes_pa_context")
+        correlation = (
+            context.get("management_document_correlation")
+            if isinstance(context, dict) else None
+        )
+        document_id = (
+            str(correlation.get("document_id") or "").strip()
+            if isinstance(correlation, dict) else ""
+        )
+        if not document_id:
             return None
-        refs = self._extract_tgg_refs(quoted_text)
-        if refs:
-            return f"Quoted WhatsApp message case refs: {', '.join(refs)}\n{quoted_text}"
-        return quoted_text
+        # Wording matches the constitution's description (item 36): the
+        # human-resolution record this reply answers, with its record id
+        # (the same value as document_id and recordId).
+        line = f"This reply answers the human-resolution record with record id {document_id}."
+        question = " ".join(str(correlation.get("question_text") or "").split())
+        return line, (f"Your question was: {question}" if question else "")
+
+    def _reply_context_text(self, data: Dict[str, Any]) -> str | None:
+        parts = self._management_document_reply_parts(data)
+        quoted_text = str(data.get("quotedText") or "").strip()
+        if quoted_text:
+            refs = self._extract_tgg_refs(quoted_text)
+            if refs:
+                quoted_text = f"Quoted WhatsApp message case refs: {', '.join(refs)}\n{quoted_text}"
+        if parts is None:
+            # Uncorrelated: unchanged; the caller keeps _REPLY_CONTEXT_LIMIT.
+            return quoted_text or None
+        # Correlated: the record line first and never cut; within the larger
+        # limit the question line is shortened first, the quoted text last.
+        record_line, question_line = parts
+        available = _CORRELATED_REPLY_CONTEXT_LIMIT - len(record_line)
+        quoted_need = (1 + len(quoted_text)) if quoted_text else 0
+        if question_line:
+            budget = available - quoted_need - 1
+            # Keep the line only if some of the question itself still fits.
+            if budget < len("Your question was: ") + 2:
+                question_line = ""
+            else:
+                question_line = _fit_reply_context_part(question_line, budget)
+        if question_line:
+            available -= 1 + len(question_line)
+        if quoted_text:
+            quoted_text = _fit_reply_context_part(quoted_text, available - 1)
+        return "\n".join(part for part in (record_line, question_line, quoted_text) if part)
 
     def _turn_policy_for_chat(self, chat_id: str) -> Dict[str, Any]:
         raw_policy = getattr(self, "_turn_policy", {}) or {}
@@ -1070,7 +1142,8 @@ class WhatsAppAdapter(BasePlatformAdapter):
                 )
                 if quote_key not in seen_quote_keys:
                     seen_quote_keys.add(quote_key)
-                    lines.append(f'   [Replying to: "{quoted_context[:500]}"]')
+                    limit = reply_context_limit(raw.get("_hermes_pa_context"))
+                    lines.append(f'   [Replying to: "{quoted_context[:limit]}"]')
             if event.media_urls:
                 lines.append(f"   attachments: {', '.join(event.media_urls)}")
             lines.append(f"   source_message_id: {message_id}")

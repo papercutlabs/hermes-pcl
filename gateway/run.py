@@ -9095,7 +9095,13 @@ class GatewayRunner:
             # is referencing. History can contain the same or similar text
             # multiple times, and without an explicit pointer the agent has to
             # guess (or answer for both subjects). Token overhead is minimal.
-            reply_snippet = event.reply_to_text[:500]
+            # PA-396: a reply correlated to a human-resolution document keeps
+            # a larger context (record line, question, quoted text); the
+            # WhatsApp adapter fits those parts within it.
+            _correlated = isinstance(getattr(event, "pa_context", None), dict) and isinstance(
+                event.pa_context.get("management_document_correlation"), dict
+            )
+            reply_snippet = event.reply_to_text[: 2000 if _correlated else 500]
             message_text = f'[Replying to: "{reply_snippet}"]\n\n{message_text}'
 
         if "@" in message_text:

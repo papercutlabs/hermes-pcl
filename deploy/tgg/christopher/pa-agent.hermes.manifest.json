@@ -257,6 +257,7 @@
     "gateway/management_continuation.py",
     "gateway/management_continuation_consumer.py",
     "gateway/management_continuation_entry.py",
+    "gateway/management_question_trigger.py",
     "gateway/mirror.py",
     "gateway/pa_background_completions.py",
     "gateway/pa_eval.py",
