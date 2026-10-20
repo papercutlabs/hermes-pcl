@@ -33,6 +33,10 @@ from hermes_constants import get_hermes_dir
 
 logger = logging.getLogger(__name__)
 
+# The gateway and the turn-bundle renderer keep this many characters of a
+# reply context (gateway/run.py reply snippet; _build_turn_event).
+_REPLY_CONTEXT_LIMIT = 500
+
 
 def _kill_port_process(port: int) -> None:
     """Kill any process listening on the given TCP port."""
@@ -600,14 +604,54 @@ class WhatsAppAdapter(BasePlatformAdapter):
                 out.append(normalized)
         return out
 
+    @staticmethod
+    def _management_document_reply_line(data: Dict[str, Any]) -> str | None:
+        """PA-396: name the record an authenticated quoted reply answers.
+
+        The consumer attaches ``management_document_correlation`` only when the
+        quote matches one of our own delivered document messages.  The line
+        goes in the reply context, never the body, so the human's words stay
+        exactly as written.
+        """
+        context = data.get("_hermes_pa_context")
+        correlation = (
+            context.get("management_document_correlation")
+            if isinstance(context, dict) else None
+        )
+        document_id = (
+            str(correlation.get("document_id") or "").strip()
+            if isinstance(correlation, dict) else ""
+        )
+        if not document_id:
+            return None
+        # Wording matches the constitution's description (item 36): the
+        # human-resolution record this reply answers, with its record id
+        # (the same value as document_id and recordId).
+        line = f"This reply answers the human-resolution record with record id {document_id}."
+        question = " ".join(str(correlation.get("question_text") or "").split())
+        if not question:
+            return line
+        # Present only when the quote is a photo or follow-up of the question.
+        # Callers keep the first 500 characters of the reply context; the
+        # question is shortened so the record line always survives.
+        prefix = "Your question was: "
+        budget = _REPLY_CONTEXT_LIMIT - len(line) - 1 - len(prefix)
+        if budget <= 1:
+            return line
+        if len(question) > budget:
+            question = question[: budget - 1].rstrip() + "…"
+        return f"{line}\n{prefix}{question}"
+
     def _reply_context_text(self, data: Dict[str, Any]) -> str | None:
+        record_line = self._management_document_reply_line(data)
         quoted_text = str(data.get("quotedText") or "").strip()
         if not quoted_text:
-            return None
+            return record_line
         refs = self._extract_tgg_refs(quoted_text)
         if refs:
-            return f"Quoted WhatsApp message case refs: {', '.join(refs)}\n{quoted_text}"
-        return quoted_text
+            quoted_text = f"Quoted WhatsApp message case refs: {', '.join(refs)}\n{quoted_text}"
+        # First, so the 500-character reply snippet never truncates it away.
+        return f"{record_line}\n{quoted_text}" if record_line else quoted_text
 
     def _turn_policy_for_chat(self, chat_id: str) -> Dict[str, Any]:
         raw_policy = getattr(self, "_turn_policy", {}) or {}

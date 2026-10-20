@@ -476,6 +476,44 @@ def _management_document_delivery_key(*, entry_id: str, chat_id: str) -> str:
     return f"human-resolution:{entry_id}:destination:{chat_id}"
 
 
+def _management_document_photo_delivery_key(
+    *, entry_id: str, chat_id: str, ordinal: int
+) -> str:
+    """PA-396: a further photo message of one initial notice."""
+    return f"{_management_document_delivery_key(entry_id=entry_id, chat_id=chat_id)}:photo:{int(ordinal)}"
+
+
+def _management_document_follow_up_delivery_key(
+    *, entry_id: str, chat_id: str, bridge_message_id: str
+) -> str:
+    """PA-396: Christopher's delivered reply in a correlated turn."""
+    return (
+        f"{_management_document_delivery_key(entry_id=entry_id, chat_id=chat_id)}"
+        f":follow-up:{bridge_message_id}"
+    )
+
+
+def _is_management_document_photo_delivery_key(
+    delivery_key: str, *, entry_id: str, chat_id: str
+) -> bool:
+    prefix = f"{_management_document_delivery_key(entry_id=entry_id, chat_id=chat_id)}:photo:"
+    return delivery_key.startswith(prefix) and delivery_key[len(prefix):].isdigit()
+
+
+def _is_management_document_part_delivery_key(
+    delivery_key: str, *, notice_part: Any, entry_id: str, chat_id: str
+) -> bool:
+    """A registered photo or follow-up of one document's notice in one chat."""
+    if notice_part == "photo":
+        return _is_management_document_photo_delivery_key(
+            delivery_key, entry_id=entry_id, chat_id=chat_id,
+        )
+    if notice_part == "follow_up":
+        prefix = f"{_management_document_delivery_key(entry_id=entry_id, chat_id=chat_id)}:follow-up:"
+        return delivery_key.startswith(prefix) and bool(delivery_key[len(prefix):])
+    return False
+
+
 def _is_management_document_delivery_key(
     delivery_key: str, *, entry_id: str, chat_id: str
 ) -> bool:
@@ -1497,6 +1535,11 @@ class DurableInbox:
                 continue
             if not isinstance(correlation, Mapping):
                 continue
+            if correlation.get("notice_part") in {"photo", "follow_up"}:
+                # PA-396: a photo of the notice, or Christopher's follow-up in
+                # a correlated turn, correlates replies but is never the quote
+                # anchor; the original notice is.
+                continue
             if (
                 correlation.get("document_id") == document_id
                 and (
@@ -2061,6 +2104,9 @@ class DurableInbox:
             raise ConsumerError("human-resolution delivery correlation is incomplete")
         if not _is_management_document_delivery_key(
             str(row["delivery_key"]), entry_id=entry_id, chat_id=record.chat_id
+        ) and not _is_management_document_part_delivery_key(
+            str(row["delivery_key"]), notice_part=stored.get("notice_part"),
+            entry_id=entry_id, chat_id=record.chat_id,
         ):
             raise ConsumerError("human-resolution delivery correlation key mismatch")
         correlation = {
@@ -2070,6 +2116,15 @@ class DurableInbox:
             "reply_message_id": record.message_id,
             "confidence": "quoted_outbound_notice_exact",
         }
+        if stored.get("notice_part") in {"photo", "follow_up"}:
+            # PA-396: an uncaptioned photo or a follow-up does not show the
+            # question itself; carry the original notice's text so the reply
+            # turn sees what was asked.  A quote of the notice already does.
+            notice = self.initial_management_document_notice(
+                chat_id=record.chat_id, document_id=document_id,
+            )
+            if notice is not None and notice.get("body"):
+                correlation["question_text"] = str(notice["body"])
         canary_projection = stored.get("pa75_canary_projection")
         if canary_projection is not None:
             if not isinstance(canary_projection, Mapping):
@@ -4643,6 +4698,67 @@ async def _management_typing_presence(
             await asyncio.to_thread(_post_typing_presence, chat_id, "paused")
 
 
+def _register_management_document_follow_up(
+    inbox: DurableInbox,
+    document_correlations: Mapping[str, Mapping[str, Any]] | None,
+    *,
+    chat_id: str,
+    anchor: str,
+    explicitly_anchored: bool,
+    delivery_key: str,
+    bridge_message_id: str,
+) -> None:
+    """Bind Christopher's delivered reply to a correlated reply it answers.
+
+    Only a reply whose own reply anchor is the correlated inbound message is
+    registered.  An unanchored reply, or one anchored to anyone else's
+    message in the same batch, never is: a later swipe-reply to it must not
+    be tied to the question.
+
+    A second row, never a change to the reply's own at-most-once claim.  It
+    carries no notice_body and is skipped by the initial-notice lookup, so it
+    never becomes the outbox's quote anchor.  A failure here never affects
+    the delivery itself.
+    """
+    if not explicitly_anchored or not document_correlations or not bridge_message_id:
+        return
+    correlation = document_correlations.get(anchor)
+    if not isinstance(correlation, Mapping):
+        return
+    document_id = str(correlation.get("document_id") or "").strip()
+    entry_id = str(correlation.get("document_entry_id") or "").strip()
+    if not document_id or not entry_id:
+        return
+    key = _management_document_follow_up_delivery_key(
+        entry_id=entry_id, chat_id=chat_id, bridge_message_id=bridge_message_id,
+    )
+    try:
+        if inbox.claim_reply_delivery(
+            key,
+            chat_id=chat_id,
+            reply_to_message_id=anchor,
+            correlation={
+                "document_id": document_id,
+                "entry_id": entry_id,
+                "notice_part": "follow_up",
+                "follow_up_delivery_key": delivery_key,
+                "answers_reply_message_id": str(correlation.get("reply_message_id") or "") or None,
+            },
+        ):
+            inbox.record_reply_delivery(
+                key,
+                status="delivered",
+                bridge_message_id=bridge_message_id,
+                provider_outcome="follow-up-registered",
+            )
+    except Exception as exc:
+        print(
+            "document follow-up registration FAILED (delivery unaffected): "
+            f"chat={chat_id} anchor={anchor} error={exc}",
+            file=sys.stderr,
+        )
+
+
 def deliver_management_replies(
     inbox: DurableInbox,
     *,
@@ -4653,6 +4769,7 @@ def deliver_management_replies(
     handled_groups: Sequence[Mapping[str, Any]],
     continuation: Mapping[str, Any] | None = None,
     completion: Mapping[str, Any] | None = None,
+    document_correlations: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, int]:
     """Deliver mgmt-selector responses through the rung-gated bridge.
 
@@ -4667,6 +4784,10 @@ def deliver_management_replies(
       no allowlist logic is duplicated here and a bridge refusal is final.
     - at-most-once per turn response: a durable claim precedes the send; a
       failure logs loudly and records undelivered — never retries.
+    - PA-396: a delivered reply anchored to an authenticated quoted reply to
+      a document message is also registered as a follow-up of that document,
+      so a quoted answer to it correlates too.  Replies anchored elsewhere,
+      or not anchored, are never registered.
     """
     from urllib.request import Request, urlopen
     from urllib.error import HTTPError, URLError
@@ -4923,6 +5044,19 @@ def deliver_management_replies(
                     provider_outcome=str(payload.get("outcome") or "delivered"),
                 )
                 summary["delivered"] += 1
+                _register_management_document_follow_up(
+                    inbox,
+                    document_correlations,
+                    chat_id=chat_id,
+                    anchor=str(anchor),
+                    # The reply's own anchor, exactly: a bundle's composite
+                    # "id1+id2" resolved to its newest component is the
+                    # runtime's choice, not Christopher's, and never counts.
+                    explicitly_anchored=bool(send.get("reply_to"))
+                    and str(send.get("reply_to")) == str(anchor),
+                    delivery_key=delivery_key,
+                    bridge_message_id=str(payload.get("messageId") or ""),
+                )
                 if send.get("send_kind", "text") == "media":
                     # Off the delivery loop: keeping the file waits for the
                     # workspace lock, which a sandbox run holds while it runs.
@@ -5825,6 +5959,496 @@ async def run_management_document_canary(args: argparse.Namespace) -> int:
     return 0
 
 
+# PA-396: one operator-approved Management question for one human-resolution
+# record.  No model turn, no outbox poll and no cursor movement: the operator
+# supplies the exact approved wording and the destination, and the send is
+# registered as the record's initial notice so the existing quoted-reply
+# correlation recognises the answer.
+MANAGEMENT_QUESTION_CONTRACT = "tgg-management-question-send/v1"
+_MANAGEMENT_QUESTION_USER_AGENT = "christopher-hermes/management-question"
+
+
+@dataclass(frozen=True)
+class ManagementQuestionSource:
+    """Explicit Systems read for one record; never the outbox drain's env."""
+
+    api_url: str
+    token_env: str
+    tenant: str | None = None
+
+
+@dataclass(frozen=True)
+class ManagementQuestionPhoto:
+    path: Path
+    digest: str
+    mime: str
+    message_id: str = ""
+    media_ordinal: int | None = None
+    sender_id: str | None = None
+    sent_at: str | None = None
+
+
+def _management_question_document(
+    source: ManagementQuestionSource, record_id: str
+) -> dict[str, Any]:
+    """Read one record's human-resolution document through the operator API."""
+    from urllib.error import HTTPError, URLError
+    from urllib.parse import quote
+    from urllib.request import Request, urlopen
+
+    token = os.environ.get(source.token_env, "").strip()
+    if not token:
+        raise ConsumerError("management question service token is absent")
+    headers = {
+        "Accept": "application/json",
+        "Authorization": f"Bearer {token}",
+        "User-Agent": _MANAGEMENT_QUESTION_USER_AGENT,
+    }
+    if source.tenant:
+        headers["X-PS-Tenant"] = source.tenant
+    request = Request(
+        f"{source.api_url}/api/operator/human-resolution-documents/{quote(record_id, safe='')}",
+        headers=headers,
+        method="GET",
+    )
+    try:
+        with urlopen(request, timeout=30) as response:
+            status_code = int(getattr(response, "status", 0) or 0)
+            payload = json.loads(response.read() or b"{}")
+    except HTTPError as exc:
+        if exc.code == 404:
+            raise ConsumerError(f"human-resolution record not found: {record_id}") from exc
+        raise ConsumerError(f"human-resolution record read HTTP {exc.code}") from exc
+    except (URLError, TimeoutError, OSError, ValueError) as exc:
+        raise ConsumerError(f"human-resolution record read failed: {exc}") from exc
+    if status_code != 200 or not isinstance(payload, Mapping):
+        raise ConsumerError("human-resolution record read returned an invalid envelope")
+    data = payload.get("data", payload)
+    if not isinstance(data, Mapping) or data.get("contract") != "tgg-human-resolution-document-entry/v1":
+        raise ConsumerError("human-resolution record read returned the wrong contract")
+    document = data.get("document")
+    record = document.get("record") if isinstance(document, Mapping) else None
+    if not isinstance(record, Mapping) or str(record.get("id") or "") != record_id:
+        raise ConsumerError("human-resolution record read returned a different record")
+    if not isinstance(document.get("entries"), list):
+        raise ConsumerError("human-resolution record read has no entry list")
+    return dict(document)
+
+
+def _management_question_initial_entry_id(document: Mapping[str, Any], record_id: str) -> str:
+    """The record's own initial outbox entry is the notice's entry identity.
+
+    Using the real Systems entry (not a synthetic one) means the dormant
+    outbox drain, if ever enabled, sees this destination as already notified
+    for that entry, and later lifecycle entries quote this notice.
+    """
+    for entry in document.get("entries") or []:
+        if (
+            isinstance(entry, Mapping)
+            and str(entry.get("entryKind") or "") == "initial_default"
+            and str(entry.get("recordId") or record_id) == record_id
+            and str(entry.get("id") or "").strip()
+        ):
+            return str(entry["id"]).strip()
+    raise ConsumerError(
+        f"human-resolution record has no initial document entry: {record_id}"
+    )
+
+
+def _management_question_prior_delivery(
+    inbox: DurableInbox, *, chat_id: str, record_id: str, entry_id: str
+) -> str | None:
+    """Any earlier notice, claim or question photo for this record and chat."""
+    status = inbox.management_document_delivery_status(entry_id=entry_id, chat_id=chat_id)
+    if status is not None:
+        return f"{entry_id}:{status}"
+    with inbox.connect() as conn:
+        rows = conn.execute(
+            "SELECT delivery_key,status,correlation_json FROM reply_deliveries "
+            "WHERE chat_id=? AND delivery_key GLOB 'human-resolution:*' "
+            "ORDER BY created_at,delivery_key",
+            (chat_id,),
+        ).fetchall()
+    for row in rows:
+        try:
+            correlation = json.loads(row["correlation_json"] or "{}")
+        except (TypeError, ValueError):
+            continue
+        if isinstance(correlation, Mapping) and str(correlation.get("document_id") or "") == record_id:
+            return f"{row['delivery_key']}:{row['status']}"
+    return None
+
+
+def _management_question_resolve(
+    command: Sequence[str], *, digest: str, mime: str, local_paths: Sequence[Path]
+) -> Path:
+    """Call the configured media resolver (local, cache or archive) once."""
+    import subprocess
+
+    request = {
+        "operation": "resolve",
+        "digest": digest,
+        "expectedMime": mime,
+        "localPaths": [str(path) for path in local_paths],
+        "purpose": "christopher_attachment_retrieval",
+    }
+    try:
+        completed = subprocess.run(
+            list(command), input=json.dumps(request), text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ConsumerError(f"media resolver failed for {digest[:12]}: {exc}") from exc
+    try:
+        result = json.loads(completed.stdout or "{}")
+    except ValueError as exc:
+        raise ConsumerError(f"media resolver response is invalid for {digest[:12]}") from exc
+    if completed.returncode != 0 or not isinstance(result, Mapping) or result.get("ok") is not True:
+        code = result.get("code") if isinstance(result, Mapping) else None
+        raise ConsumerError(f"media resolver could not supply {digest[:12]}: {code or 'unavailable'}")
+    try:
+        return Path(str(result.get("path") or "")).resolve(strict=True)
+    except OSError as exc:
+        raise ConsumerError(f"media resolver path is unavailable for {digest[:12]}") from exc
+
+
+def _management_question_photos(
+    document: Mapping[str, Any],
+    *,
+    config_path: Path,
+    resolver_command: Sequence[str] | None,
+) -> list[ManagementQuestionPhoto]:
+    """The record's cited, available image evidence as bridge-readable files.
+
+    Every file is digest-verified and ends inside the retained-media root,
+    which is the only place ordinary media replies are sent from.  A cited
+    image that cannot be supplied refuses the whole send before any claim.
+    """
+    record = document["record"]
+    media = record.get("evidenceMedia")
+    if media is None:
+        media = (record.get("citedSnapshot") or {}).get("media") or []
+    if not isinstance(media, list):
+        raise ConsumerError("human-resolution record evidence media is invalid")
+    messages = {
+        str(message.get("messageId") or ""): message
+        for message in (record.get("evidenceMessages") or (record.get("citedSnapshot") or {}).get("messages") or [])
+        if isinstance(message, Mapping)
+    }
+    wanted: list[tuple[str, str, str, Mapping[str, Any]]] = []
+    seen: set[str] = set()
+    for item in media:
+        if not isinstance(item, Mapping) or item.get("availability") != "available":
+            continue
+        mime = str(item.get("mime") or "").split(";", 1)[0].strip().lower()
+        if not mime.startswith("image/"):
+            continue
+        digest = str(item.get("digest") or "").strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise ConsumerError("human-resolution evidence image has no valid digest")
+        if digest in seen:
+            continue
+        seen.add(digest)
+        source_media = item.get("sourceMedia")
+        ref = str(
+            item.get("retrievalUrl")
+            or (source_media.get("ref") if isinstance(source_media, Mapping) else "")
+            or ""
+        ).strip()
+        wanted.append((digest, mime, ref, item))
+    if not wanted:
+        return []
+    retention = _retention_config(config_path)
+    if retention is None:
+        raise ConsumerError("retained media is not configured; evidence images cannot be sent")
+    root = Path(retention["root"])
+    prefix = f"{retention['ref_prefix']}/"
+    photos: list[ManagementQuestionPhoto] = []
+    for digest, mime, ref, item in wanted:
+        local: Path | None = None
+        if ref.startswith(prefix):
+            basename = ref[len(prefix):]
+            if basename and Path(basename).name == basename and basename not in {".", ".."}:
+                local = root / basename
+        source: Path | None = None
+        if local is not None and local.is_file() and hashlib.sha256(local.read_bytes()).hexdigest() == digest:
+            source = local.resolve()
+        elif resolver_command:
+            source = _management_question_resolve(
+                resolver_command, digest=digest, mime=mime,
+                local_paths=[local] if local is not None else [],
+            )
+        if source is None:
+            raise ConsumerError(f"evidence image {digest[:12]} is not available locally and no resolver is configured")
+        if hashlib.sha256(source.read_bytes()).hexdigest() != digest:
+            raise ConsumerError(f"evidence image {digest[:12]} digest does not match")
+        try:
+            detected_mime, ext = _validated_image_type(source, mime)
+        except MediaRetentionError as exc:
+            raise ConsumerError(f"evidence image {digest[:12]} is not a valid image: {exc}") from exc
+        if not source.is_relative_to(root):
+            # Same contained name the evidence plugin uses for inspection
+            # copies, so an existing copy is reused, never duplicated.
+            target = root / f"wa-evidence-{digest[:24]}.{ext}"
+            if target.exists():
+                if hashlib.sha256(target.read_bytes()).hexdigest() != digest:
+                    raise ConsumerError(f"retained copy of {digest[:12]} diverges")
+            else:
+                temporary = root / f".{target.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp"
+                try:
+                    shutil.copyfile(source, temporary)
+                    if hashlib.sha256(temporary.read_bytes()).hexdigest() != digest:
+                        raise ConsumerError(f"retained copy of {digest[:12]} diverges")
+                    os.chmod(temporary, 0o640)
+                    os.replace(temporary, target)
+                finally:
+                    temporary.unlink(missing_ok=True)
+            source = target
+        message_id = str(item.get("messageId") or "")
+        message = messages.get(message_id) or {}
+        try:
+            media_ordinal: int | None = int(item.get("ordinal"))
+        except (TypeError, ValueError):
+            media_ordinal = None
+        photos.append(ManagementQuestionPhoto(
+            path=source, digest=digest, mime=detected_mime,
+            message_id=message_id,
+            media_ordinal=media_ordinal,
+            sender_id=str(message.get("senderId") or "") or None,
+            sent_at=str(message.get("sgt") or message.get("timestamp") or "") or None,
+        ))
+    return photos
+
+
+def _management_question_bridge_post(
+    bridge_url: str, endpoint: str, payload: Mapping[str, Any]
+) -> dict[str, Any]:
+    """One strict bridge attempt; only HTTP 200 + success is delivered."""
+    from urllib.error import HTTPError, URLError
+    from urllib.request import Request, urlopen
+
+    request = Request(
+        f"{bridge_url}/{endpoint}",
+        data=json.dumps(dict(payload)).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=60) as response:
+            status_code = int(getattr(response, "status", 0) or 0)
+            body = json.loads(response.read() or b"{}")
+    except HTTPError as exc:
+        return {"status": "undelivered", "error": f"http-{exc.code}"}
+    except (URLError, TimeoutError, OSError, ValueError) as exc:
+        return {"status": "undelivered", "error": str(exc)[:300]}
+    if status_code == 200 and isinstance(body, Mapping) and body.get("success") is True:
+        message_id = str(body.get("messageId") or "").strip()
+        return {
+            "status": "delivered",
+            "bridge_message_id": message_id or None,
+            "provider_outcome": str(body.get("outcome") or "delivered"),
+        }
+    outcome = body.get("outcome") if isinstance(body, Mapping) else None
+    return {
+        "status": "undelivered",
+        "provider_outcome": str(outcome or "unconfirmed"),
+        "error": f"http-{status_code}-unconfirmed: {json.dumps(body)[:200]}",
+    }
+
+
+def send_management_question(
+    inbox: DurableInbox,
+    *,
+    config_path: Path,
+    record_id: str,
+    chat_id: str,
+    question_text: str,
+    source: ManagementQuestionSource,
+    resolver_command: Sequence[str] | None = None,
+    bridge_url: str | None = None,
+    check_only: bool = False,
+) -> dict[str, Any]:
+    """Send one approved question, with the record's photos, exactly once.
+
+    The first message carries the question (as the first photo's caption, or
+    as plain text when the record has no image evidence).  Its bridge message
+    id is stored as the record's initial notice under the same delivery key
+    and correlation shape the outbox notice uses, so a quoted reply to it
+    correlates to the record.  Remaining photos follow uncaptioned, each
+    registered as a photo of that notice under its own at-most-once key, so a
+    quoted reply to any photo correlates to the same record.  The outbox
+    cursor is never read or moved.
+    """
+    record_id = str(record_id or "").strip()
+    chat_id = str(chat_id or "").strip()
+    text = str(question_text or "").strip()
+    if not record_id:
+        raise ConsumerError("management question requires a record id")
+    if not text:
+        raise ConsumerError("management question text is empty")
+    if chat_id not in _management_selector_chats(config_path):
+        raise ConsumerError(
+            "management question destination is not a WhatsApp management selector"
+        )
+    document = _management_question_document(source, record_id)
+    entry_id = _management_question_initial_entry_id(document, record_id)
+    prior = _management_question_prior_delivery(
+        inbox, chat_id=chat_id, record_id=record_id, entry_id=entry_id,
+    )
+    if prior is not None:
+        raise ConsumerError(
+            f"record {record_id} already has a delivery in {chat_id} ({prior}); refusing to send again"
+        )
+    photos = _management_question_photos(
+        document, config_path=config_path, resolver_command=resolver_command,
+    )
+    receipt: dict[str, Any] = {
+        "contract": MANAGEMENT_QUESTION_CONTRACT,
+        "record_id": record_id,
+        "entry_id": entry_id,
+        "destination_chat_id": chat_id,
+        "question_sha256": hashlib.sha256(text.encode()).hexdigest(),
+        "photo_digests": [photo.digest for photo in photos],
+        # Sent in this order; the record does not say which image is whose
+        # (complaint screenshot or worker photo), so the record's own cited
+        # order is kept and shown here for the operator to read.
+        "photo_order": "record_evidence_order",
+        "photos_planned": [
+            {
+                "send_order": order,
+                "carries_caption": order == 0,
+                "message_id": photo.message_id or None,
+                "media_ordinal": photo.media_ordinal,
+                "mime": photo.mime,
+                "sender_id": photo.sender_id,
+                "sent_at": photo.sent_at,
+                "digest": photo.digest,
+            }
+            for order, photo in enumerate(photos)
+        ],
+        "check_only": check_only,
+    }
+    if check_only:
+        return receipt
+    bridge = (bridge_url or os.environ.get("TGG_REPLY_BRIDGE_URL", "http://127.0.0.1:3011")).rstrip("/")
+    key = _management_document_delivery_key(entry_id=entry_id, chat_id=chat_id)
+    correlation = {
+        "document_id": record_id,
+        "entry_id": entry_id,
+        "entry_kind": "initial_default",
+        "notice_role": "initial_notice",
+        "notice_body": text,
+        "notice_source": "operator_question",
+        "photo_count": len(photos),
+    }
+    if not inbox.claim_reply_delivery(
+        key, chat_id=chat_id, reply_to_message_id=None, correlation=correlation,
+    ):
+        raise ConsumerError(f"record {record_id} notice was claimed concurrently; refusing to send")
+    if photos:
+        first = photos[0]
+        endpoint, payload = "send-media", {
+            "chatId": chat_id, "filePath": str(first.path), "mediaType": "image", "caption": text,
+        }
+    else:
+        endpoint, payload = "send", {"chatId": chat_id, "message": text}
+    outcome = _management_question_bridge_post(bridge, endpoint, payload)
+    inbox.record_reply_delivery(
+        key,
+        status=outcome["status"],
+        bridge_message_id=outcome.get("bridge_message_id"),
+        provider_outcome=outcome.get("provider_outcome"),
+        error=outcome.get("error"),
+    )
+    receipt["notice"] = {
+        "delivery_key": key,
+        "endpoint": endpoint,
+        "status": outcome["status"],
+        "message_id": outcome.get("bridge_message_id"),
+    }
+    receipt["photos"] = []
+    if outcome["status"] != "delivered":
+        # The question did not certainly arrive; never follow it with
+        # orphan photos.  The claim stays consumed: no automatic resend.
+        return receipt
+    for ordinal, photo in enumerate(photos[1:], start=1):
+        photo_key = _management_document_photo_delivery_key(
+            entry_id=entry_id, chat_id=chat_id, ordinal=ordinal,
+        )
+        photo_correlation = {
+            "document_id": record_id,
+            "entry_id": entry_id,
+            "entry_kind": "initial_default",
+            "notice_role": "initial_notice",
+            # A photo of the notice, never its anchor: no notice_body, and the
+            # initial-notice lookup skips notice_part=photo explicitly.
+            "notice_part": "photo",
+            "notice_delivery_key": key,
+            "photo_ordinal": ordinal,
+            "photo_digest": photo.digest,
+        }
+        if not inbox.claim_reply_delivery(
+            photo_key, chat_id=chat_id, reply_to_message_id=None,
+            correlation=photo_correlation,
+        ):
+            receipt["photos"].append({"ordinal": ordinal, "status": "duplicate"})
+            continue
+        photo_outcome = _management_question_bridge_post(bridge, "send-media", {
+            "chatId": chat_id, "filePath": str(photo.path), "mediaType": "image",
+        })
+        inbox.record_reply_delivery(
+            photo_key,
+            status=photo_outcome["status"],
+            bridge_message_id=photo_outcome.get("bridge_message_id"),
+            provider_outcome=photo_outcome.get("provider_outcome"),
+            error=photo_outcome.get("error"),
+        )
+        receipt["photos"].append({
+            "ordinal": ordinal,
+            "status": photo_outcome["status"],
+            "message_id": photo_outcome.get("bridge_message_id"),
+        })
+    return receipt
+
+
+def run_management_question_send(args: argparse.Namespace) -> int:
+    """CLI wrapper: one record, one destination, one approved text file."""
+    import shlex
+
+    api_url = str(args.systems_url or os.environ.get("TGG_MANAGEMENT_QUESTION_API_URL", "")).strip().rstrip("/")
+    if not api_url.startswith(("http://", "https://")):
+        raise ConsumerError("management question needs --systems-url (HTTP(S))")
+    tenant = str(args.tenant or os.environ.get("TGG_MANAGEMENT_QUESTION_TENANT", "")).strip() or None
+    try:
+        question = Path(args.question_file).read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ConsumerError(f"cannot read approved question file: {args.question_file}") from exc
+    resolver_value = str(
+        args.media_resolver_command
+        if args.media_resolver_command is not None
+        else os.environ.get("TGG_MEDIA_RESOLVER_COMMAND", "")
+    ).strip()
+    resolver = tuple(shlex.split(resolver_value)) if resolver_value else None
+    inbox = DurableInbox(Path(args.inbox).resolve())
+    with SharedActivityLock(Path(args.activity_lock_file).resolve() if args.activity_lock_file else None):
+        receipt = send_management_question(
+            inbox,
+            config_path=Path(args.config).resolve(),
+            record_id=args.record_id,
+            chat_id=args.chat_id,
+            question_text=question,
+            source=ManagementQuestionSource(api_url=api_url, token_env=args.token_env, tenant=tenant),
+            resolver_command=resolver,
+            check_only=bool(args.check),
+        )
+    print(json.dumps(receipt, sort_keys=True))
+    if args.check:
+        return 0
+    notice = receipt.get("notice") or {}
+    photos_ok = all(item.get("status") == "delivered" for item in receipt.get("photos") or [])
+    return 0 if notice.get("status") == "delivered" and notice.get("message_id") and photos_ok else 1
+
+
 async def _process_claimed_chat_batch_unlocked(
     inbox: DurableInbox,
     records: Sequence[InboxRecord],
@@ -6047,6 +6671,7 @@ async def _process_claimed_chat_batch_unlocked(
             batch_records=records,
             gate_changed_at=gate_changed_at,
             handled_groups=result.get("handled") or [],
+            document_correlations=management_document_correlations,
         )
         if delivery.get("delivered") or delivery.get("undelivered"):
             print(f"reply deliveries: {delivery}", file=sys.stderr)
@@ -7774,6 +8399,38 @@ def build_parser() -> argparse.ArgumentParser:
         "--activity-lock-file",
         help="shared with release executor while the real GatewayRunner owns the canary",
     )
+
+    question = sub.add_parser(
+        "management-question-send",
+        help="Send one approved question, with the record's photos, to one management chat",
+    )
+    question.add_argument("--record-id", required=True, help="human-resolution record id")
+    question.add_argument("--chat-id", required=True, help="management chat JID, e.g. <id>@g.us")
+    question.add_argument("--question-file", required=True, help="approved question text, sent verbatim")
+    question.add_argument("--inbox", required=True)
+    question.add_argument("--config", required=True)
+    question.add_argument(
+        "--systems-url",
+        help="Systems base URL (else TGG_MANAGEMENT_QUESTION_API_URL)",
+    )
+    question.add_argument(
+        "--tenant", help="X-PS-Tenant header value (else TGG_MANAGEMENT_QUESTION_TENANT)",
+    )
+    question.add_argument("--token-env", default="CHRISTOPHER_TGG_PS_SERVICE_TOKEN")
+    question.add_argument(
+        "--media-resolver-command",
+        help="media resolver command (else TGG_MEDIA_RESOLVER_COMMAND)",
+    )
+    question.add_argument(
+        "--activity-lock-file", help="shared with release executor while sending",
+    )
+    question.add_argument(
+        "--check", action="store_true",
+        help=(
+            "read the record, resolve its photos and check refusals; send nothing. "
+            "May stage verified photo copies into the retained-media root"
+        ),
+    )
     return parser
 
 
@@ -7794,6 +8451,8 @@ def main(argv: Iterable[str] | None = None) -> int:
             return asyncio.run(run_bounded_backplay(args))
         if args.command == "management-document-canary":
             return asyncio.run(run_management_document_canary(args))
+        if args.command == "management-question-send":
+            return run_management_question_send(args)
         raise ConsumerError(f"unknown command {args.command}")
     except ConsumerError as exc:
         print(f"consumer error: {exc}", file=sys.stderr)
