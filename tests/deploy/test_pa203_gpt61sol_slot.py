@@ -71,7 +71,7 @@ def test_every_table_accepts_the_slot():
         capture_output=True, text=True, check=True,
     )
     result = json.loads(completed.stdout)
-    assert result["ok"] is True and result["allowed_slots"][-2:] == [ROLLBACK_SLOT, SLOT]
+    assert result["ok"] is True and result["allowed_slots"][-3:-1] == [ROLLBACK_SLOT, SLOT]
     verify = (SCRIPTS / "verify_runtime.sh").read_text()
     assert verify.count(f'"{SLOT}": "{MODEL}",') == 2
     assert verify.count(f'"{SLOT}": "medium",') == 2

@@ -28,6 +28,7 @@ SLOT_MODELS = {
     "gpt-5.6-terra-high": "gpt-5.6-terra",
     "gpt-6-sol-medium": "gpt-6-sol",
     "gpt-6.1-sol-medium": "gpt-6.1-sol",
+    "gpt-6.1-terra-medium": "gpt-6.1-terra",
 }
 SLOT_REASONING_EFFORT = {
     "gpt-5.6-luna-low": "low",
@@ -36,6 +37,7 @@ SLOT_REASONING_EFFORT = {
     "gpt-5.6-terra-high": "high",
     "gpt-6-sol-medium": "medium",
     "gpt-6.1-sol-medium": "medium",
+    "gpt-6.1-terra-medium": "medium",
 }
 ALLOWED_SLOTS = tuple(SLOT_MODELS)
 DEFAULT_SLOT = ALLOWED_SLOTS[0]
