@@ -1226,17 +1226,19 @@ def _tgg_nightly_assignment_prompt(
     passes through the compressor.  The assignment is carried there.
 
     Only a nightly analyzer turn (the trigger or a retry; same-session
-    continuations reuse that agent) gets the block.  The continuous lane, the
-    consolidator and every other job return "", so their instructions stay
-    byte-identical.
+    continuations reuse that agent) or a continuous interval turn (PA-430: the
+    batch lost its launch message to compaction mid-interval) gets the block.
+    A continuous recovery, the consolidator and every other job return "", so
+    their instructions stay byte-identical.
     """
     trigger = _tgg_nightly_analyzer_trigger(pa_job_type, pa_context)
     if trigger is None:
         return ""
-    if pa_context.get("continuous_interval") is True:
-        return ""
-    if isinstance(original_message, str) and _TGG_CONTINUOUS_INTERVAL_TRIGGER.search(
-        original_message
+    continuous = pa_context.get("continuous_interval") is True
+    if (
+        not continuous
+        and isinstance(original_message, str)
+        and _TGG_CONTINUOUS_INTERVAL_TRIGGER.search(original_message)
     ):
         return ""
     role = pa_context.get("nightly_role")
@@ -1245,7 +1247,14 @@ def _tgg_nightly_assignment_prompt(
     batch_id, authoritative_chat_id = trigger
     lines = [
         "[PA NIGHTLY ANALYZER ASSIGNMENT]",
-        "This session is one nightly WhatsApp analyzer. The runtime fixes this assignment "
+        "This turn is one continuous WhatsApp interval of one chat. The runtime fixes this "
+        "assignment for the turn: it holds after context compaction. If the conversation no "
+        "longer shows the original trigger, this block is the assignment. Do not switch "
+        "batch, chat or role. Read the frozen chat with tgg_nightly_get_chat_ledger and "
+        "finish by sealing it with tgg_nightly_seal_chat; the seal checks the coverage of "
+        "the frozen input."
+        if continuous
+        else "This session is one nightly WhatsApp analyzer. The runtime fixes this assignment "
         "for the whole session: it holds after context compaction, in every same-session "
         "continuation and in a retry of this analyzer. If the conversation no longer shows "
         "the original trigger, this block is the assignment. Do not switch batch, chat or role.",

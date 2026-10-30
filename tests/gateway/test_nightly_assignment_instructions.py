@@ -256,16 +256,6 @@ _UNCHANGED_LANES = [
         "120363000000000000@g.us", id="management",
     ),
     pytest.param(
-        _continuous_interval(_ROLE_CHATS["amk"]), "tgg_nightly_whatsapp",
-        {
-            "job_type": "tgg_nightly_whatsapp", "nightly_batch_id": _BATCH_ID,
-            "nightly_role": "amk", "authoritative_chat_id": _ROLE_CHATS["amk"],
-            "continuous_interval": True,
-            "continuous_contract": "tgg-christopher-continuous-interval/v1",
-        },
-        "900000000000000001@g.us", id="continuous-interval",
-    ),
-    pytest.param(
         _continuous_recovery(_ROLE_CHATS["sk"]), "tgg_nightly_whatsapp",
         {
             "job_type": "tgg_nightly_whatsapp", "nightly_batch_id": _BATCH_ID,
@@ -348,17 +338,18 @@ def _wide_parallel_turn() -> list[SimpleNamespace]:
     ]
 
 
-def test_assignment_survives_compaction_that_keeps_only_orphan_tool_results(tmp_path):
+@pytest.mark.parametrize("continuous", [False, True], ids=["nightly", "continuous-interval"])
+def test_assignment_survives_compaction_that_keeps_only_orphan_tool_results(tmp_path, continuous):
     from run_agent import AIAgent
     from agent.transports import get_transport
 
     chat_id = _ROLE_CHATS["amk"]
-    trigger = _nightly_trigger(chat_id)
-    assignment = gateway_run._tgg_nightly_assignment_prompt(
-        "tgg_nightly_whatsapp",
-        {"nightly_batch_id": _BATCH_ID, "nightly_role": "amk", "authoritative_chat_id": chat_id},
-        trigger,
-    )
+    trigger = _continuous_interval(chat_id) if continuous else _nightly_trigger(chat_id)
+    lead = "Continuous WhatsApp interval." if continuous else "Nightly WhatsApp analyzer continuation."
+    context = {"nightly_batch_id": _BATCH_ID, "nightly_role": "amk", "authoritative_chat_id": chat_id}
+    if continuous:
+        context["continuous_interval"] = True
+    assignment = gateway_run._tgg_nightly_assignment_prompt("tgg_nightly_whatsapp", context, trigger)
     assert assignment
 
     with (
@@ -406,8 +397,7 @@ def test_assignment_survives_compaction_that_keeps_only_orphan_tool_results(tmp_
         agent.run_conversation(trigger, conversation_history=[], task_id="nightly-session")
         # A same-session continuation: the runner's own re-prompt, empty history.
         agent.run_conversation(
-            f"Nightly WhatsApp analyzer continuation. batch_id={_BATCH_ID}. "
-            f"authoritative_chat_id={chat_id}. ",
+            f"{lead} batch_id={_BATCH_ID}. authoritative_chat_id={chat_id}. ",
             conversation_history=[],
             task_id="nightly-session",
         )
@@ -440,3 +430,55 @@ def test_assignment_survives_compaction_that_keeps_only_orphan_tool_results(tmp_
     assert codex["instructions"].endswith(assignment)
     assert _BATCH_ID not in json.dumps(codex["input"])
     assert continuation[0]["content"] == after_compaction[0]["content"]
+
+
+# PA-430: a continuous interval gets the same pin, naming the real tools.
+_CONTINUOUS_CONTEXT = {
+    "job_type": "tgg_nightly_whatsapp",
+    "nightly_batch_id": _BATCH_ID,
+    "nightly_role": "amk",
+    "authoritative_chat_id": _ROLE_CHATS["amk"],
+    "continuous_interval": True,
+    "continuous_contract": "tgg-christopher-continuous-interval/v1",
+}
+
+
+def test_continuous_interval_pin_holds_the_assignment_and_names_the_real_tools():
+    chat_id = _ROLE_CHATS["amk"]
+    trigger = _continuous_interval(chat_id)
+    block = gateway_run._tgg_nightly_assignment_prompt(
+        "tgg_nightly_whatsapp", _CONTINUOUS_CONTEXT, trigger,
+    )
+    _assert_assignment(block, role="amk", chat_id=chat_id)
+    assert f"original trigger (verbatim): {trigger}" in block
+    assert "continuous WhatsApp interval" in block
+    assert "tgg_nightly_get_chat_ledger" in block
+    assert "tgg_nightly_seal_chat" in block
+    assert "source-status" not in block
+
+
+def test_continuous_trigger_without_the_validated_flag_stays_unpinned():
+    chat_id = _ROLE_CHATS["amk"]
+    context = {k: v for k, v in _CONTINUOUS_CONTEXT.items() if not k.startswith("continuous")}
+    assert gateway_run._tgg_nightly_assignment_prompt(
+        "tgg_nightly_whatsapp", context, _continuous_interval(chat_id),
+    ) == ""
+
+
+@pytest.mark.asyncio
+async def test_continuous_interval_carries_its_assignment_on_every_call(monkeypatch, tmp_path):
+    chat_id = _ROLE_CHATS["amk"]
+    _install_fakes(monkeypatch, tmp_path, chat_id, seal_after_status_calls=3)
+
+    await _run(
+        _runner(), _continuous_interval(chat_id),
+        pa_job_type="tgg_nightly_whatsapp", pa_context=_CONTINUOUS_CONTEXT,
+    )
+
+    agent = _FakeAgent.instances[0]
+    ephemeral = agent.kwargs["ephemeral_system_prompt"]
+    _assert_assignment(ephemeral, role="amk", chat_id=chat_id)
+    assert ephemeral.startswith(_CONTEXT_PROMPT + "\n\n[PA NIGHTLY ANALYZER ASSIGNMENT]\n")
+    assert len(agent.calls) >= 2
+    assert all(call["ephemeral"] == ephemeral for call in agent.calls)
+    assert agent.calls[1]["message"].startswith("Continuous WhatsApp interval.")
