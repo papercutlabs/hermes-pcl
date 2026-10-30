@@ -5,7 +5,7 @@ import json
 import os
 import sqlite3
 import zipfile
-from datetime import datetime
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from pathlib import Path
 
@@ -3060,6 +3060,166 @@ async def test_management_brief_admits_unmentioned_messages_without_widening_nig
             "skipped", "PRIORITY_DIRECT_TRIGGER_NOT_RECOGNIZED"
         ),
     }
+
+
+def test_ingress_timestamp_accepts_protobuf_long_dict():
+    # PA-429: WhatsApp history sync serialises messageTimestamp as a Long.
+    expected = datetime(2026, 10, 30, 0, 0, 11, tzinfo=timezone.utc)
+    seconds = int(expected.timestamp())
+    assert consumer._parse_ingress_timestamp(
+        {"high": 0, "low": seconds, "unsigned": True}
+    ) == expected
+    assert consumer._parse_ingress_timestamp({"low": seconds}) == expected
+    # high word carries the bits above 2**32; milliseconds follow the int rule.
+    millis = seconds * 1000
+    assert consumer._parse_ingress_timestamp(
+        {"high": millis >> 32, "low": millis & 0xFFFFFFFF, "unsigned": True}
+    ) == expected
+    # unsigned masks a negative low word, signed keeps it.
+    assert consumer._parse_ingress_timestamp(
+        {"high": 0, "low": seconds - 2**32, "unsigned": True}
+    ) == expected
+    assert consumer._parse_ingress_timestamp({"high": 0, "low": -1}) == datetime(
+        1969, 12, 31, 23, 59, 59, tzinfo=timezone.utc
+    )
+
+
+@pytest.mark.parametrize("junk", [
+    {},
+    {"high": 0},
+    {"low": "1792783211"},
+    {"low": 1.5},
+    {"low": True},
+    {"low": None},
+    {"low": 1, "high": "0"},
+    {"low": 1, "high": True},
+    {"low": 1, "high": None},
+    {"low": 2**200, "high": 2**200},
+    {"seconds": 1792783211},
+])
+def test_ingress_timestamp_refuses_malformed_long_dict(junk):
+    with pytest.raises(consumer.ConsumerError):
+        consumer._parse_ingress_timestamp(junk)
+
+
+def test_ingress_timestamp_keeps_existing_forms():
+    expected = datetime(2026, 10, 30, 0, 0, 11, tzinfo=timezone.utc)
+    seconds = int(expected.timestamp())
+    assert consumer._parse_ingress_timestamp(seconds) == expected
+    assert consumer._parse_ingress_timestamp(float(seconds)) == expected
+    assert consumer._parse_ingress_timestamp(seconds * 1000) == expected
+    assert consumer._parse_ingress_timestamp(str(seconds)) == expected
+    assert consumer._parse_ingress_timestamp("2026-10-30T08:00:11+08:00") == expected
+    with pytest.raises(consumer.ConsumerError, match="naive"):
+        consumer._parse_ingress_timestamp("2026-10-30T08:00:11")
+    with pytest.raises(consumer.ConsumerError):
+        consumer._parse_ingress_timestamp("")
+
+
+def _management_admits_unmentioned(args: argparse.Namespace) -> None:
+    """Production Management runs with require_mention off (see the brief test)."""
+    constitution = Path(
+        yaml.safe_load(Path(args.config).read_text())["pa"]["constitution_path"]
+    )
+    data = yaml.safe_load(constitution.read_text())
+    data["job_briefs"] = {"tgg_management": {"require_mention": False}}
+    constitution.write_text(yaml.safe_dump(data), encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_management_history_sync_with_long_timestamp_is_skipped_without_turn_or_reply(
+    tmp_path, monkeypatch
+):
+    # PA-429, the 30 Oct shape: history-sync rows with a Long-dict timestamp
+    # sit ahead of a live message.  Evidence is projected, the history rows end
+    # skipped with no turn and no outbound reply, and the live row is answered.
+    chat = "management@g.us"
+    history = []
+    for index in range(3):
+        row = _message(f"history-{index}", chat)
+        row.update({
+            "timestamp": {"high": 0, "low": 1792783211 + index, "unsigned": True},
+            "historySync": True,
+            "historySyncType": "RECENT",
+        })
+        history.append(row)
+    live = _message("live-after-history", chat)
+    live["historySync"] = False
+    args = _enabled_consumer_args(tmp_path, history + [live])
+    _management_admits_unmentioned(args)
+    turns: list[list[str]] = []
+    deliveries: list[list[str]] = []
+
+    async def fake_process(records, **_kwargs):
+        ids = [record.message_id for record in records]
+        turns.append(ids)
+        return {
+            "processed": len(records), "submitted_message_ids": ids,
+            "handled": [{"message_ids": ids, "turn_id": "turn-live"}],
+            "captured_outbound": [],
+        }
+
+    def fake_deliver(inbox, **kwargs):
+        deliveries.append([r.message_id for r in kwargs["batch_records"]])
+        return {}
+
+    monkeypatch.setattr(consumer, "process_live_records", fake_process)
+    monkeypatch.setattr(consumer, "deliver_management_replies", fake_deliver)
+    monkeypatch.setattr(consumer, "_new_gateway_runner", lambda *_a, **_k: object())
+
+    assert await consumer.run_consumer(args) == 0
+    assert turns == [["live-after-history"]]
+    assert deliveries == [["live-after-history"]]
+    inbox = consumer.DurableInbox(Path(args.inbox))
+    with inbox.connect() as conn:
+        rows = {
+            row["message_id"]: (row["status"], row["last_error"])
+            for row in conn.execute(
+                "SELECT message_id,status,last_error FROM ingress_events"
+            )
+        }
+        projected = {
+            row[0] for row in sqlite3.connect(args.case_db).execute(
+                "SELECT source_ref FROM bridge_message_log"
+            )
+        }
+    skipped = ("skipped", "HISTORY_SYNC_REPLAY_NOT_LIVE")
+    assert rows == {
+        "history-0": skipped, "history-1": skipped, "history-2": skipped,
+        "live-after-history": ("completed", None),
+    }
+    assert {"history-0", "history-1", "history-2"} <= projected
+
+
+@pytest.mark.asyncio
+async def test_all_history_sync_batch_starts_no_turn_and_no_reply(tmp_path, monkeypatch):
+    chat = "management@g.us"
+    row = _message("history-only", chat)
+    row.update({
+        "timestamp": {"high": 0, "low": 1792783211, "unsigned": True},
+        "historySync": True,
+    })
+    args = _enabled_consumer_args(tmp_path, [row])
+    _management_admits_unmentioned(args)
+
+    async def forbidden(*_args, **_kwargs):
+        raise AssertionError("a history-sync record started a turn")
+
+    def forbidden_delivery(*_args, **_kwargs):
+        raise AssertionError("a history-sync record produced an outbound reply")
+
+    monkeypatch.setattr(consumer, "process_live_records", forbidden)
+    monkeypatch.setattr(consumer, "deliver_management_replies", forbidden_delivery)
+    monkeypatch.setattr(consumer, "_new_gateway_runner", lambda *_a, **_k: object())
+
+    assert await consumer.run_consumer(args) == 0
+    inbox = consumer.DurableInbox(Path(args.inbox))
+    assert inbox.counts() == {"skipped": 1}
+    with inbox.connect() as conn:
+        error = conn.execute(
+            "SELECT last_error FROM ingress_events WHERE message_id='history-only'"
+        ).fetchone()[0]
+    assert error == "HISTORY_SYNC_REPLAY_NOT_LIVE"
 
 
 def test_management_direct_trigger_setting_defaults_closed(tmp_path):

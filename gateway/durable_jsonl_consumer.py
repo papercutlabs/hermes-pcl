@@ -131,6 +131,22 @@ def _photo_fill_status() -> dict[str, Any]:
     return {"photo_fill_lane": {**_PHOTO_FILL["status"], "thread_alive": thread.is_alive()}} if thread else {}
 
 
+def _protobuf_long_value(value: Mapping[str, Any]) -> int:
+    """Combine a protobuf Long serialised as ``{low, high, unsigned}``.
+
+    WhatsApp history-sync records carry ``messageTimestamp`` this way.  Only an
+    integer ``low`` (bool is not an integer) with an optional integer ``high``
+    is accepted; anything else is refused like any other malformed timestamp.
+    """
+    low, high = value.get("low"), value.get("high", 0)
+    for part in (low, high):
+        if not isinstance(part, int) or isinstance(part, bool):
+            raise ConsumerError(f"invalid ingress timestamp: {dict(value)!r}")
+    if value.get("unsigned"):
+        low &= 0xFFFFFFFF
+    return low + high * 2**32
+
+
 def _parse_ingress_timestamp(value: Any) -> datetime:
     """Normalize bridge timestamps without guessing the timezone.
 
@@ -138,6 +154,11 @@ def _parse_ingress_timestamp(value: Any) -> datetime:
     strings.  Naive strings are refused because a bounded production replay
     must not silently move its cutoff with the host timezone.
     """
+    if isinstance(value, Mapping):
+        try:
+            return _parse_ingress_timestamp(_protobuf_long_value(value))
+        except (OverflowError, OSError, ValueError) as exc:
+            raise ConsumerError(f"invalid ingress timestamp: {dict(value)!r}") from exc
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         number = float(value)
         if number > 10_000_000_000:
@@ -155,6 +176,14 @@ def _parse_ingress_timestamp(value: Any) -> datetime:
     if parsed.tzinfo is None:
         raise ConsumerError("naive ingress timestamp is forbidden")
     return parsed.astimezone(timezone.utc)
+
+
+HISTORY_SYNC_REPLAY_NOT_LIVE = "HISTORY_SYNC_REPLAY_NOT_LIVE"
+
+
+def _is_history_sync_record(record: "InboxRecord") -> bool:
+    """True when the bridge marked the record as a WhatsApp history-sync replay."""
+    return record.raw.get("historySync") is True
 
 
 def _record_ingress_timestamp(record: "InboxRecord") -> datetime:
@@ -6706,6 +6735,22 @@ async def _process_claimed_chat_batch_unlocked(
             raise SourceEvidenceProjectionError(
                 f"source-evidence-projection-held: {exc}"
             ) from exc
+        # PA-429: WhatsApp resends history after a re-pair.  Its source
+        # evidence is projected above; it is never a live message, so it starts
+        # no turn and gets no reply.
+        history = [record for record in records if _is_history_sync_record(record)]
+        if history:
+            # Terminal rows get their retention attempt first (PA-203).
+            await _settle_claim_path_retention(
+                inbox, claim_retention, config_path=config_path
+            )
+            inbox.finish(
+                history, status="skipped", error=HISTORY_SYNC_REPLAY_NOT_LIVE
+            )
+            history_seqs = {record.seq for record in history}
+            records = [record for record in records if record.seq not in history_seqs]
+            if not records:
+                return
         # A reply quote can deterministically locate one of Christopher's own
         # prior document notices.  The metadata is only supplied to the model
         # turn; the capture event remains the same source record and ordinary
