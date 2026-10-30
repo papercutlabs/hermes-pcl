@@ -1250,9 +1250,9 @@ def _tgg_nightly_assignment_prompt(
         "This turn is one continuous WhatsApp interval of one chat. The runtime fixes this "
         "assignment for the turn: it holds after context compaction. If the conversation no "
         "longer shows the original trigger, this block is the assignment. Do not switch "
-        "batch, chat or role. Read the frozen chat with tgg_nightly_get_chat_ledger and "
-        "finish by sealing it with tgg_nightly_seal_chat; the seal checks the coverage of "
-        "the frozen input."
+        "batch, chat or role. Work the frozen chat page by page with tgg_nightly_get_chat_page; "
+        "tgg_nightly_get_chat_ledger lists what is still missing; finish by sealing it with "
+        "tgg_nightly_seal_chat, which checks the coverage of the frozen input."
         if continuous
         else "This session is one nightly WhatsApp analyzer. The runtime fixes this assignment "
         "for the whole session: it holds after context compaction, in every same-session "
@@ -1264,8 +1264,11 @@ def _tgg_nightly_assignment_prompt(
         f"frozen evidence: the frozen chat of batch_id={batch_id} for "
         f"authoritative_chat_id={authoritative_chat_id}; work already saved durably for it is kept.",
     ]
+    # A continuous trigger carries WhatsApp reply context (untrusted client text),
+    # so only a nightly trigger is ever copied into the system instructions.
     if (
-        isinstance(original_message, str)
+        not continuous
+        and isinstance(original_message, str)
         and f"batch_id={batch_id}." in original_message
         and len(original_message) <= _TGG_NIGHTLY_ASSIGNMENT_TRIGGER_MAX_CHARS
     ):
