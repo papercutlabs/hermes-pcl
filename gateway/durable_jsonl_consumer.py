@@ -4201,6 +4201,33 @@ def _continuous_interval_batch(records: Sequence[InboxRecord], config_path: Path
     return bool(records) and all(_continuous_interval_trigger(record, config_path) for record in records)
 
 
+def _continuous_analyzer_retry_trigger(record: InboxRecord, config_path: Path) -> bool:
+    """A validated continuous trigger that the runner issued as its one analyzer retry."""
+    if not _continuous_interval_trigger(record, config_path):
+        return False
+    item = _bridge_item_ref(record.raw)
+    metadata = item.get("metadata") if isinstance(item, Mapping) else None
+    return bool(
+        isinstance(metadata, Mapping)
+        and metadata.get("continuous_analyzer_retry") is True
+        and metadata.get("continuous_analyzer_retry_contract")
+        == "tgg-continuous-analyzer-retry/v1"
+    )
+
+
+def _persistent_continuous_interval_batch(
+    records: Sequence[InboxRecord], config_path: Path
+) -> bool:
+    """Continuous intervals share the chat's session, except an analyzer retry.
+
+    PA-430: the retry follows a turn that ended without a seal, often in a
+    session that compaction had already cut down, so it starts a fresh one.
+    """
+    return _continuous_interval_batch(records, config_path) and not any(
+        _continuous_analyzer_retry_trigger(record, config_path) for record in records
+    )
+
+
 def _same_session_steering_allowed(
     active: Sequence[InboxRecord], followups: Sequence[InboxRecord], config_path: Path,
 ) -> bool:
@@ -7457,7 +7484,7 @@ async def run_consumer(args: argparse.Namespace) -> int:
                             ),
                             allow_active_steering=True,
                             persistent_session=(
-                                _continuous_interval_batch(records, config_path)
+                                _persistent_continuous_interval_batch(records, config_path)
                                 or chat_id not in nightly_chats
                             ),
                         )

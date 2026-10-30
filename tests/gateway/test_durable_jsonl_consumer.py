@@ -2898,6 +2898,72 @@ async def test_validated_continuous_interval_reuses_persistent_nightly_chat_sess
     assert observed == [True]
 
 
+@pytest.mark.asyncio
+async def test_continuous_analyzer_retry_runs_in_a_fresh_session(tmp_path, monkeypatch):
+    nightly_chat = "900000000000000001@g.us"
+    batch_id = "nightly:2026-08-27:0123456789ab"
+
+    def retry_event(message_id, retry_metadata):
+        event = _message(message_id, nightly_chat)
+        event.update({
+            "senderId": "system@internal",
+            "metadata": {
+                "job_type": "tgg_nightly_whatsapp",
+                "nightly_batch_id": batch_id,
+                "nightly_role": "amk",
+                "authoritative_chat_id": "120363421424519051@g.us",
+                "continuous_interval": True,
+                "continuous_contract": "tgg-christopher-continuous-interval/v1",
+                **retry_metadata,
+            },
+        })
+        return event
+
+    retry = retry_event("continuous-retry", {
+        "continuous_analyzer_retry": True,
+        "continuous_analyzer_retry_contract": "tgg-continuous-analyzer-retry/v1",
+    })
+    args = _enabled_consumer_args(tmp_path, [retry])
+    constitution = Path(yaml.safe_load(Path(args.config).read_text())["pa"]["constitution_path"])
+    constitution.write_text(yaml.safe_dump({
+        "selectors": [{"job_type": "tgg_nightly_whatsapp", "match": {
+            "source.platform": "whatsapp", "source.chat_id": nightly_chat,
+        }}],
+    }), encoding="utf-8")
+    config = Path(args.config)
+
+    def record_of(event, ordinal):
+        return consumer.InboxRecord(ordinal, event["messageId"], nightly_chat, ordinal, ordinal, event)
+
+    original = record_of(retry_event("continuous-original", {}), 1)
+    retried = record_of(retry, 2)
+    wrong_contract = record_of(retry_event("continuous-bad", {
+        "continuous_analyzer_retry": True,
+        "continuous_analyzer_retry_contract": "untrusted/v1",
+    }), 3)
+    assert consumer._persistent_continuous_interval_batch([original], config)
+    assert not consumer._persistent_continuous_interval_batch([retried], config)
+    assert consumer._persistent_continuous_interval_batch([wrong_contract], config)
+    # The retry is still a validated continuous trigger: it keeps its pa_context.
+    assert consumer._continuous_interval_trigger(retried, config)
+
+    observed = []
+
+    async def fake_process(records, **kwargs):
+        observed.append(kwargs["persistent_session"])
+        return {
+            "processed": len(records),
+            "submitted_message_ids": [item.message_id for item in records],
+            "handled": [{"message_ids": [item.message_id for item in records], "turn_id": "turn-retry"}],
+            "captured_outbound": [],
+        }
+
+    monkeypatch.setattr(consumer, "process_live_records", fake_process)
+    monkeypatch.setattr(consumer, "_new_gateway_runner", lambda *_a, **_k: object())
+    assert await consumer.run_consumer(args) == 0
+    assert observed == [False]
+
+
 def test_continuous_and_full_nightly_triggers_never_steer_into_each_others_session(tmp_path):
     pseudo = "900000000000000001@g.us"
     batch_id = "nightly:2026-08-27:0123456789ab"
