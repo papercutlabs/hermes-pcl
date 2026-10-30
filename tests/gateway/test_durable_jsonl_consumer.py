@@ -3075,13 +3075,24 @@ def test_ingress_timestamp_accepts_protobuf_long_dict():
     assert consumer._parse_ingress_timestamp(
         {"high": millis >> 32, "low": millis & 0xFFFFFFFF, "unsigned": True}
     ) == expected
-    # unsigned masks a negative low word, signed keeps it.
+    # JavaScript Long: low is always an unsigned 32-bit word.
     assert consumer._parse_ingress_timestamp(
-        {"high": 0, "low": seconds - 2**32, "unsigned": True}
-    ) == expected
-    assert consumer._parse_ingress_timestamp({"high": 0, "low": -1}) == datetime(
+        {"high": 0, "low": -1294967296, "unsigned": True}
+    ) == datetime.fromtimestamp(3_000_000_000, tz=timezone.utc)
+    assert consumer._parse_ingress_timestamp({"high": 0, "low": -1}) == datetime.fromtimestamp(
+        4294967295, tz=timezone.utc
+    )
+    # A signed Long of 3,000,000,000 is {low: -1294967296, high: 0}.
+    assert consumer._parse_ingress_timestamp(
+        {"low": -1294967296, "high": 0}
+    ) == datetime.fromtimestamp(3_000_000_000, tz=timezone.utc)
+    # high is signed int32 unless the Long is unsigned: {-1, -1} is Long -1.
+    assert consumer._parse_ingress_timestamp({"low": -1, "high": -1}) == datetime(
         1969, 12, 31, 23, 59, 59, tzinfo=timezone.utc
     )
+    assert consumer._parse_ingress_timestamp(
+        {"low": 0, "high": 1, "unsigned": True}
+    ) == datetime.fromtimestamp(2**32, tz=timezone.utc)
 
 
 @pytest.mark.parametrize("junk", [
@@ -3095,6 +3106,10 @@ def test_ingress_timestamp_accepts_protobuf_long_dict():
     {"low": 1, "high": True},
     {"low": 1, "high": None},
     {"low": 2**200, "high": 2**200},
+    {"low": 2**32, "high": 0},
+    {"low": 0, "high": 2**32},
+    {"low": -(2**31) - 1},
+    {"low": 0, "high": 2**31 - 1, "unsigned": True},
     {"seconds": 1792783211},
 ])
 def test_ingress_timestamp_refuses_malformed_long_dict(junk):
@@ -3189,6 +3204,165 @@ async def test_management_history_sync_with_long_timestamp_is_skipped_without_tu
         "live-after-history": ("completed", None),
     }
     assert {"history-0", "history-1", "history-2"} <= projected
+
+
+def _fake_turn(turns):
+    async def fake_process(records, **_kwargs):
+        ids = [record.message_id for record in records]
+        turns.append(ids)
+        return {
+            "processed": len(ids), "submitted_message_ids": ids,
+            "handled": [{"message_ids": ids, "turn_id": "turn"}],
+            "captured_outbound": [],
+        }
+    return fake_process
+
+
+def _status_rows(args):
+    with consumer.DurableInbox(Path(args.inbox)).connect() as conn:
+        return {
+            row["message_id"]: (row["status"], row["last_error"])
+            for row in conn.execute("SELECT message_id,status,last_error FROM ingress_events")
+        }
+
+
+@pytest.mark.asyncio
+async def test_history_row_with_trigger_cannot_admit_unaddressed_live_row(
+    tmp_path, monkeypatch
+):
+    # PA-429 review: the mention gate decides on live rows only.  The history
+    # row below starts with "/", which is a direct trigger, but it is not live.
+    chat = "management@g.us"
+    history = _message("history-cmd", chat)
+    history.update({
+        "body": "/status please", "historySync": True,
+        "timestamp": {"high": 0, "low": 1792783211, "unsigned": True},
+    })
+    live = _message("live-plain", chat)
+    live["body"] = "ok noted thanks"
+    args = _enabled_consumer_args(tmp_path, [history, live])
+    turns: list[list[str]] = []
+    monkeypatch.setattr(consumer, "process_live_records", _fake_turn(turns))
+    monkeypatch.setattr(consumer, "deliver_management_replies", lambda *a, **k: {})
+    monkeypatch.setattr(consumer, "_new_gateway_runner", lambda *_a, **_k: object())
+    assert consumer._management_requires_direct_trigger(Path(args.config), chat) is True
+
+    assert await consumer.run_consumer(args) == 0
+    assert turns == []
+    assert _status_rows(args) == {
+        "history-cmd": ("skipped", "HISTORY_SYNC_REPLAY_NOT_LIVE"),
+        "live-plain": ("skipped", "PRIORITY_DIRECT_TRIGGER_NOT_RECOGNIZED"),
+    }
+    with sqlite3.connect(args.case_db) as conn:
+        projected = {r[0] for r in conn.execute("SELECT source_ref FROM bridge_message_log")}
+    assert "history-cmd" in projected
+
+
+@pytest.mark.asyncio
+async def test_history_only_batch_with_mention_required_is_projected_then_skipped(
+    tmp_path, monkeypatch
+):
+    chat = "management@g.us"
+    history = _message("history-plain", chat)
+    history.update({
+        "historySync": True,
+        "timestamp": {"high": 0, "low": 1792783211, "unsigned": True},
+    })
+    args = _enabled_consumer_args(tmp_path, [history])
+    monkeypatch.setattr(consumer, "process_live_records", _fake_turn([]))
+    monkeypatch.setattr(consumer, "_new_gateway_runner", lambda *_a, **_k: object())
+    assert await consumer.run_consumer(args) == 0
+    assert _status_rows(args) == {
+        "history-plain": ("skipped", "HISTORY_SYNC_REPLAY_NOT_LIVE"),
+    }
+    with sqlite3.connect(args.case_db) as conn:
+        assert [r[0] for r in conn.execute("SELECT source_ref FROM bridge_message_log")] == [
+            "history-plain"
+        ]
+
+
+@pytest.mark.asyncio
+async def test_mixed_batch_history_settle_does_not_wait_for_live_retention(
+    tmp_path, monkeypatch
+):
+    # PA-203: retention never delays a turn.  Live rows' media copy is still
+    # running when the live turn starts; only the history rows' own attempt
+    # was settled before they were finished.
+    chat = "management@g.us"
+    history = _message("history-media", chat)
+    history.update({
+        "historySync": True,
+        "timestamp": {"high": 0, "low": 1792783211, "unsigned": True},
+    })
+    live = _message("live-media", chat)
+    args = _enabled_consumer_args(tmp_path, [history, live])
+    _management_admits_unmentioned(args)
+    turn_started = asyncio.Event()
+    started_for: list[list[str]] = []
+    turns: list[list[str]] = []
+
+    def fake_start(inbox, records, *, config_path):
+        records = list(records)
+        if not records:
+            return None
+        started_for.append([r.message_id for r in records])
+        is_live = not any(r.raw.get("historySync") is True for r in records)
+
+        async def attempt():
+            if is_live:
+                await turn_started.wait()
+
+        task = asyncio.create_task(attempt())
+        return consumer._ClaimPathRetention(task=task, records=records)
+
+    async def fake_process(records, **kwargs):
+        turn_started.set()
+        return await _fake_turn(turns)(records, **kwargs)
+
+    monkeypatch.setattr(consumer, "_start_claim_path_retention", fake_start)
+    monkeypatch.setattr(consumer, "_record_claim_path_not_completed", lambda *a, **k: False)
+    monkeypatch.setattr(consumer, "process_live_records", fake_process)
+    monkeypatch.setattr(consumer, "deliver_management_replies", lambda *a, **k: {})
+    monkeypatch.setattr(consumer, "_new_gateway_runner", lambda *_a, **_k: object())
+
+    # A wait for live retention before the turn would deadlock on turn_started.
+    assert await asyncio.wait_for(consumer.run_consumer(args), timeout=10) == 0
+    assert sorted(started_for) == [["history-media"], ["live-media"]]
+    assert turns == [["live-media"]]
+    assert _status_rows(args) == {
+        "history-media": ("skipped", "HISTORY_SYNC_REPLAY_NOT_LIVE"),
+        "live-media": ("completed", None),
+    }
+
+
+@pytest.mark.asyncio
+async def test_production_wrapped_capture_event_history_row_is_skipped(
+    tmp_path, monkeypatch
+):
+    # Production records are whatsapp_capture_event wrappers with the bridge
+    # item under "normalized"; InboxRecord.raw is that unwrapped item.
+    chat = "management@g.us"
+    item = _message("wrapped-history", chat)
+    item.update({
+        "historySync": True, "historySyncType": "RECENT",
+        "timestamp": {"high": 0, "low": 1792783211, "unsigned": True},
+    })
+    wrapped = {
+        "type": "whatsapp_capture_event",
+        "capturedAt": "2026-10-30T01:00:00+00:00",
+        "normalized": item,
+        "raw": {"messageTimestamp": item["timestamp"]},
+    }
+    args = _enabled_consumer_args(tmp_path, [wrapped])
+    _management_admits_unmentioned(args)
+    turns: list[list[str]] = []
+    monkeypatch.setattr(consumer, "process_live_records", _fake_turn(turns))
+    monkeypatch.setattr(consumer, "_new_gateway_runner", lambda *_a, **_k: object())
+    assert await consumer.run_consumer(args) == 0
+    assert turns == []
+    assert _status_rows(args) == {
+        "wrapped-history": ("skipped", "HISTORY_SYNC_REPLAY_NOT_LIVE"),
+    }
 
 
 @pytest.mark.asyncio

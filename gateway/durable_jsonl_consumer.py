@@ -134,17 +134,21 @@ def _photo_fill_status() -> dict[str, Any]:
 def _protobuf_long_value(value: Mapping[str, Any]) -> int:
     """Combine a protobuf Long serialised as ``{low, high, unsigned}``.
 
-    WhatsApp history-sync records carry ``messageTimestamp`` this way.  Only an
-    integer ``low`` (bool is not an integer) with an optional integer ``high``
-    is accepted; anything else is refused like any other malformed timestamp.
+    This follows JavaScript Long: ``low`` is always an unsigned 32-bit word;
+    ``high`` is unsigned when ``unsigned`` is set and a signed int32 otherwise.
+    Only integer words (bool is not an integer) that fit 32 bits are accepted.
     """
     low, high = value.get("low"), value.get("high", 0)
     for part in (low, high):
-        if not isinstance(part, int) or isinstance(part, bool):
+        if (
+            not isinstance(part, int) or isinstance(part, bool)
+            or not -(2**31) <= part < 2**32
+        ):
             raise ConsumerError(f"invalid ingress timestamp: {dict(value)!r}")
-    if value.get("unsigned"):
-        low &= 0xFFFFFFFF
-    return low + high * 2**32
+    high &= 0xFFFFFFFF
+    if not value.get("unsigned") and high >= 2**31:
+        high -= 2**32
+    return (low & 0xFFFFFFFF) + high * 2**32
 
 
 def _parse_ingress_timestamp(value: Any) -> datetime:
@@ -6673,8 +6677,11 @@ async def _process_claimed_chat_batch_unlocked(
     if len(chat_ids) != 1:
         raise ConsumerError(f"scheduler produced a mixed-chat batch: {sorted(chat_ids)}")
     inbox.claim(records)
-    if direct_trigger_required and not any(
-        _priority_direct_trigger(record, config_path) for record in records
+    # PA-429: the mention gate decides on live rows only, so a history-sync
+    # row that carries a trigger can never admit a live row that did not.
+    live = [record for record in records if not _is_history_sync_record(record)]
+    if live and direct_trigger_required and not any(
+        _priority_direct_trigger(record, config_path) for record in live
     ):
         # Retain the reason: a consumed-no-turn row must not look like an
         # unexplained model failure during nightly recovery.
@@ -6683,7 +6690,7 @@ async def _process_claimed_chat_batch_unlocked(
         # (PA-203).  There is no turn here to delay.
         claim_retention = _start_claim_path_retention(
             inbox,
-            [inbox.with_retention_view(record) for record in records],
+            [inbox.with_retention_view(record) for record in live],
             config_path=config_path,
         )
         try:
@@ -6694,12 +6701,16 @@ async def _process_claimed_chat_batch_unlocked(
             inbox.requeue(records, reason="graceful-cancellation")
             raise
         inbox.finish(
-            records,
+            live,
             status="skipped",
             error="PRIORITY_DIRECT_TRIGGER_NOT_RECOGNIZED",
         )
-        return
+        # History rows in the same batch still go on to be projected and skipped.
+        records = [record for record in records if _is_history_sync_record(record)]
+        if not records:
+            return
     claim_retention: _ClaimPathRetention | None = None
+    history_retention: _ClaimPathRetention | None = None
     try:
         # PA-203: retention never gates or delays the turn.  The turn reads
         # each attachment from capture.  Its retention state is re-read
@@ -6708,8 +6719,15 @@ async def _process_claimed_chat_batch_unlocked(
         # Rows nobody has attempted get one best-effort attempt beside the
         # turn; see _start_claim_path_retention.
         records = [inbox.with_retention_view(record) for record in records]
+        history = [record for record in records if _is_history_sync_record(record)]
+        live = [record for record in records if not _is_history_sync_record(record)]
+        # Separate attempts: the history rows' settle below must not wait on
+        # the live rows' media copy, which never delays the live turn.
         claim_retention = _start_claim_path_retention(
-            inbox, records, config_path=config_path
+            inbox, live, config_path=config_path
+        )
+        history_retention = _start_claim_path_retention(
+            inbox, history, config_path=config_path
         )
         # Systems validates business-write citations against bridge_message_log.
         # Project the exact claimed source rows before Hermes can run the model
@@ -6737,18 +6755,17 @@ async def _process_claimed_chat_batch_unlocked(
             ) from exc
         # PA-429: WhatsApp resends history after a re-pair.  Its source
         # evidence is projected above; it is never a live message, so it starts
-        # no turn and gets no reply.
-        history = [record for record in records if _is_history_sync_record(record)]
+        # no turn and gets no reply.  The guard covers every chat: production
+        # finishes no real site-chat rows in this consumer.
         if history:
             # Terminal rows get their retention attempt first (PA-203).
             await _settle_claim_path_retention(
-                inbox, claim_retention, config_path=config_path
+                inbox, history_retention, config_path=config_path
             )
             inbox.finish(
                 history, status="skipped", error=HISTORY_SYNC_REPLAY_NOT_LIVE
             )
-            history_seqs = {record.seq for record in history}
-            records = [record for record in records if record.seq not in history_seqs]
+            records = live
             if not records:
                 return
         # A reply quote can deterministically locate one of Christopher's own
@@ -6878,10 +6895,11 @@ async def _process_claimed_chat_batch_unlocked(
         inbox.requeue(records, reason=f"source-evidence-projection-retry: {exc}")
         raise
     except Exception as exc:
-        with contextlib.suppress(Exception):
-            await _settle_claim_path_retention(
-                inbox, claim_retention, config_path=config_path
-            )
+        for pending in (claim_retention, history_retention):
+            with contextlib.suppress(Exception):
+                await _settle_claim_path_retention(
+                    inbox, pending, config_path=config_path
+                )
         inbox.finish(records, status="failed", error=str(exc))
         raise
 
