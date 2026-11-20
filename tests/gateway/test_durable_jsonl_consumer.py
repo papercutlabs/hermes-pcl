@@ -3741,6 +3741,100 @@ def test_addressed_management_burst_includes_followups_and_steers_while_active(
     assert inbox.counts() == {"completed": 2, "skipped": 1}
 
 
+def _steering_scenario(tmp_path, monkeypatch, *, main_fails=False):
+    """A burst is running; a follow-up arrives and the gateway steers it in."""
+    chat_id = "management@g.us"
+    first = _message("mention", chat_id)
+    first.update({
+        "botIds": ["6599999999@s.whatsapp.net"],
+        "mentionedIds": ["6599999999@s.whatsapp.net"],
+    })
+    source = tmp_path / "events.jsonl"
+    _write_jsonl(source, [first])
+    cursor = tmp_path / "cursor.json"
+    inbox = consumer.DurableInbox(tmp_path / "inbox.db")
+    consumer.initialize_cursor(source, cursor, position="start")
+    inbox.stage_from_source(source, cursor)
+    records = inbox.pending(limit=1)
+    config = tmp_path / "config.yaml"
+    config.write_text("pa:\n  enabled: true\n", encoding="utf-8")
+    started = asyncio.Event()
+    steered = asyncio.Event()
+
+    async def fake_process(batch, **kwargs):
+        ids = [record.message_id for record in batch]
+        if ids == ["mention"]:
+            started.set()
+            await asyncio.wait_for(steered.wait(), timeout=2)
+            if main_fails:
+                raise consumer.ConsumerError("turn failed")
+            # The running turn's record lists the steered message too.
+            return {
+                "processed": 1,
+                "submitted_message_ids": ids,
+                "handled": [{"message_ids": ["mention", "followup"], "turn_id": "turn-main"}],
+                "captured_outbound": [],
+            }
+        steered.set()
+        return {
+            "processed": 1,
+            "submitted_message_ids": ids,
+            "handled": [],
+            "steered_message_ids": ["followup"],
+            "captured_outbound": [],
+        }
+
+    monkeypatch.setattr(consumer, "process_live_records", fake_process)
+    monkeypatch.setattr(consumer, "deliver_management_replies", lambda *_a, **_k: {"delivered": 0, "undelivered": 0})
+
+    async def exercise():
+        task = asyncio.create_task(consumer._process_claimed_chat_batch(
+            inbox,
+            records,
+            config_path=config,
+            state_db=tmp_path / "state.db",
+            case_db=_write_case_db(tmp_path / "case.db"),
+            source_before_image_dir=tmp_path / "source-before-images",
+            gate_changed_at="2026-08-11T00:00:00+00:00",
+            runner=object(),
+            direct_trigger_required=True,
+            allow_active_steering=True,
+            steering_poll_seconds=0.01,
+        ))
+        await asyncio.wait_for(started.wait(), timeout=2)
+        with source.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(_message("followup", chat_id)) + "\n")
+        inbox.stage_from_source(source, cursor)
+        try:
+            await asyncio.wait_for(task, timeout=3)
+        except consumer.ConsumerError:
+            pass
+
+    asyncio.run(exercise())
+    return inbox
+
+
+def test_steered_message_is_completed_with_the_running_turn_id_not_skipped(
+    tmp_path, monkeypatch
+):
+    inbox = _steering_scenario(tmp_path, monkeypatch)
+    assert inbox.counts() == {"completed": 2}
+    with inbox.connect() as conn:
+        rows = dict(conn.execute(
+            "SELECT message_id, pa_turn_id FROM ingress_events"
+        ).fetchall())
+    assert rows == {"mention": "turn-main", "followup": "turn-main"}
+
+
+def test_steered_message_returns_to_pending_when_the_running_turn_fails(
+    tmp_path, monkeypatch
+):
+    inbox = _steering_scenario(tmp_path, monkeypatch, main_fails=True)
+    # The turn failed, so the message steered into it was not answered.
+    assert inbox.counts() == {"failed": 1, "pending": 1}
+    assert inbox.pending(limit=1)[0].message_id == "followup"
+
+
 @pytest.mark.asyncio
 async def test_live_drain_reuses_one_session_across_site_chat_turns(tmp_path):
     args = _enabled_consumer_args(tmp_path, [])

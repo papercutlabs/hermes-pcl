@@ -3900,6 +3900,12 @@ async def process_live_records(
         "provider_errors": provider_errors,
         "outbound_sent": 0,
         "submitted_message_ids": [record.message_id for record in records],
+        # PA-611: messages the gateway steered into an already running turn.
+        # They are answered by that turn, so this replay has no turn for them.
+        "steered_message_ids": [
+            str(value)
+            for value in (getattr(result, "steered_message_ids", None) or [])
+        ],
     }
 
 
@@ -6696,10 +6702,16 @@ async def _process_claimed_chat_batch_unlocked(
     steering_poll_seconds: float = 0.5,
     steering_batch_size: int = 25,
     persistent_session: bool = True,
-) -> None:
-    """Claim and process exactly one chat batch through the shared runner."""
+) -> list[InboxRecord]:
+    """Claim and process exactly one chat batch through the shared runner.
+
+    Returns the records of this batch that the gateway steered into an already
+    running turn (PA-611).  They are left in ``processing`` for the caller that
+    owns that running turn, which credits them with its turn id when it
+    finishes; the return is empty for an ordinary batch.
+    """
     if not records:
-        return
+        return []
     chat_ids = {record.chat_id for record in records}
     if len(chat_ids) != 1:
         raise ConsumerError(f"scheduler produced a mixed-chat batch: {sorted(chat_ids)}")
@@ -6735,9 +6747,11 @@ async def _process_claimed_chat_batch_unlocked(
         # History rows in the same batch still go on to be projected and skipped.
         records = [record for record in records if _is_history_sync_record(record)]
         if not records:
-            return
+            return []
     claim_retention: _ClaimPathRetention | None = None
     history_retention: _ClaimPathRetention | None = None
+    # PA-611: records of later batches that were steered into this batch's turn.
+    steered_records: list[InboxRecord] = []
     try:
         # PA-203: retention never gates or delays the turn.  The turn reads
         # each attachment from capture.  Its retention state is re-read
@@ -6794,7 +6808,7 @@ async def _process_claimed_chat_batch_unlocked(
             )
             records = live
             if not records:
-                return
+                return []
         # A reply quote can deterministically locate one of Christopher's own
         # prior document notices.  The metadata is only supplied to the model
         # turn; the capture event remains the same source record and ordinary
@@ -6854,18 +6868,21 @@ async def _process_claimed_chat_batch_unlocked(
                     # follow-up after the active tool boundary; it never cancels
                     # file generation or another in-flight tool.
                     try:
-                        await _process_claimed_chat_batch_unlocked(
-                            inbox,
-                            followups,
-                            config_path=config_path,
-                            state_db=state_db,
-                            case_db=case_db,
-                            source_before_image_dir=source_before_image_dir,
-                            gate_changed_at=gate_changed_at,
-                            runner=runner,
-                            direct_trigger_required=False,
-                            allow_active_steering=False,
-                            persistent_session=persistent_session,
+                        steered_records.extend(
+                            await _process_claimed_chat_batch_unlocked(
+                                inbox,
+                                followups,
+                                config_path=config_path,
+                                state_db=state_db,
+                                case_db=case_db,
+                                source_before_image_dir=source_before_image_dir,
+                                gate_changed_at=gate_changed_at,
+                                runner=runner,
+                                direct_trigger_required=False,
+                                allow_active_steering=False,
+                                persistent_session=persistent_session,
+                            )
+                            or []
                         )
                     except Exception as exc:
                         print(
@@ -6881,6 +6898,25 @@ async def _process_claimed_chat_batch_unlocked(
                 "processor evidence did not conserve claimed messages: "
                 f"claimed={len(expected)} evidenced={len(submitted)}"
             )
+        # PA-611: a message the gateway steered into the running turn has no
+        # turn of this replay.  It is not skipped: it stays claimed and is
+        # finished by the batch that owns the running turn, with that turn's
+        # id.  Only a batch that ran no turn of its own defers (a batch whose
+        # turn ran answers its own messages).
+        steered_ids = {
+            str(value) for value in result.get("steered_message_ids") or []
+        } & expected
+        if steered_ids and not result.get("handled"):
+            deferred = [r for r in records if r.message_id in steered_ids]
+            records = [r for r in records if r.message_id not in steered_ids]
+            await _settle_claim_path_retention(
+                inbox, claim_retention, config_path=config_path
+            )
+            if records:
+                inbox.finish_processed_batch(records, turn_for_message={})
+            return deferred
+        # Records steered into this batch's own turn by later batches.
+        expected = expected | {record.message_id for record in steered_records}
         turn_for_message: dict[str, str] = {}
         for group in result.get("handled") or []:
             turn_id = str(group.get("turn_id") or "")
@@ -6911,15 +6947,25 @@ async def _process_claimed_chat_batch_unlocked(
         )
         # One transaction: a multi-turn batch can never land partially
         # terminal if the process exits between turn groups.
-        inbox.finish_processed_batch(records, turn_for_message=turn_for_message)
+        # The steered records finish with the same transaction as the turn that
+        # answered them: completed with that turn's id (PA-611).
+        inbox.finish_processed_batch(
+            [*records, *steered_records], turn_for_message=turn_for_message
+        )
+        steered_records = []
     except asyncio.CancelledError:
-        inbox.requeue(records, reason="graceful-cancellation")
+        inbox.requeue([*records, *steered_records], reason="graceful-cancellation")
         raise
     except MediaRetentionError as exc:
-        inbox.requeue(records, reason=f"media-retention-retry: {exc}")
+        inbox.requeue(
+            [*records, *steered_records], reason=f"media-retention-retry: {exc}"
+        )
         raise
     except SourceEvidenceProjectionError as exc:
-        inbox.requeue(records, reason=f"source-evidence-projection-retry: {exc}")
+        inbox.requeue(
+            [*records, *steered_records],
+            reason=f"source-evidence-projection-retry: {exc}",
+        )
         raise
     except Exception as exc:
         for pending in (claim_retention, history_retention):
@@ -6928,6 +6974,11 @@ async def _process_claimed_chat_batch_unlocked(
                     inbox, pending, config_path=config_path
                 )
         inbox.finish(records, status="failed", error=str(exc))
+        if steered_records:
+            # The running turn failed, so the messages steered into it were
+            # not answered: return them to pending for an ordinary turn.
+            with contextlib.suppress(Exception):
+                inbox.requeue(steered_records, reason="steered-turn-failed")
         raise
 
     # Delivery follows durable ingest completion.  It cannot change inbox
@@ -6949,6 +7000,7 @@ async def _process_claimed_chat_batch_unlocked(
             f"reply delivery machinery FAILED (ingest unaffected): {exc}",
             file=sys.stderr,
         )
+    return []
 
 
 async def _process_claimed_chat_batch(

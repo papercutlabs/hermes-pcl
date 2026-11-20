@@ -1444,6 +1444,9 @@ class AIAgent:
         # existing tool message rather than inserting a new user turn).
         self._pending_steer: Optional[str] = None
         self._pending_steer_lock = threading.Lock()
+        # PA-611: gateway messages that arrive mid-turn.  Each entry becomes a
+        # real user message at the next model-call boundary (steer_user_message).
+        self._pending_user_messages: list = []
 
         # Concurrent-tool worker thread tracking.  `_execute_tool_calls_concurrent`
         # runs each tool on its own ThreadPoolExecutor worker — those worker
@@ -5627,6 +5630,77 @@ class AIAgent:
             text = self._pending_steer
             self._pending_steer = None
         return text
+
+    def steer_user_message(
+        self,
+        text: str,
+        *,
+        source_message_ids: Optional[List[str]] = None,
+    ) -> bool:
+        """Queue a mid-turn user message to enter the conversation as a user turn.
+
+        PA-611.  Unlike steer(), the text is not pasted into a tool result.  At
+        the top of the next model-call iteration the loop appends it to the
+        running conversation as its own ``role: "user"`` message, with the
+        source message ids and any attachment lines the caller put in ``text``
+        intact.  If the model would end the turn while one is still pending,
+        the loop makes one more call in the same turn (see the final-response
+        branch of run_conversation).  Thread-safe; callable from gateway threads.
+
+        Returns False when the text is empty.
+        """
+        if not text or not str(text).strip():
+            return False
+        entry = {
+            "text": str(text).strip(),
+            "source_message_ids": [str(i) for i in (source_message_ids or []) if i],
+        }
+        lock = getattr(self, "_pending_steer_lock", None)
+        if lock is None:
+            pending = getattr(self, "_pending_user_messages", None)
+            if pending is None:
+                pending = self._pending_user_messages = []
+            pending.append(entry)
+            return True
+        with lock:
+            pending = getattr(self, "_pending_user_messages", None)
+            if pending is None:
+                pending = self._pending_user_messages = []
+            pending.append(entry)
+        return True
+
+    def _has_pending_user_messages(self) -> bool:
+        lock = getattr(self, "_pending_steer_lock", None)
+        if lock is None:
+            return bool(getattr(self, "_pending_user_messages", None))
+        with lock:
+            return bool(getattr(self, "_pending_user_messages", None))
+
+    def _drain_pending_user_messages(self) -> list:
+        lock = getattr(self, "_pending_steer_lock", None)
+        if lock is None:
+            entries = list(getattr(self, "_pending_user_messages", None) or [])
+            self._pending_user_messages = []
+            return entries
+        with lock:
+            entries = list(getattr(self, "_pending_user_messages", None) or [])
+            self._pending_user_messages = []
+        return entries
+
+    def _inject_pending_user_messages(self, messages: list) -> int:
+        """Append each pending mid-turn message to ``messages`` as a user message.
+
+        Returns the number appended.  Called at the top of every model-call
+        iteration, so a message that arrives during a tool batch or during the
+        previous model call is seen by the very next call.
+        """
+        entries = self._drain_pending_user_messages()
+        for entry in entries:
+            msg = {"role": "user", "content": entry["text"], "_steered_user_message": True}
+            if entry.get("source_message_ids"):
+                msg["_source_message_ids"] = list(entry["source_message_ids"])
+            messages.append(msg)
+        return len(entries)
 
     def _record_file_mutation_result(
         self,
@@ -12848,6 +12922,17 @@ class AIAgent:
                     and "skill_manage" in self.valid_tool_names):
                 self._iters_since_skill += 1
             
+            # PA-611: mid-turn gateway messages enter the conversation as real
+            # user messages at this model-call boundary (not inside a tool result).
+            _injected_user_msgs = self._inject_pending_user_messages(messages)
+            if _injected_user_msgs:
+                logger.info(
+                    "Steered %d mid-turn user message(s) into the conversation before API call #%d",
+                    _injected_user_msgs,
+                    api_call_count,
+                )
+                self._session_messages = messages
+
             # ── Pre-API-call /steer drain ──────────────────────────────────
             # If a /steer arrived during the previous API call (while the model
             # was thinking), drain it now — before we build api_messages — so
@@ -12966,6 +13051,8 @@ class AIAgent:
                     api_msg.pop("finish_reason")
                 # Strip internal thinking-prefill marker
                 api_msg.pop("_thinking_prefill", None)
+                api_msg.pop("_steered_user_message", None)
+                api_msg.pop("_source_message_ids", None)
                 # Strip Codex Responses API fields (call_id, response_item_id) for
                 # strict providers like Mistral, Fireworks, etc. that reject unknown fields.
                 # Uses new dicts so the internal messages list retains the fields
@@ -16046,6 +16133,22 @@ class AIAgent:
                         messages.pop()
 
                     messages.append(final_msg)
+
+                    # PA-611: a mid-turn user message is still pending, so the
+                    # turn is not over.  Make one more model call in this turn;
+                    # the top of the loop appends the message as a user turn.
+                    if self._has_pending_user_messages() and (
+                        (
+                            api_call_count < self.max_iterations
+                            and self.iteration_budget.remaining > 0
+                        )
+                        or self._budget_grace_call
+                    ):
+                        logger.info(
+                            "Mid-turn user message pending at turn end; making a follow-up call in the same turn"
+                        )
+                        self._session_messages = messages
+                        continue
                     
                     _turn_exit_reason = f"text_response(finish_reason={finish_reason})"
                     if not self.quiet_mode:
@@ -16357,6 +16460,15 @@ class AIAgent:
         # batches to drain into), hand it back to the caller so it can be
         # delivered as the next user turn instead of being silently lost.
         _leftover_steer = self._drain_pending_steer()
+        # PA-611: a mid-turn user message that could not be answered in this
+        # turn (interrupt, budget) goes back to the caller the same way.
+        _leftover_user = [
+            entry["text"] for entry in self._drain_pending_user_messages()
+        ]
+        if _leftover_user:
+            _leftover_steer = "\n".join(
+                part for part in [_leftover_steer, *_leftover_user] if part
+            )
         if _leftover_steer:
             result["pending_steer"] = _leftover_steer
         self._response_was_previewed = False

@@ -1006,6 +1006,9 @@ class ReplayExecutionContext:
     outbound: list[dict[str, Any]] = field(default_factory=list)
     blocked_commands: list[dict[str, Any]] = field(default_factory=list)
     captured_business_mutations: list[dict[str, Any]] = field(default_factory=list)
+    # PA-611: source message ids this replay steered into an already running
+    # turn.  They belong to that turn, not to a turn of this replay.
+    steered_message_ids: list[str] = field(default_factory=list)
 
     @property
     def execution_mode(self) -> str:
@@ -1220,6 +1223,7 @@ class ReplayResult:
     corpus_report: Optional[dict[str, Any]] = None
     attempt: Optional[dict[str, Any]] = None
     execution_report: Optional[dict[str, Any]] = None
+    steered_message_ids: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -1234,6 +1238,7 @@ class ReplayResult:
             "corpus_report": self.corpus_report,
             "attempt": self.attempt,
             "execution_report": self.execution_report,
+            "steered_message_ids": self.steered_message_ids,
         }
 
     def to_json(self) -> str:

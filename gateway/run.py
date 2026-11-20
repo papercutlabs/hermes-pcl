@@ -3652,6 +3652,61 @@ class GatewayRunner:
             return
         merge_pending_message_event(adapter._pending_messages, session_key, event)
 
+    def _steer_event_into_running_agent(
+        self,
+        running_agent: Any,
+        event: MessageEvent,
+        session_key: str,
+    ) -> bool:
+        """Steer a mid-turn message into the running turn as a real user message.
+
+        PA-611.  The message enters the running conversation as its own user
+        message at the next model-call boundary (``steer_user_message``), with
+        its text, its attachment lines and its source message ids.  Its source
+        ids are registered for the running turn so the tools that resolve the
+        current message's attachments find them, the turn record lists them,
+        and the durable intake credits them to the running turn instead of
+        marking them skipped.  Returns False (caller queues) when the message
+        has nothing to carry or the agent cannot take it.
+        """
+        text = (event.text or "").strip()
+        media_urls = list(getattr(event, "media_urls", None) or [])
+        if media_urls and not any(str(url) in text for url in media_urls):
+            placeholder = _build_media_placeholder(event)
+            text = f"{text}\n{placeholder}".strip() if text else placeholder
+        if not text or running_agent is None or not hasattr(running_agent, "steer_user_message"):
+            return False
+        source_ids = self._event_source_message_ids(event)
+        if source_ids:
+            text = f"{text}\n[Message id: {', '.join(source_ids)}]"
+        try:
+            accepted = bool(
+                running_agent.steer_user_message(text, source_message_ids=source_ids)
+            )
+        except Exception as exc:
+            logger.warning("Gateway steer failed for session %s: %s", session_key, exc)
+            return False
+        if not accepted:
+            return False
+        if source_ids:
+            try:
+                from gateway.session_context import add_steered_source_refs
+
+                add_steered_source_refs(session_key, source_ids)
+            except Exception as exc:
+                logger.debug("steered source ref registration failed: %s", exc)
+            try:
+                from gateway.replay import current_replay_context
+
+                replay_ctx = current_replay_context()
+                if replay_ctx is not None:
+                    for item in source_ids:
+                        if item not in replay_ctx.steered_message_ids:
+                            replay_ctx.steered_message_ids.append(item)
+            except Exception as exc:
+                logger.debug("steered replay ref registration failed: %s", exc)
+        return True
+
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
         # --- Authorization gate (#17775) ---
         # The cold path (_handle_message) checks _is_user_authorized before
@@ -3717,19 +3772,14 @@ class GatewayRunner:
         effective_mode = self._busy_input_mode
         steered = False
         if effective_mode == "steer":
-            steer_text = (event.text or "").strip()
             can_steer = (
-                steer_text
-                and running_agent is not None
+                running_agent is not None
                 and running_agent is not _AGENT_PENDING_SENTINEL
-                and hasattr(running_agent, "steer")
             )
             if can_steer:
-                try:
-                    steered = bool(running_agent.steer(steer_text))
-                except Exception as exc:
-                    logger.warning("Gateway steer failed for session %s: %s", session_key, exc)
-                    steered = False
+                steered = self._steer_event_into_running_agent(
+                    running_agent, event, session_key
+                )
             if not steered:
                 # Fall back to queue (merge into pending messages, no interrupt)
                 effective_mode = "queue"
@@ -8226,14 +8276,9 @@ class GatewayRunner:
                 # Steer mode: inject text into the running agent mid-run via
                 # agent.steer().  Falls back to queue semantics if the payload
                 # is empty, the agent lacks steer(), or steer() rejects.
-                steer_text = (event.text or "").strip()
-                steered = False
-                if steer_text and hasattr(running_agent, "steer"):
-                    try:
-                        steered = bool(running_agent.steer(steer_text))
-                    except Exception as exc:
-                        logger.warning("PRIORITY steer failed for session %s: %s", _quick_key, exc)
-                        steered = False
+                steered = self._steer_event_into_running_agent(
+                    running_agent, event, _quick_key
+                )
                 if steered:
                     logger.debug("PRIORITY steer for session %s", _quick_key)
                     return None
@@ -9278,6 +9323,15 @@ class GatewayRunner:
         # Build session context
         context = build_session_context(source, self.config, session_entry)
         
+        # PA-611: steered ids belong to the turn they were steered into; a
+        # new turn starts with none (the sentinel blocks steering until the
+        # agent is registered, which happens after this point).
+        try:
+            from gateway.session_context import pop_steered_source_refs
+
+            pop_steered_source_refs(session_key)
+        except Exception:
+            pass
         # Set session context variables for tools (task-local, concurrency-safe)
         _session_env_tokens = self._set_session_env(context, event=event)
         
@@ -12392,7 +12446,21 @@ class GatewayRunner:
         # pa_turns.message_refs_json is populated at source, never
         # reconstructed from content downstream.
         _src_msg_ids = self._event_source_message_ids(event)
-        if _src_msg_ids and isinstance(_pa_record_result, dict):
+        # PA-611: messages steered into this turn mid-run belong to it.
+        try:
+            from gateway.session_context import pop_steered_source_refs
+
+            _steered_ids = pop_steered_source_refs(str(quick_key or ""))
+        except Exception:
+            _steered_ids = []
+        if _steered_ids and isinstance(_pa_record_result, dict):
+            _own_ids = list(
+                _pa_record_result.get("turn_source_message_ids") or _src_msg_ids
+            )
+            _pa_record_result["turn_source_message_ids"] = _own_ids + [
+                i for i in _steered_ids if i not in _own_ids
+            ]
+        elif _src_msg_ids and isinstance(_pa_record_result, dict):
             _pa_record_result.setdefault("turn_source_message_ids", _src_msg_ids)
         _pa_final_text = ""
         if isinstance(_pa_record_result, dict):
