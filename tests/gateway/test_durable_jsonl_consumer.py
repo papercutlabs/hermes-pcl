@@ -3668,82 +3668,9 @@ def test_passive_management_chatter_is_skipped_without_calling_model(
     assert row[0] == "PRIORITY_DIRECT_TRIGGER_NOT_RECOGNIZED"
 
 
-def test_addressed_management_burst_includes_followups_and_steers_while_active(
-    tmp_path, monkeypatch
-):
-    chat_id = "management@g.us"
-    first = _message("mention", chat_id)
-    first.update({
-        "botIds": ["6599999999@s.whatsapp.net"],
-        "mentionedIds": ["6599999999@s.whatsapp.net"],
-    })
-    source = tmp_path / "events.jsonl"
-    _write_jsonl(source, [_message("burst-context", chat_id), first])
-    cursor = tmp_path / "cursor.json"
-    inbox = consumer.DurableInbox(tmp_path / "inbox.db")
-    consumer.initialize_cursor(source, cursor, position="start")
-    inbox.stage_from_source(source, cursor)
-    records = inbox.pending(limit=2)
-    config = tmp_path / "config.yaml"
-    config.write_text("pa:\n  enabled: true\n", encoding="utf-8")
-    started = asyncio.Event()
-    steered = asyncio.Event()
-    calls: list[list[str]] = []
-    shared_runner = object()
-
-    async def fake_process(batch, **kwargs):
-        assert kwargs["runner"] is shared_runner
-        ids = [record.message_id for record in batch]
-        calls.append(ids)
-        if ids == ["burst-context", "mention"]:
-            started.set()
-            await asyncio.wait_for(steered.wait(), timeout=2)
-            return {
-                "processed": 2,
-                "submitted_message_ids": ids,
-                "handled": [{"message_ids": ids, "turn_id": "turn-main"}],
-                "captured_outbound": [],
-            }
-        assert ids == ["followup"]
-        steered.set()
-        return {
-            "processed": 1,
-            "submitted_message_ids": ids,
-            "handled": [],
-            "captured_outbound": [],
-        }
-
-    monkeypatch.setattr(consumer, "process_live_records", fake_process)
-    monkeypatch.setattr(consumer, "deliver_management_replies", lambda *_a, **_k: {"delivered": 0, "undelivered": 0})
-    async def exercise():
-        task = asyncio.create_task(consumer._process_claimed_chat_batch(
-            inbox,
-            records,
-            config_path=config,
-            state_db=tmp_path / "state.db",
-            case_db=_write_case_db(tmp_path / "case.db"),
-            source_before_image_dir=tmp_path / "source-before-images",
-            gate_changed_at="2026-08-11T00:00:00+00:00",
-            runner=shared_runner,
-            direct_trigger_required=True,
-            allow_active_steering=True,
-            steering_poll_seconds=0.01,
-        ))
-        await asyncio.wait_for(started.wait(), timeout=2)
-        with source.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(_message("followup", chat_id)) + "\n")
-        inbox.stage_from_source(source, cursor)
-        await asyncio.wait_for(task, timeout=3)
-
-    asyncio.run(exercise())
-
-    assert calls == [["burst-context", "mention"], ["followup"]]
-    assert inbox.counts() == {"completed": 2, "skipped": 1}
-
-
-def test_media_followup_is_not_steered_and_stays_pending_for_its_own_turn(tmp_path, monkeypatch):
-    """PA-611: a follow-up with an attachment is never steered into the active turn (steering drops the
-    attachment and credits no turn). It stays pending in the durable inbox, attachment intact."""
+def _run_with_midturn_message(tmp_path, monkeypatch, midturn):
+    """Run an addressed management turn; while it runs, append `midturn` to the source and stage it.
+    Returns (inbox, calls, runner_kwargs) after the active turn ends. Nothing runs the mid-turn row."""
     chat_id = "management@g.us"
     first = _message("mention", chat_id)
     first.update({
@@ -3766,51 +3693,94 @@ def test_media_followup_is_not_steered_and_stays_pending_for_its_own_turn(tmp_pa
     async def fake_process(batch, **kwargs):
         ids = [record.message_id for record in batch]
         calls.append(ids)
-        started.set()
-        await asyncio.wait_for(release.wait(), timeout=2)
-        return {"processed": 1, "submitted_message_ids": ids,
-                "handled": [{"message_ids": ids, "turn_id": "turn-main"}], "captured_outbound": []}
+        if ids == ["mention"]:
+            started.set()
+            await asyncio.wait_for(release.wait(), timeout=2)
+        return {"processed": len(ids), "submitted_message_ids": ids,
+                "handled": [{"message_ids": ids, "turn_id": "turn-" + ids[0]}], "captured_outbound": []}
 
     monkeypatch.setattr(consumer, "process_live_records", fake_process)
     monkeypatch.setattr(consumer, "deliver_management_replies", lambda *_a, **_k: {"delivered": 0, "undelivered": 0})
+    kwargs = dict(
+        config_path=config, state_db=tmp_path / "state.db", case_db=_write_case_db(tmp_path / "case.db"),
+        source_before_image_dir=tmp_path / "source-before-images", gate_changed_at="2026-08-11T00:00:00+00:00",
+        runner=object(), direct_trigger_required=False, allow_active_steering=True, steering_poll_seconds=0.01,
+    )
 
     async def exercise():
-        task = asyncio.create_task(consumer._process_claimed_chat_batch(
-            inbox, records, config_path=config, state_db=tmp_path / "state.db",
-            case_db=_write_case_db(tmp_path / "case.db"),
-            source_before_image_dir=tmp_path / "source-before-images",
-            gate_changed_at="2026-08-11T00:00:00+00:00", runner=object(),
-            direct_trigger_required=True, allow_active_steering=True, steering_poll_seconds=0.01,
-        ))
+        task = asyncio.create_task(consumer._process_claimed_chat_batch(inbox, records, **kwargs))
         await asyncio.wait_for(started.wait(), timeout=2)
-        workbook = _message("workbook", chat_id)
-        workbook.update({"hasMedia": True, "mediaType": "document", "mediaUrls": ["/media/x.xlsx"]})
         with source.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(workbook) + "\n")
+            handle.write(json.dumps(midturn(chat_id)) + "\n")
         inbox.stage_from_source(source, cursor)
-        await asyncio.sleep(0.2)  # many steering polls while the turn is active
+        await asyncio.sleep(0.2)  # many former steering polls while the turn is active
         release.set()
         await asyncio.wait_for(task, timeout=3)
 
     asyncio.run(exercise())
+    return inbox, calls, kwargs
 
-    assert calls == [["mention"]]  # the workbook was never handed to a second replay
+
+def _text_followup(chat_id):
+    return _message("followup", chat_id)
+
+
+def _media_followup(chat_id):
+    workbook = _message("workbook", chat_id)
+    workbook.update({"hasMedia": True, "mediaType": "document", "mediaUrls": ["/media/x.xlsx"]})
+    return workbook
+
+
+@pytest.mark.parametrize("make, message_id", [(_text_followup, "followup"), (_media_followup, "workbook")])
+def test_midturn_followup_is_never_steered_and_gets_its_own_turn(tmp_path, monkeypatch, make, message_id):
+    """PA-611: text or media, a message that arrives while a turn runs is not handed to a second replay
+    (steering drops attachments and credits no turn). It stays pending, intact, until intake gives it its own turn."""
+    inbox, calls, kwargs = _run_with_midturn_message(tmp_path, monkeypatch, make)
+
+    assert calls == [["mention"]]  # no second replay while the turn was active
     assert inbox.counts() == {"completed": 1, "pending": 1}
     pending = inbox.pending(limit=5)
-    assert [record.message_id for record in pending] == ["workbook"]
-    assert pending[0].raw["mediaUrls"] == ["/media/x.xlsx"]
+    assert [record.message_id for record in pending] == [message_id]
+    if message_id == "workbook":
+        assert pending[0].raw["mediaUrls"] == ["/media/x.xlsx"]
+
+    # The next intake cycle claims it: its own turn, credited completed (not skipped).
+    asyncio.run(consumer._process_claimed_chat_batch(inbox, pending, **kwargs))
+    assert calls == [["mention"], [message_id]]
+    assert inbox.counts() == {"completed": 2}
+    with inbox.connect() as conn:
+        row = conn.execute("SELECT status FROM ingress_events WHERE message_id=?", (message_id,)).fetchone()
+    assert row[0] == "completed"
 
 
-def test_record_carries_media_reads_every_attachment_shape():
-    def record(raw):
-        return consumer.InboxRecord(seq=1, message_id="m", chat_id="c@g.us", start_offset=0, end_offset=1, raw=raw)
+def test_message_arriving_with_no_turn_running_is_processed_as_before(tmp_path, monkeypatch):
+    source = tmp_path / "events.jsonl"
+    _write_jsonl(source, [_message("solo", "management@g.us")])
+    cursor = tmp_path / "cursor.json"
+    inbox = consumer.DurableInbox(tmp_path / "inbox.db")
+    consumer.initialize_cursor(source, cursor, position="start")
+    inbox.stage_from_source(source, cursor)
+    records = inbox.pending(limit=1)
+    config = tmp_path / "config.yaml"
+    config.write_text("pa:\n  enabled: true\n", encoding="utf-8")
+    calls: list[list[str]] = []
 
-    assert not consumer._record_carries_media(record(_message("text")))
-    assert consumer._record_carries_media(record({**_message("a"), "hasMedia": True}))
-    assert consumer._record_carries_media(record({**_message("b"), "mediaType": "image"}))
-    assert consumer._record_carries_media(record({**_message("c"), "mediaUrls": ["/x"]}))
-    assert consumer._record_carries_media(record({**_message("d"), "mediaPaths": ["/x"]}))
-    assert consumer._record_carries_media(record({"normalized": {**_message("e"), "hasMedia": True}}))
+    async def fake_process(batch, **kwargs):
+        ids = [record.message_id for record in batch]
+        calls.append(ids)
+        return {"processed": 1, "submitted_message_ids": ids,
+                "handled": [{"message_ids": ids, "turn_id": "turn-solo"}], "captured_outbound": []}
+
+    monkeypatch.setattr(consumer, "process_live_records", fake_process)
+    monkeypatch.setattr(consumer, "deliver_management_replies", lambda *_a, **_k: {"delivered": 0, "undelivered": 0})
+    asyncio.run(consumer._process_claimed_chat_batch(
+        inbox, records, config_path=config, state_db=tmp_path / "state.db",
+        case_db=_write_case_db(tmp_path / "case.db"), source_before_image_dir=tmp_path / "source-before-images",
+        gate_changed_at="2026-08-11T00:00:00+00:00", runner=object(), direct_trigger_required=False,
+        allow_active_steering=True, steering_poll_seconds=0.01,
+    ))
+    assert calls == [["solo"]]
+    assert inbox.counts() == {"completed": 1}
 
 
 @pytest.mark.asyncio

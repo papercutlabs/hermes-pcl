@@ -4228,18 +4228,6 @@ def _persistent_continuous_interval_batch(
     )
 
 
-def _record_carries_media(record: InboxRecord) -> bool:
-    """True when the captured message has an attachment (hasMedia, a media type or any media path)."""
-    item = record.raw if isinstance(record.raw, Mapping) else {}
-    normalized = item.get("normalized") if isinstance(item.get("normalized"), Mapping) else item
-    for source in (item, normalized):
-        if source.get("hasMedia") is True or str(source.get("mediaType") or "").strip():
-            return True
-        if any(source.get(key) for key in ("mediaUrls", "media", "mediaPaths")):
-            return True
-    return False
-
-
 def _same_session_steering_allowed(
     active: Sequence[InboxRecord], followups: Sequence[InboxRecord], config_path: Path,
 ) -> bool:
@@ -6843,56 +6831,13 @@ async def _process_claimed_chat_batch_unlocked(
                     capture_business_writes_for_test_management=capture_canary_reply,
                 )
             )
-            if allow_active_steering:
-                while not processing.done():
-                    await asyncio.sleep(max(0.05, steering_poll_seconds))
-                    if processing.done():
-                        break
-                    followups = inbox.pending_chat_batch(
-                        records[0].chat_id,
-                        batch_size=steering_batch_size,
-                    )
-                    if not followups:
-                        continue
-                    # A continuous interval and the full nightly fallback use
-                    # the same reserved pseudo-chat but intentionally different
-                    # session lifetimes. Never steer one mode into the other's
-                    # active turn; leave it pending for the scheduler to launch
-                    # with its own persistent/fresh decision after this turn.
-                    if not _same_session_steering_allowed(records, followups, config_path):
-                        continue
-                    # PA-611: steering injects only text, and a steered row is credited
-                    # skipped with no turn. A follow-up that carries media (a workbook, a
-                    # photo, a voice note) would lose the attachment, so it stays pending in
-                    # the durable inbox and runs as its own turn, with its own turn id and
-                    # its attachment, after the active turn. The runner's queue mode cannot
-                    # do this: a replay adapter's pending queue is local to that replay.
-                    if any(_record_carries_media(record) for record in followups):
-                        continue
-                    # The shared runner is still executing the addressed turn.
-                    # With busy_input_mode=steer this second replay injects the
-                    # follow-up after the active tool boundary; it never cancels
-                    # file generation or another in-flight tool.
-                    try:
-                        await _process_claimed_chat_batch_unlocked(
-                            inbox,
-                            followups,
-                            config_path=config_path,
-                            state_db=state_db,
-                            case_db=case_db,
-                            source_before_image_dir=source_before_image_dir,
-                            gate_changed_at=gate_changed_at,
-                            runner=runner,
-                            direct_trigger_required=False,
-                            allow_active_steering=False,
-                            persistent_session=persistent_session,
-                        )
-                    except Exception as exc:
-                        print(
-                            "active management steer FAILED "
-                            f"chat={records[0].chat_id}: {exc}",
-                            file=sys.stderr,
-                        )
+            # PA-611 (Teren, 20 Nov): a message that arrives while this turn runs is
+            # never steered into it. Steering injected text only, credited the row
+            # skipped with no turn, and dropped any attachment. The row stays pending
+            # in the durable inbox with its attachment and runs as its own turn after
+            # this one, credited completed by intake (finish_processed_batch).
+            # allow_active_steering is kept so callers are unchanged; it no longer
+            # starts a second replay.
             result = await processing
         submitted = {str(value) for value in result.get("submitted_message_ids") or []}
         expected = {record.message_id for record in records}
