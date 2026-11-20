@@ -4228,6 +4228,18 @@ def _persistent_continuous_interval_batch(
     )
 
 
+def _record_carries_media(record: InboxRecord) -> bool:
+    """True when the captured message has an attachment (hasMedia, a media type or any media path)."""
+    item = record.raw if isinstance(record.raw, Mapping) else {}
+    normalized = item.get("normalized") if isinstance(item.get("normalized"), Mapping) else item
+    for source in (item, normalized):
+        if source.get("hasMedia") is True or str(source.get("mediaType") or "").strip():
+            return True
+        if any(source.get(key) for key in ("mediaUrls", "media", "mediaPaths")):
+            return True
+    return False
+
+
 def _same_session_steering_allowed(
     active: Sequence[InboxRecord], followups: Sequence[InboxRecord], config_path: Path,
 ) -> bool:
@@ -6848,6 +6860,14 @@ async def _process_claimed_chat_batch_unlocked(
                     # active turn; leave it pending for the scheduler to launch
                     # with its own persistent/fresh decision after this turn.
                     if not _same_session_steering_allowed(records, followups, config_path):
+                        continue
+                    # PA-611: steering injects only text, and a steered row is credited
+                    # skipped with no turn. A follow-up that carries media (a workbook, a
+                    # photo, a voice note) would lose the attachment, so it stays pending in
+                    # the durable inbox and runs as its own turn, with its own turn id and
+                    # its attachment, after the active turn. The runner's queue mode cannot
+                    # do this: a replay adapter's pending queue is local to that replay.
+                    if any(_record_carries_media(record) for record in followups):
                         continue
                     # The shared runner is still executing the addressed turn.
                     # With busy_input_mode=steer this second replay injects the
