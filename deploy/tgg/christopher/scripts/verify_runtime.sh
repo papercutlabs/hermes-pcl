@@ -477,6 +477,8 @@ if slot_effort is None:
     assert "reasoning_effort" not in config["agent"]
 else:
     assert config["agent"]["reasoning_effort"] == slot_effort
+management_engine = loader._select_management_engine(runtime / "management-engine", None)
+assert config["pa"].get("management_engine") == loader._management_engine_block(management_engine)
 assert constitution["runtime"] == {"provider": provider, "model": slot_model}
 for brief in constitution.get("job_briefs", {}).values():
     if isinstance(brief.get("runtime"), dict):
@@ -503,6 +505,7 @@ if capability:
     receipt = json.loads((runtime / "engine-slot-receipt.json").read_text())
     assert receipt["configuration_source"] == "external-capability"
     assert receipt["host_config_authoritative"] is True
+    assert receipt["management_engine"] == management_engine
     assert receipt["config_sha256"] == sha(home / "config.yaml")
     assert receipt["capability_release_id"] == capability["release_id"]
     assert receipt["capability_manifest_sha256"] == capability["manifest_sha256"]
@@ -706,6 +709,7 @@ print(json.dumps({
     "provider": provider,
     "model": slot_model,
     "reasoning_effort": slot_effort,
+    "management_engine": management_engine,
     "config_sha256": sha(home / "config.yaml"),
     "constitution_sha256": sha(home / "christopher_tgg_constitution.yaml"),
     "processing_enabled": config_enabled,

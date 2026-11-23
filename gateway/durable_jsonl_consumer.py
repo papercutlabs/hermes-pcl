@@ -40,6 +40,11 @@ from zoneinfo import ZoneInfo
 
 import yaml
 
+from gateway.management_engine import (
+    ManagementEngineConfigError,
+    parse_management_engine,
+)
+
 
 CURSOR_VERSION = 1
 INBOX_SCHEMA_VERSION = 5
@@ -3399,6 +3404,26 @@ def configured_engine(config_path: Path) -> tuple[str, str]:
     return provider, selected
 
 
+def configured_chat_engine(config_path: Path, chat_id: str) -> tuple[str, str]:
+    """The (provider, model) a turn in ``chat_id`` must have run on.
+
+    A chat bound to the ``tgg_management`` selector expects the engine in
+    ``pa.management_engine`` (same provider, that model) when the config has
+    the block.  Every other chat, and Management without the block, expects the
+    gateway engine from ``configured_engine``.
+    """
+    provider, model = configured_engine(config_path)
+    if chat_id in _management_selector_chats(config_path):
+        data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        try:
+            management = parse_management_engine(data)
+        except ManagementEngineConfigError as exc:
+            raise ConsumerError(str(exc)) from exc
+        if management is not None:
+            return provider, management.model
+    return provider, model
+
+
 def configured_fallback_engines(config_path: Path) -> frozenset[tuple[str, str]]:
     """(provider, model) pairs the config lists under fallback_providers.
 
@@ -3774,7 +3799,13 @@ async def process_live_records(
     from gateway.replay import ReplayPlan
     from gateway.run import GatewayRunner
 
-    provider, model = configured_engine(config_path)
+    batch_engines = {
+        configured_chat_engine(config_path, chat_id)
+        for chat_id in {record.chat_id for record in records}
+    } or {configured_engine(config_path)}
+    if len(batch_engines) != 1:
+        raise ConsumerError("a live batch must run on one engine")
+    provider, model = next(iter(batch_engines))
     fallback_engines = configured_fallback_engines(config_path)
     business_write_mode = "apply"
     if capture_business_writes_for_test_management:
@@ -5875,7 +5906,7 @@ def _pa75_capture_receipt(
     receipt_key = hashlib.sha256(
         (json.dumps(identity, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode()
     ).hexdigest()
-    provider, model = configured_engine(config_path)
+    provider, model = configured_chat_engine(config_path, records[0].chat_id)
     receipt = {
         "contract": "tgg-pa75-capture-mutation-receipt/v1",
         "receipt_key_sha256": receipt_key,

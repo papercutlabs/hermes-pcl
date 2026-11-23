@@ -731,6 +731,7 @@ from gateway.session import (
     is_shared_multi_user_session,
 )
 from gateway.delivery import DeliveryRouter
+from gateway.management_engine import is_management_job, parse_management_engine
 from gateway.platforms.base import (
     BasePlatformAdapter,
     EphemeralReply,
@@ -1487,10 +1488,17 @@ def _merge_pa_toolsets(
     return _dedupe(next_enabled), _dedupe(next_disabled)
 
 
+def _load_management_engine(config: Mapping[str, Any] | None = None):
+    """The Management chats' engine from config.yaml, or None when not set."""
+    cfg = config if config is not None else _load_gateway_config()
+    return parse_management_engine(cfg)
+
+
 def _apply_pa_job_runtime(
     model: str,
     runtime_kwargs: Mapping[str, Any] | None,
     pa_context: Any,
+    management_engine: Any = None,
 ) -> tuple[str, dict]:
     """Apply PA job-specific runtime defaults before session overrides.
 
@@ -1522,6 +1530,12 @@ def _apply_pa_job_runtime(
     if "args" in job_runtime:
         args = job_runtime.get("args") or []
         next_runtime["args"] = list(args) if isinstance(args, (list, tuple)) else [str(args)]
+
+    if management_engine is not None and is_management_job(pa_context):
+        # The Management chats' own engine (pa.management_engine); the provider
+        # stays the gateway's.  The fallback path above returned already, so a
+        # fallback engine is never replaced by this model.
+        next_model = management_engine.model
 
     return next_model, next_runtime
 
@@ -2958,7 +2972,12 @@ class GatewayRunner:
                 runtime_model,
             )
             model = runtime_model
-        model, runtime_kwargs = _apply_pa_job_runtime(model, runtime_kwargs, pa_context)
+        model, runtime_kwargs = _apply_pa_job_runtime(
+            model,
+            runtime_kwargs,
+            pa_context,
+            management_engine=_load_management_engine(user_config),
+        )
         # The marker has done its work; no caller builds an agent from it.
         runtime_kwargs.pop("fallback_entry", None)
         if override and resolved_session_key:
@@ -3450,8 +3469,14 @@ class GatewayRunner:
         *,
         source: Optional[SessionSource] = None,
         session_key: Optional[str] = None,
+        pa_context: Any = None,
     ) -> dict | None:
-        """Resolve reasoning effort for a session, honoring session overrides."""
+        """Resolve reasoning effort for a session, honoring session overrides.
+
+        A Management turn (PA job ``tgg_management``) uses the effort of
+        ``pa.management_engine`` when that block is set; every other turn uses
+        ``agent.reasoning_effort``.
+        """
         resolved_session_key = session_key
         if not resolved_session_key and source is not None:
             try:
@@ -3462,6 +3487,12 @@ class GatewayRunner:
         overrides = getattr(self, "_session_reasoning_overrides", {}) or {}
         if resolved_session_key and resolved_session_key in overrides:
             return overrides[resolved_session_key]
+        if is_management_job(pa_context):
+            management_engine = _load_management_engine()
+            if management_engine is not None:
+                from hermes_constants import parse_reasoning_effort
+
+                return parse_reasoning_effort(management_engine.reasoning_effort)
         return self._load_reasoning_config()
 
     def _set_session_reasoning_override(
@@ -18202,6 +18233,7 @@ class GatewayRunner:
             reasoning_config = self._resolve_session_reasoning_config(
                 source=source,
                 session_key=session_key,
+                pa_context=pa_resolved_context,
             )
             self._reasoning_config = reasoning_config
             self._service_tier = self._load_service_tier()

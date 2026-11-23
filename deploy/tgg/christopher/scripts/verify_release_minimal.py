@@ -75,6 +75,16 @@ def main() -> int:
     assert engine["provider"] == provider == config["model"]["provider"]
     assert engine["model"] == config["model"]["default"]
     assert engine.get("reasoning_effort") == config.get("agent", {}).get("reasoning_effort")
+    # The Management chats' engine: the receipt, the state file and the config
+    # block must agree, and the block must be one the runtime knows.
+    management_state = runtime / "management-engine"
+    management_name = management_state.read_text().strip() if management_state.exists() else "none"
+    management_blocks = {
+        "none": None,
+        "gpt-6.2-sol-medium": {"model": "gpt-6.2-sol", "reasoning_effort": "medium"},
+    }
+    assert engine.get("management_engine", "none") == management_name
+    assert config["pa"].get("management_engine") == management_blocks[management_name]
     if provider == "openai-codex":
         assert credential_label and config["model"]["credential_label"] == credential_label
         run(
