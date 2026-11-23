@@ -224,6 +224,12 @@ TOOLSETS = {
         "includes": [],
     },
 
+    "pa-message-recall": {
+        "description": "PA read-only recall of a stored conversation message by id: read_full_message returns the full text of a message cut when it was carried through compaction",
+        "tools": ["read_full_message"],
+        "includes": [],
+    },
+
     "pa-observability": {
         "description": "PA universal observability: record_event lets the agent emit semantic events for the PA portal (observability only, no client mutation)",
         "tools": ["record_event"],

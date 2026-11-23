@@ -31,6 +31,7 @@ from agent.model_metadata import (
     estimate_messages_tokens_rough,
 )
 from agent.redact import redact_sensitive_text
+from agent import pa_carried_conversation
 
 logger = logging.getLogger(__name__)
 
@@ -511,6 +512,11 @@ class ContextCompressor(ContextEngine):
         # filter), the guidance keeps the native pipeline and threads a
         # retention brief into the summarizer prompt on every compaction.
         self.pa_compaction_guidance: Optional[str] = None
+        # Where carried messages are stored (send time and state.db row), for
+        # the preserve-recent-and-conversation policy (PA-648).  Set by the
+        # gateway; without it every carried message counts as sent now.
+        self._pa_message_locator = None
+        self._last_carried_conversation: Optional[Dict[str, Any]] = None
 
     def update_from_response(self, usage: Dict[str, Any]):
         """Update tracked token usage from API response."""
@@ -535,6 +541,127 @@ class ContextCompressor(ContextEngine):
         """
         text = str(guidance).strip() if isinstance(guidance, str) else ""
         self.pa_compaction_guidance = text or None
+
+    def set_pa_message_locator(self, locator) -> None:
+        """Attach the lookup the conversation-carrying policy uses to time and cite messages.
+
+        ``locator`` is a no-argument callable returning a mapping from
+        ``(role, content)`` to ``pa_carried_conversation.StoredMessage`` (send
+        time and state.db row); it is called once per compaction that runs
+        the ``preserve-recent-and-conversation`` policy.  ``None`` detaches it.
+        """
+        self._pa_message_locator = locator if callable(locator) else None
+
+    def _pa_message_index(self) -> Mapping[Any, Any]:
+        locator = getattr(self, "_pa_message_locator", None)
+        if locator is None:
+            return {}
+        try:
+            index = locator()
+        except Exception as exc:  # best-effort: words are still carried, timed as now
+            logger.warning("Carried-conversation locator failed: %s", exc)
+            return {}
+        return index if isinstance(index, Mapping) else {}
+
+    def _pa_preserve_conversation(
+        self,
+        messages: List[Dict[str, Any]],
+        policy: Mapping[str, Any],
+        head_end: int,
+    ) -> List[Dict[str, Any]]:
+        """preserve-recent, plus the recent conversation carried word for word.
+
+        Keeps the head and the latest ``window_size`` messages exactly as
+        ``preserve-recent`` does.  From the messages older than the window it
+        carries, in one user-role block between the marker and the window,
+        every message a person wrote and every text reply the agent sent in
+        the last ``conversation_days`` (oldest dropped first above
+        ``conversation_max_tokens``; a message over
+        ``conversation_message_max_chars`` keeps its first and last halves and
+        a note naming its stored row; an identical repeat once).  Tool calls,
+        tool output and synthetic injections older than the window are
+        dropped, as today.  No summarizer call.
+        """
+        strategy = pa_carried_conversation.STRATEGY
+        window = self._pa_compression_window(policy, self.protect_last_n)
+        if len(messages) <= head_end + window:
+            return [m.copy() for m in messages]
+        settings = pa_carried_conversation.CarrySettings.from_policy(policy)
+        head = [m.copy() for m in messages[:head_end]]
+        tail = [m.copy() for m in messages[-window:]]
+        dropped = messages[head_end:len(messages) - window]
+
+        index = self._pa_message_index()
+        try:
+            from hermes_time import get_timezone
+            tz = get_timezone()
+        except Exception:
+            tz = None
+        selection = pa_carried_conversation.select(
+            dropped,
+            settings,
+            now=time.time(),
+            locate=index.get,
+            estimate=lambda text: estimate_messages_tokens_rough([{"role": "user", "content": text}]),
+            window=tail,
+            tz=tz,
+        )
+        earlier_blocks = sum(
+            1 for m in dropped
+            if m.get("role") == "user" and pa_carried_conversation.is_block(m.get("content"))
+        )
+        omitted = len(dropped) - earlier_blocks - selection.carried_messages
+        self._last_carried_conversation = {
+            "carried": len(selection.carried),
+            "person_messages": selection.person_messages,
+            "agent_replies": selection.agent_replies,
+            "carried_tokens": selection.carried_tokens,
+            "shortened": selection.shortened,
+            "excluded_synthetic": selection.excluded_synthetic,
+            "aged_out": selection.aged_out,
+            "capped_out": selection.capped_out,
+            "duplicates": selection.duplicates,
+            "omitted": omitted,
+        }
+
+        days = f"{settings.max_age_days:g}"
+        detail = f"kept the latest {len(tail)} messages intact"
+        if selection.carried:
+            detail += (
+                f" and, in the block that follows, the earlier conversation from the "
+                f"last {days} days word for word: {selection.person_messages} messages "
+                f"people wrote and {selection.agent_replies} replies you sent "
+                f"(~{selection.carried_tokens:,} tokens"
+            )
+            if selection.shortened:
+                noun = "message" if selection.shortened == 1 else "messages"
+                detail += f"; {selection.shortened} long {noun} cut to start and end"
+            detail += ")"
+        else:
+            detail += f"; no earlier conversation from the last {days} days to carry"
+        detail += f"; omitted the other {omitted} older messages (tool calls and results"
+        if selection.excluded_synthetic:
+            detail += ", system-generated messages"
+        left_out = []
+        if selection.aged_out:
+            left_out.append(f"messages older than {days} days")
+        if selection.capped_out:
+            left_out.append(
+                f"the {selection.capped_out} oldest messages over the "
+                f"{settings.max_tokens:,}-token limit"
+            )
+        if left_out:
+            detail += ", " + " and ".join(left_out)
+        detail += ")."
+
+        result = [*head, self._pa_policy_summary_message(strategy, detail)]
+        if selection.carried:
+            result.append({
+                "role": "user",
+                "content": pa_carried_conversation.render_block(selection.carried, tz=tz),
+            })
+        result.extend(tail)
+        return result
 
     def _pa_compression_window(self, policy: Mapping[str, Any], default: int) -> int:
         raw = policy.get("window_size", default)
@@ -593,6 +720,9 @@ class ContextCompressor(ContextEngine):
                 ),
                 *tail,
             ]
+
+        if strategy == pa_carried_conversation.STRATEGY:
+            return self._pa_preserve_conversation(messages, policy, head_end)
 
         if strategy == "preserve-case-state":
             window = self._pa_compression_window(policy, self.protect_last_n)

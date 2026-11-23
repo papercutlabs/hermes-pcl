@@ -1540,6 +1540,21 @@ def _apply_pa_job_runtime(
     return next_model, next_runtime
 
 
+def _add_message_recall_toolset(enabled_toolsets: Any, pa_context: Any):
+    """Give a conversation-carrying chat read_full_message, so cut notes can be followed.
+
+    PA-648: the ``preserve-recent-and-conversation`` compression policy cuts a
+    long carried message to its start and end and names the stored row; the
+    ``pa-message-recall`` toolset holds the read-only tool that returns it.
+    ``None`` already means every toolset and is returned unchanged.
+    """
+    from agent.pa_carried_conversation import RECALL_TOOLSET, STRATEGY
+
+    if enabled_toolsets is None or _pa_compression_strategy(pa_context) != STRATEGY:
+        return enabled_toolsets
+    return sorted({*enabled_toolsets, RECALL_TOOLSET})
+
+
 def _render_pa_ephemeral_prompt(pa_context: Any) -> str:
     """Render PA identity + job brief for API-call-time prompt injection.
 
@@ -1571,7 +1586,26 @@ def _render_pa_ephemeral_prompt(pa_context: Any) -> str:
     return "\n\n".join(parts).strip()
 
 
-def _apply_pa_compression_policy(agent: Any, pa_context: Any) -> None:
+def _pa_compression_strategy(pa_context: Any) -> str:
+    raw = _pa_response_policy(pa_context).get("compression")
+    return str(raw.get("strategy") or "").strip().lower() if isinstance(raw, Mapping) else ""
+
+
+def _conversation_message_locator(agent: Any, session_db: Any):
+    """Callable for the compressor: (role, content) -> where the message is stored."""
+    if session_db is None or not hasattr(session_db, "conversation_message_index"):
+        return None
+
+    def _locate():
+        from agent.pa_carried_conversation import StoredMessage
+
+        index = session_db.conversation_message_index(getattr(agent, "session_id", None) or "")
+        return {key: StoredMessage(**row) for key, row in index.items()}
+
+    return _locate
+
+
+def _apply_pa_compression_policy(agent: Any, pa_context: Any, session_db: Any = None) -> None:
     """Attach job-brief compression behavior to an agent compressor when supported.
 
     Two distinct knobs live under ``response_policy.compression``:
@@ -1583,6 +1617,11 @@ def _apply_pa_compression_policy(agent: Any, pa_context: Any) -> None:
     * ``compaction_guidance`` — standing guidance string threaded into the
       NATIVE summarizer prompt (auto-trigger compactions; composes with any
       per-call /compress focus). Keeps the native pipeline running.
+
+    For the ``preserve-recent-and-conversation`` strategy (PA-648) the
+    compressor also gets a locator over ``session_db`` (default: the agent's
+    own session store) that gives each carried message its send time and
+    stored row; any other chat has it detached.
     """
     compressor = getattr(agent, "context_compressor", None)
     setter = getattr(compressor, "set_pa_compression_policy", None)
@@ -1604,6 +1643,17 @@ def _apply_pa_compression_policy(agent: Any, pa_context: Any) -> None:
             if isinstance(raw_guidance, str) and raw_guidance.strip():
                 guidance = raw_guidance
     setter(policy)
+    locator_setter = getattr(compressor, "set_pa_message_locator", None)
+    if callable(locator_setter):
+        from agent.pa_carried_conversation import STRATEGY as _CARRY_STRATEGY
+
+        carries = (
+            policy is not None
+            and str(policy.get("strategy") or "").strip().lower() == _CARRY_STRATEGY
+        )
+        if session_db is None:
+            session_db = getattr(agent, "_session_db", None)
+        locator_setter(_conversation_message_locator(agent, session_db) if carries else None)
     guidance_setter = getattr(compressor, "set_pa_compaction_guidance", None)
     if callable(guidance_setter):
         guidance_setter(guidance)
@@ -17576,6 +17626,7 @@ class GatewayRunner:
             disabled_toolsets,
             pa_resolved_context,
         )
+        enabled_toolsets = _add_message_recall_toolset(enabled_toolsets, pa_resolved_context)
         pa_tenant_slug = _pa_tenant_slug(pa_resolved_context)
         pa_max_output_tokens = _pa_max_output_tokens(pa_resolved_context)
         management_attachment_validation_enabled = (
