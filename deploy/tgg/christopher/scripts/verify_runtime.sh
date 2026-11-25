@@ -287,8 +287,8 @@ if systemctl is-enabled --quiet christopher-tgg-report-weekly.timer; then
   echo "weekly report timer must ship disabled" >&2
   exit 35
 fi
-if systemctl is-enabled --quiet christopher-tgg-report-monthly.timer; then
-  echo "monthly report timer must ship disabled" >&2
+if ! systemctl is-enabled --quiet christopher-tgg-report-monthly.timer; then
+  echo "monthly report timer must be enabled" >&2
   exit 35
 fi
 "$APP_ROOT/.venv/bin/python" \
