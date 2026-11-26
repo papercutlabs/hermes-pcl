@@ -182,3 +182,28 @@ def test_script_source_never_selects_or_loads_pool():
     source = CODEX_AUTH.read_text()
     assert "select_label(" not in source.replace("Never call pool.select_label()", "")
     assert "load_pool(" not in source.replace("load_pool() is not read-only", "")
+
+
+def test_quick_mode_sends_no_operator_query():
+    # PA-675: Systems audits every /api/operator/query as a write to the live tenant
+    # database, which refuses the daily Master reconciliation's apply. The 15-minute
+    # --quick run must not send it; only --full may.
+    import ast
+
+    source = VERIFY.read_text()
+    head = '"$APP_ROOT/.venv/bin/python" - "$APP_ROOT" "$HERMES_HOME" "$DEPLOY_ROOT" "$MODE" <<\'PY\'\n'
+    assert source.count(head) == 1, "the main python block must receive $MODE"
+    block = source.split(head, 1)[1].split("\nPY\n", 1)[0]
+    tree = ast.parse(block)
+    parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+
+    def full_only(node) -> bool:
+        while node in parents:
+            node = parents[node]
+            if isinstance(node, ast.If) and ast.unparse(node.test) == "mode == '--full'":
+                return True
+        return False
+
+    queries = [n for n in ast.walk(tree) if isinstance(n, ast.Constant) and n.value == "/api/operator/query?tenant=tgg"]
+    assert queries, "operator query not found in the main python block"
+    assert all(full_only(n) for n in queries)
