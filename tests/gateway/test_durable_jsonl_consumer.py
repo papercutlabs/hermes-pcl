@@ -2650,6 +2650,36 @@ def test_internal_nightly_prose_without_structured_identity_is_rejected(tmp_path
     assert not consumer._priority_direct_trigger(consumer.InboxRecord(3, "wrong-sender", wrong_sender["chatId"], 3, 3, wrong_sender), config)
 
 
+def test_recheck_record_admitted_only_on_its_chat_with_its_job_type(tmp_path):
+    """PA-689: the gate admits a recheck record only on 900000000000000010 with job_type tgg_resolution_recheck."""
+    recheck_chat, nightly_chat = "900000000000000010@g.us", "900000000000000001@g.us"
+    constitution = tmp_path / "constitution.yaml"
+    constitution.write_text(yaml.safe_dump({
+        "job_briefs": {"tgg_resolution_recheck": {"max_documents_per_run": 2}},
+        "selectors": [
+            {"job_type": "tgg_resolution_recheck", "match": {"source.platform": "whatsapp", "source.chat_id": recheck_chat}},
+            {"job_type": "tgg_nightly_whatsapp", "match": {"source.platform": "whatsapp", "source.chat_id": nightly_chat}},
+        ],
+    }), encoding="utf-8")
+    config = tmp_path / "config.yaml"
+    config.write_text(yaml.safe_dump({"pa": {"constitution_path": str(constitution)}}), encoding="utf-8")
+    exact = _message("recheck", recheck_chat)
+    exact.update({"senderId": "system@internal", "metadata": {
+        "job_type": "tgg_resolution_recheck", "recheck_run_id": "reconcile-1795733274011-5518eb50",
+        "master_content_hash": "0" * 64, "document_ids": ["3cc12710-4bf5-416b-b6a9-46b710de78f8"],
+    }})
+
+    def admitted(item: dict) -> bool:
+        return consumer._priority_direct_trigger(consumer.InboxRecord(1, "r", item["chatId"], 1, 1, item), config)
+
+    assert admitted(exact)
+    other_chat = dict(exact, chatId=nightly_chat)
+    other_job = json.loads(json.dumps(exact))
+    other_job["metadata"]["job_type"] = "tgg_nightly_whatsapp"
+    assert not admitted(other_chat)
+    assert not admitted(other_job)
+
+
 def test_seven_session_nightly_trigger_validates_structured_role_assignment_not_body(tmp_path):
     constitution = tmp_path / "constitution.yaml"
     nightly_ids = [f"90000000000000000{index}@g.us" for index in range(1, 8)]

@@ -3701,6 +3701,24 @@ def _replay_messages_with_retained_documents(
                 context["continuous_interval"] = True
                 context["continuous_contract"] = metadata.get("continuous_contract")
             item["_hermes_pa_context"] = context
+        # PA-689: an admitted recheck record carries its correlation to the
+        # turn.  The append tool's recheck mode reads it from here and accepts
+        # an entry only for a document this correlation lists.
+        if (
+            isinstance(metadata, Mapping)
+            and metadata.get("job_type") == RECHECK_JOB_TYPE
+            and _priority_direct_trigger(record, config_path)
+        ):
+            item["_hermes_pa_job_type"] = RECHECK_JOB_TYPE
+            item["_hermes_pa_context"] = {
+                "job_type": RECHECK_JOB_TYPE,
+                "evidence_recheck_correlation": {
+                    "kind": "evidence_recheck",
+                    "recheck_run_id": metadata.get("recheck_run_id"),
+                    "master_content_hash": metadata.get("master_content_hash"),
+                    "document_ids": list(metadata.get("document_ids") or []),
+                },
+            }
         if record.retention_quarantined:
             warning = (
                 "[Attachment unavailable: retention quarantine for message "
@@ -4065,12 +4083,43 @@ def _priority_selector_chats(config_path: Path) -> frozenset[str]:
             continue
         match = selector.get("match") or {}
         if (
-            selector.get("job_type") in {"tgg_management", "tgg_nightly_whatsapp"}
+            selector.get("job_type") in {"tgg_management", "tgg_nightly_whatsapp", RECHECK_JOB_TYPE}
             and match.get("source.platform") == "whatsapp"
             and match.get("source.chat_id")
         ):
             chats.add(str(match.get("source.chat_id")))
     return frozenset(chats)
+
+
+# PA-689: Christopher's recheck of his open human-resolution documents after
+# an applied Master reconcile.  One internal record per run, on one reserved
+# pseudo chat that continuous processing never reads.
+RECHECK_JOB_TYPE = "tgg_resolution_recheck"
+RECHECK_CHAT = "900000000000000010@g.us"
+_RECHECK_RUN_ID = re.compile(r"reconcile-\d{13}-[0-9a-f]{8}")
+_RECHECK_CONTENT_HASH = re.compile(r"[0-9a-f]{64}")
+_RECHECK_DOCUMENT_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+
+
+def _recheck_brief(config_path: Path) -> tuple[frozenset[str], int]:
+    """The recheck selector chats and the brief's per-run document limit."""
+    data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    pa = data.get("pa") if isinstance(data, dict) else None
+    constitution_raw = str((pa or {}).get("constitution_path") or "")
+    if not constitution_raw or not Path(constitution_raw).is_file():
+        return frozenset(), 0
+    constitution = yaml.safe_load(Path(constitution_raw).read_text(encoding="utf-8")) or {}
+    chats = {
+        str((selector.get("match") or {}).get("source.chat_id"))
+        for selector in constitution.get("selectors") or []
+        if isinstance(selector, Mapping)
+        and selector.get("job_type") == RECHECK_JOB_TYPE
+        and (selector.get("match") or {}).get("source.platform") == "whatsapp"
+        and (selector.get("match") or {}).get("source.chat_id")
+    }
+    brief = (constitution.get("job_briefs") or {}).get(RECHECK_JOB_TYPE)
+    limit = brief.get("max_documents_per_run") if isinstance(brief, Mapping) else None
+    return frozenset(chats), limit if type(limit) is int and limit > 0 else 0
 
 
 def _nightly_selector_chats(config_path: Path) -> frozenset[str]:
@@ -4197,6 +4246,21 @@ def _priority_direct_trigger(record: InboxRecord, config_path: Path) -> bool:
     if record.chat_id not in nightly_chats:
         return False
     metadata = item.get("metadata")
+    if isinstance(metadata, Mapping) and metadata.get("job_type") == RECHECK_JOB_TYPE:
+        # PA-689: only on the reserved recheck chat, with a manifest run id,
+        # a Master content hash and 1..N record UUIDs (N from the brief).
+        recheck_chats, limit = _recheck_brief(config_path)
+        document_ids = metadata.get("document_ids")
+        return bool(
+            record.chat_id == RECHECK_CHAT
+            and record.chat_id in recheck_chats
+            and _RECHECK_RUN_ID.fullmatch(str(metadata.get("recheck_run_id") or ""))
+            and _RECHECK_CONTENT_HASH.fullmatch(str(metadata.get("master_content_hash") or ""))
+            and isinstance(document_ids, list)
+            and 0 < len(document_ids) <= limit
+            and len(set(document_ids)) == len(document_ids)
+            and all(isinstance(value, str) and _RECHECK_DOCUMENT_ID.fullmatch(value) for value in document_ids)
+        )
     if not isinstance(metadata, Mapping) or metadata.get("job_type") != "tgg_nightly_whatsapp":
         return False
     batch_id = str(metadata.get("nightly_batch_id") or "")
@@ -7497,7 +7561,8 @@ async def run_consumer(args: argparse.Namespace) -> int:
 
                 try:
                     priority_chats = _priority_selector_chats(config_path)
-                    nightly_chats = _nightly_selector_chats(config_path)
+                    # PA-689: each recheck run is its own session, like a nightly turn.
+                    nightly_chats = _nightly_selector_chats(config_path) | _recheck_brief(config_path)[0]
                 except Exception:
                     priority_chats = frozenset()
                     nightly_chats = frozenset()
