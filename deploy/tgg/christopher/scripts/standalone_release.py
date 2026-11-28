@@ -57,8 +57,10 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def verify_prepare_repository(runtime: Path) -> dict[str, str]:
-    """Require a clean checkout at the freshly fetched protected-main head."""
+def verify_prepare_repository(
+    runtime: Path, *, break_glass: bool = False, reason: str | None = None,
+) -> dict[str, Any]:
+    """Require a clean pinned checkout, with an explicit audited main bypass."""
     inside = _checked_output(["git", "rev-parse", "--is-inside-work-tree"], cwd=runtime)
     if inside != "true":
         raise ReleaseError("runtime is not a Git worktree")
@@ -79,6 +81,23 @@ def verify_prepare_repository(runtime: Path) -> dict[str, str]:
         cwd=runtime,
     )
     verified_main_head = _checked_output(["git", "rev-parse", "FETCH_HEAD"], cwd=runtime)
+    if break_glass:
+        clean_reason = str(reason or "").strip()
+        if not clean_reason:
+            raise ReleaseError("--break-glass requires a non-empty --reason")
+        return {
+            "break_glass": True,
+            "reason": clean_reason,
+            "actor": os.environ.get("SUDO_USER") or getpass.getuser(),
+            "canonical_repository_url": CANONICAL_REPOSITORY_URL,
+            "protected_ref": PROTECTED_MAIN_REF,
+            "runtime_commit": runtime_commit,
+            "observed_protected_main_head": verified_main_head,
+            "observed_at": _utc_now(),
+            "repository_reconciliation_required": True,
+        }
+    if reason:
+        raise ReleaseError("--reason is valid only with --break-glass")
     if runtime_commit != verified_main_head:
         raise ReleaseError(
             "runtime commit is not the freshly verified protected main head: "
@@ -595,6 +614,8 @@ def prepare(args: argparse.Namespace) -> int:
     required_capability_files(capability, manifest)
     preserve_installed = bool(getattr(args, "preserve_installed_runtime", False))
     if preserve_installed:
+        if getattr(args, "break_glass", False) or getattr(args, "reason", None):
+            raise ReleaseError("preserve-installed runtime mode does not permit repository bypass")
         declared = str((manifest.get("runtime") or {}).get("hermes_commit") or "").strip()
         if len(declared) != 40 or any(char not in "0123456789abcdef" for char in declared.lower()):
             raise ReleaseError("preserve-installed runtime mode requires an exact manifest runtime.hermes_commit")
@@ -607,7 +628,11 @@ def prepare(args: argparse.Namespace) -> int:
         if not args.runtime or not args.runtime_manifest:
             raise ReleaseError("runtime and runtime-manifest are required unless preserving installed runtime")
         runtime = Path(args.runtime).resolve()
-        repository_guard = verify_prepare_repository(runtime)
+        repository_guard = verify_prepare_repository(
+            runtime,
+            break_glass=bool(getattr(args, "break_glass", False)),
+            reason=getattr(args, "reason", None),
+        )
         commit = runtime_identity(runtime)
         declared_compatibility = declared_runtime_compatibility(manifest, commit)
         staged_runtime = out / ".runtime-payload"
@@ -847,6 +872,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
     make = sub.add_parser("prepare"); make.add_argument("--runtime"); make.add_argument("--runtime-manifest"); make.add_argument("--preserve-installed-runtime", action="store_true"); make.add_argument("--capability", required=True); make.add_argument("--out", required=True)
+    make.add_argument("--break-glass", action="store_true"); make.add_argument("--reason")
     make.add_argument("--provider", required=True); make.add_argument("--model", required=True); make.add_argument("--reasoning-effort", required=True)
     for name in ("apply", "rollback"):
         item = sub.add_parser(name); item.add_argument("--root", default=str(DEFAULT_ROOT)); item.add_argument("--hermes-home", default=str(DEFAULT_HOME))

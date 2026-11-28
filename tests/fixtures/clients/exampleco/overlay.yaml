@@ -1,0 +1,16 @@
+identity:
+  display_name: ExampleCo Assistant
+  voice_register: bilingual inquiry coordinator
+  greeting_style: concise, warm, and qualification-led
+  signature: ExampleCo Assistant
+  refer_to_self: your ExampleCo assistant
+client:
+  id: exampleco
+  name: ExampleCo
+  tenant: exampleco
+  business_bridge:
+    tenant: exampleco
+    auth:
+      type: header
+      header: X-ExampleCo-Token
+      token_env: EXAMPLECO_BUSINESS_TOKEN

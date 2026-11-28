@@ -159,13 +159,62 @@ def rollback_security_fixture(tmp_path: Path) -> tuple[dict, object, dict[str, s
 def test_prepare_builds_separately_hashed_payloads(tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch) -> None:
     rt, cap, bundle = tmp_path / "runtime", tmp_path / "capability", tmp_path / "bundle"
     runtime(rt); capability(cap)
-    monkeypatch.setattr(release, "verify_prepare_repository", lambda _runtime: repository_guard("abc1234"))
+    monkeypatch.setattr(release, "verify_prepare_repository", lambda _runtime, **_kwargs: repository_guard("abc1234"))
     assert release.main(["prepare", "--runtime", str(rt), "--runtime-manifest", str(runtime_manifest(rt)), "--capability", str(cap), "--out", str(bundle), "--provider", "openai-codex", "--model", "x", "--reasoning-effort", "medium"]) == 0
     emitted = json.loads(capsys.readouterr().out)
     assert emitted["runtime_commit"] == "abc1234"
     assert emitted["capability_release_id"] == "r1"
     assert release.sha256(bundle / "runtime.tgz") == emitted["runtime_sha256"]
     assert release.sha256(bundle / "capability.tgz") == emitted["capability_sha256"]
+
+
+def test_prepare_break_glass_builds_audited_payload_but_does_not_authorize_apply(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate, main = "b" * 40, "a" * 40
+    rt, cap, bundle = tmp_path / "runtime", tmp_path / "capability", tmp_path / "bundle"
+    runtime(rt, candidate)
+    capability(cap)
+    manifest = json.loads((cap / "manifest.json").read_text())
+    manifest["runtime"]["hermes_commit"] = candidate
+    (cap / "manifest.json").write_text(json.dumps(manifest))
+    audit = {
+        "break_glass": True,
+        "reason": "scoped TGG continuation repair",
+        "actor": "release-owner",
+        "canonical_repository_url": release.CANONICAL_REPOSITORY_URL,
+        "protected_ref": release.PROTECTED_MAIN_REF,
+        "runtime_commit": candidate,
+        "observed_protected_main_head": main,
+        "observed_at": "2026-09-15T05:00:00+00:00",
+        "repository_reconciliation_required": True,
+    }
+    observed: dict[str, object] = {}
+
+    def verify(_runtime, **kwargs):
+        observed.update(kwargs)
+        return audit
+
+    monkeypatch.setattr(release, "verify_prepare_repository", verify)
+    assert release.main([
+        "prepare", "--runtime", str(rt), "--runtime-manifest", str(runtime_manifest(rt)),
+        "--capability", str(cap), "--out", str(bundle), "--provider", "openai-codex",
+        "--model", "gpt-5.6-terra", "--reasoning-effort", "medium",
+        "--break-glass", "--reason", "scoped TGG continuation repair",
+    ]) == 0
+    emitted = json.loads(capsys.readouterr().out)
+    assert observed == {
+        "break_glass": True,
+        "reason": "scoped TGG continuation repair",
+    }
+    assert emitted["runtime_commit"] == candidate
+    assert emitted["repository_guard"] == audit
+    assert (bundle / "runtime.tgz").is_file()
+    monkeypatch.setattr(release, "resolve_protected_main_head", lambda: main)
+    with pytest.raises(release.ReleaseError, match="protected main changed"):
+        release.verify_apply_repository(
+            emitted, break_glass=False, reason=None,
+        )
 
 
 def test_prepare_preserve_installed_runtime_skips_runtime_payload_and_pins_manifest(
@@ -268,6 +317,68 @@ def test_prepare_repository_refuses_dirty_checkout(tmp_path: Path, monkeypatch: 
     monkeypatch.setattr(release, "_checked_output", checked)
     with pytest.raises(release.ReleaseError, match="not clean"):
         release.verify_prepare_repository(tmp_path)
+
+
+def test_prepare_repository_break_glass_records_candidate_main_and_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate, main = "b" * 40, "a" * 40
+
+    def checked(argv, *, cwd=None):
+        if argv[:3] == ["git", "rev-parse", "--is-inside-work-tree"]: return "true"
+        if argv[:2] == ["git", "status"]: return ""
+        if argv[-1] == "HEAD": return candidate
+        if argv[1] == "fetch": return ""
+        if argv[-1] == "FETCH_HEAD": return main
+        raise AssertionError(argv)
+
+    monkeypatch.setattr(release, "_checked_output", checked)
+    monkeypatch.setenv("SUDO_USER", "release-owner")
+    result = release.verify_prepare_repository(
+        tmp_path, break_glass=True, reason="scoped TGG continuation repair",
+    )
+    assert result == {
+        "break_glass": True,
+        "reason": "scoped TGG continuation repair",
+        "actor": "release-owner",
+        "canonical_repository_url": release.CANONICAL_REPOSITORY_URL,
+        "protected_ref": release.PROTECTED_MAIN_REF,
+        "runtime_commit": candidate,
+        "observed_protected_main_head": main,
+        "observed_at": result["observed_at"],
+        "repository_reconciliation_required": True,
+    }
+
+
+def test_prepare_repository_break_glass_still_refuses_dirty_checkout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def checked(argv, *, cwd=None):
+        if argv[:3] == ["git", "rev-parse", "--is-inside-work-tree"]: return "true"
+        if argv[:2] == ["git", "status"]: return " M gateway/run.py"
+        raise AssertionError(argv)
+
+    monkeypatch.setattr(release, "_checked_output", checked)
+    with pytest.raises(release.ReleaseError, match="not clean"):
+        release.verify_prepare_repository(
+            tmp_path, break_glass=True, reason="scoped TGG continuation repair",
+        )
+
+
+def test_prepare_repository_break_glass_requires_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def checked(argv, *, cwd=None):
+        if argv[:3] == ["git", "rev-parse", "--is-inside-work-tree"]: return "true"
+        if argv[:2] == ["git", "status"]: return ""
+        if argv[-1] == "HEAD": return "b" * 40
+        if argv[1] == "fetch": return ""
+        if argv[-1] == "FETCH_HEAD": return "a" * 40
+        raise AssertionError(argv)
+
+    monkeypatch.setattr(release, "_checked_output", checked)
+    with pytest.raises(release.ReleaseError, match="non-empty"):
+        release.verify_prepare_repository(tmp_path, break_glass=True, reason="  ")
 
 
 def test_prepare_repository_remote_failure_refuses(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -686,7 +797,7 @@ def test_apply_flips_all_pointers_and_rolls_back_on_verify_failure(tmp_path: Pat
     (cap / "plugins/tgg/plugin.py").write_text("x=2\n")
     (cap / "plugins/new-plugin/plugin.py").write_text("x=3\n")
     manifest = json.loads((cap / "manifest.json").read_text()); manifest["runtime"]["hermes_commit"] = "abcdef0"; manifest["files"]["plugins/tgg/plugin.py"] = release.sha256(cap / "plugins/tgg/plugin.py"); manifest["files"]["plugins/new-plugin/plugin.py"] = release.sha256(cap / "plugins/new-plugin/plugin.py"); (cap / "manifest.json").write_text(json.dumps(manifest))
-    monkeypatch.setattr(release, "verify_prepare_repository", lambda _runtime: repository_guard("abcdef0"))
+    monkeypatch.setattr(release, "verify_prepare_repository", lambda _runtime, **_kwargs: repository_guard("abcdef0"))
     assert release.main(["prepare", "--runtime", str(rt), "--runtime-manifest", str(runtime_manifest(rt)), "--capability", str(cap), "--out", str(bundle), "--provider", "p", "--model", "m", "--reasoning-effort", "r"]) == 0
     monkeypatch.setattr(release, "verify_apply_repository", lambda *_args, **_kwargs: {"break_glass": False})
     monkeypatch.setattr(release, "command", lambda argv: "inactive" if "is-active" in argv else "disabled")

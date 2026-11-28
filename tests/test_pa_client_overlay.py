@@ -5,7 +5,7 @@ from agent.pa_constitution import load_constitution, render_identity_prompt, res
 
 PA_FIXTURE = Path(__file__).parent / "fixtures" / "pa" / "bobby_tgg_constitution.yaml"
 TGG_OVERLAY = Path(__file__).parent / "fixtures" / "clients" / "tgg" / "overlay.yaml"
-MOFEX_OVERLAY = Path(__file__).parent / "fixtures" / "clients" / "mofex" / "overlay.yaml"
+EXAMPLECO_OVERLAY = Path(__file__).parent / "fixtures" / "clients" / "exampleco" / "overlay.yaml"
 
 
 def test_client_overlay_changes_display_identity_without_changing_job_briefs():
@@ -13,18 +13,18 @@ def test_client_overlay_changes_display_identity_without_changing_job_briefs():
         {"constitution_path": str(PA_FIXTURE), "client_overlay_path": str(TGG_OVERLAY)},
         {"source": {"platform": "whatsapp", "chat_id": "tgg-ops"}},
     )
-    mofex = resolve_context(
-        {"constitution_path": str(PA_FIXTURE), "client_overlay_path": str(MOFEX_OVERLAY)},
+    exampleco = resolve_context(
+        {"constitution_path": str(PA_FIXTURE), "client_overlay_path": str(EXAMPLECO_OVERLAY)},
         {"source": {"platform": "whatsapp", "chat_id": "tgg-ops"}},
     )
 
     assert tgg is not None
-    assert mofex is not None
+    assert exampleco is not None
     assert tgg.constitution.identity["display_name"] == "TGG Assistant"
-    assert mofex.constitution.identity["display_name"] == "Mofex Assistant"
-    assert tgg.identity_hash != mofex.identity_hash
-    assert tgg.job_hash == mofex.job_hash
-    assert tgg.behavior_hash != mofex.behavior_hash
+    assert exampleco.constitution.identity["display_name"] == "ExampleCo Assistant"
+    assert tgg.identity_hash != exampleco.identity_hash
+    assert tgg.job_hash == exampleco.job_hash
+    assert tgg.behavior_hash != exampleco.behavior_hash
 
 
 def test_same_overlay_keeps_identity_hash_across_jobs():

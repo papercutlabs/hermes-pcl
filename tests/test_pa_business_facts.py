@@ -35,7 +35,7 @@ class _FakeBusinessHandler(BaseHTTPRequestHandler):
             "payload": payload,
             "content_type": self.headers.get("Content-Type"),
             "tgg_token": self.headers.get("X-TGG-Token"),
-            "mofex_token": self.headers.get("X-Mofex-Token"),
+            "exampleco_token": self.headers.get("X-ExampleCo-Token"),
         }
         body = json.dumps({"ok": True, "echo": payload}).encode("utf-8")
         self.send_response(200)
@@ -100,7 +100,7 @@ def test_http_operation_calls_fake_endpoint_and_returns_json(fake_business_endpo
         "payload": {"case_id": "C-123"},
         "content_type": "application/json",
         "tgg_token": None,
-        "mofex_token": None,
+        "exampleco_token": None,
     }
 
 
@@ -1850,9 +1850,9 @@ def test_wrong_tenant_operation_fails_loudly(fake_business_endpoint):
                     "token": "tgg-secret",
                 },
                 "operations": {
-                    "mofex_lookup": {
+                    "exampleco_lookup": {
                         "type": "http",
-                        "tenant": "mofex",
+                        "tenant": "exampleco",
                         "url": fake_business_endpoint,
                     }
                 },
@@ -1867,7 +1867,7 @@ def test_wrong_tenant_operation_fails_loudly(fake_business_endpoint):
     with pytest.raises(TenantScopeMismatch, match="TENANT_SCOPE_MISMATCH"):
         execute_business_operation(
             {"pa_business": {"operations": {}}},
-            "mofex_lookup",
+            "exampleco_lookup",
             {"case_id": "M-1"},
             pa_context=pa_context,
         )

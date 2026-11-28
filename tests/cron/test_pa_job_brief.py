@@ -77,6 +77,31 @@ def test_non_management_or_unbound_cron_keeps_delegation_disabled(pa_context):
     assert disabled == ["delegation"]
 
 
+def test_explicit_tgg_readonly_delegation_survives_cron_default():
+    enabled = ["tgg-management-readonly-investigation", "delegation"]
+    context = SimpleNamespace(
+        job_type="tgg_management",
+        job_brief=SimpleNamespace(enabled_toolsets=enabled, disabled_toolsets=[]),
+    )
+    actual_enabled, disabled = _merge_cron_pa_toolsets(
+        None, ["cronjob", "messaging", "clarify", "delegation"], context
+    )
+    assert actual_enabled == enabled
+    assert disabled == ["cronjob", "messaging", "clarify"]
+    # A deliberate declaration-level disable still wins.
+    context.job_brief.disabled_toolsets = ["delegation"]
+    assert "delegation" in _merge_cron_pa_toolsets(None, ["delegation"], context)[1]
+
+
+def test_other_cron_context_keeps_default_delegation_exclusion():
+    context = SimpleNamespace(
+        job_type="tgg_management",
+        job_brief=SimpleNamespace(enabled_toolsets=["delegation"], disabled_toolsets=[]),
+    )
+    assert _merge_cron_pa_toolsets(None, ["delegation"], context)[1] == ["delegation"]
+    assert _merge_cron_pa_toolsets(None, ["delegation"], None)[1] == ["delegation"]
+
+
 @pytest.fixture()
 def tmp_cron_dir(tmp_path, monkeypatch):
     monkeypatch.setattr("cron.jobs.CRON_DIR", tmp_path / "cron")

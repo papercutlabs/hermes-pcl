@@ -37,7 +37,6 @@ class Handler(BaseHTTPRequestHandler):
             "payload": payload,
             "auth": {
                 "x_tgg_token_present": bool(self.headers.get("X-TGG-Token")),
-                "x_mofex_token_present": bool(self.headers.get("X-Mofex-Token")),
                 "authorization_present": bool(self.headers.get("Authorization")),
             },
         }

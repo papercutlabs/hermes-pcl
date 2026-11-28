@@ -18,7 +18,7 @@
 - **2026-07-13** — READY-state controlled-tester pass run through the **production stack** (Hermes gateway + native Telegram ingress), synthetic cases only, tester `276672685`. Transcript: `test-transcripts/2026-07-13-synthetic-e2e.md`. Case A (ROP Term→Term) drafted a full BOR with ROP disadvantages disclosure + `[[MISSING: ECIM]]` placeholder; Case B (non-ROP new purchase) correctly did NOT fire ROP checks. Agent behaviour is constitution/knowledge-driven, not generic-LLM.
 
 ## What remains (before a real advisor can use it)
-1. ~~**[BLOCKER] A free Telegram bot.**~~ **RESOLVED 2026-07-13.** Teren authorised freeing one slot from the 20-bot cap. Deleted exactly one retired throwaway (`pcl_mofextest_bot`, interlock-verified: BotFather's confirmation prompt was asserted to name mofextest and NOT `pcl_moltbot`=Kleya's before confirming). Minted **@pcl_mtu_bor_bot** (id 8869502462). Deployed + live + synthetic-E2E tested.
+1. ~~**[BLOCKER] A free Telegram bot.**~~ **RESOLVED 2026-07-13.** Teren authorised freeing one slot from the 20-bot cap. Deleted exactly one retired throwaway test bot (interlock-verified: BotFather's confirmation prompt was asserted to name that test bot and NOT `pcl_moltbot`=Kleya's before confirming). Minted **@pcl_mtu_bor_bot** (id 8869502462). Deployed + live + synthetic-E2E tested.
 2. **[Amelia gate]** DEBUT go (first real advisor) — WB 16f2b3ae. **Still open — nothing reaches a real advisor before this.**
 3. **[Melody gate]** Confirm/edit the BOR table (`knowledge/bor-required-checks.yaml`) + approved disclosure wording. **Still open.**
 4. Set literal `engagement_id`, add Melody's/advisors' Telegram IDs to the allowlist (currently tester-only `276672685`).
