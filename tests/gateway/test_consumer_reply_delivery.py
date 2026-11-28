@@ -147,7 +147,12 @@ def test_selector_chats_are_whatsapp_management_only(config_path: Path) -> None:
 
 def test_parse_extracts_send_and_rejects_other_kinds() -> None:
     parsed = _parse_captured_send(_captured(MGMT_CHAT))
-    assert parsed == {"chat_id": MGMT_CHAT, "content": "reply text", "reply_to": "MSG1"}
+    assert parsed == {
+        "chat_id": MGMT_CHAT,
+        "content": "reply text",
+        "reply_to": "MSG1",
+        "workspace_owner": None,
+    }
     assert _parse_captured_send({**_captured(MGMT_CHAT), "kind": "send_image"}) is None
     assert _parse_captured_send({"kind": "send", "args": [], "kwargs": {}}) is None
 
@@ -988,7 +993,7 @@ async def test_correlated_reply_reaches_recreated_management_session_as_metadata
         [record], config_path=config_path, state_db=state_db, persistent_session=True,
         runner=runner, management_document_correlations={"reply-1": correlation},
     )
-    assert runner.plans[0].replay_namespace == "agent:live-drain:persistent-chat:openai-codex:gpt-5.6-terra"
+    assert runner.plans[0].replay_namespace == "agent:live-drain:conversation"
     assert runner.plans[0].messages[0]["_hermes_pa_context"]["management_document_correlation"] == correlation
 
 
@@ -1008,8 +1013,8 @@ async def test_document_event_recreates_the_same_persistent_management_session(
     await _run_management_document_turn(_document_entry("entry-1"), config_path=config_path, destination_chat_id=MGMT_CHAT, runner=runner)
     await _run_management_document_turn(_document_entry("entry-2", created_at=101), config_path=config_path, destination_chat_id=MGMT_CHAT, runner=runner)
     assert [plan.replay_namespace for plan in runner.plans] == [
-        "agent:live-drain:persistent-chat:openai-codex:gpt-5.6-terra",
-        "agent:live-drain:persistent-chat:openai-codex:gpt-5.6-terra",
+        "agent:live-drain:conversation",
+        "agent:live-drain:conversation",
     ]
     assert all(plan.live_business_writes is False for plan in runner.plans)
 
@@ -1099,6 +1104,96 @@ def test_zip_document_delivery_uses_send_media_with_filename_and_caption(
             },
         )
     ]
+
+
+def test_sandbox_document_uses_captured_workspace_owner(
+    inbox: DurableInbox,
+    config_path: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tools.python_sandbox_tool import _workspace_key
+
+    owner = "stable-gateway-owner"
+    work = tmp_path / "sandbox_workspaces" / _workspace_key(owner) / "work"
+    work.mkdir(parents=True)
+    report = work / "report.xlsx"
+    report.write_bytes(b"PK\x03\x04edited-workbook")
+    monkeypatch.setattr(
+        "tools.python_sandbox_tool.get_hermes_home", lambda: tmp_path
+    )
+    sent: list[tuple[str, dict]] = []
+
+    def fake_urlopen(request, timeout=0):
+        sent.append((request.full_url, json.loads(request.data)))
+        return _FakeResponse({"success": True, "messageId": "WA-WORKBOOK"})
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    captured = _captured_document(MGMT_CHAT, Path("work/report.xlsx"))
+    captured["workspace_owner"] = owner
+    summary = deliver_management_replies(
+        inbox,
+        config_path=config_path,
+        captured_outbound=[captured],
+        batch_records=[_record(MGMT_CHAT)],
+        gate_changed_at=GATE_CHANGED_AT,
+        handled_groups=_handled("MSG1"),
+    )
+
+    assert summary["delivered"] == 1
+    assert sent == [
+        (
+            "http://127.0.0.1:3011/send-media",
+            {
+                "chatId": MGMT_CHAT,
+                "replyTo": "MSG1",
+                "filePath": str(report),
+                "mediaType": "document",
+                "fileName": "report.xlsx",
+            },
+        )
+    ]
+
+
+def test_missing_sandbox_document_records_undelivered_without_media_request(
+    inbox: DurableInbox,
+    config_path: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "tools.python_sandbox_tool.get_hermes_home", lambda: tmp_path
+    )
+    requests: list[tuple[str, dict]] = []
+
+    def fake_urlopen(request, timeout=0):
+        requests.append((request.full_url, json.loads(request.data)))
+        assert not request.full_url.endswith("/send-media")
+        return _FakeResponse({"success": True, "messageId": "WA-FAILURE-NOTE"})
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    captured = _captured_document(MGMT_CHAT, Path("work/missing.xlsx"))
+    captured["workspace_owner"] = "stable-gateway-owner"
+    summary = deliver_management_replies(
+        inbox,
+        config_path=config_path,
+        captured_outbound=[captured],
+        batch_records=[_record(MGMT_CHAT)],
+        gate_changed_at=GATE_CHANGED_AT,
+        handled_groups=_handled("MSG1"),
+    )
+
+    assert summary["undelivered"] == 1
+    assert [url.rsplit("/", 1)[-1] for url, _ in requests] == ["send"]
+    assert "exact files[].path" in requests[0][1]["message"]
+    with inbox.connect() as conn:
+        rows = conn.execute(
+            "SELECT delivery_key,status,error FROM reply_deliveries ORDER BY delivery_key"
+        ).fetchall()
+    refused = [row for row in rows if row["delivery_key"].startswith("media-refused::")]
+    assert len(refused) == 1
+    assert refused[0]["status"] == "undelivered"
+    assert "sandbox attachment refused" in refused[0]["error"]
 
 
 def test_composite_bundle_anchor_resolves_to_handled_component(

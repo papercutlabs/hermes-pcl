@@ -224,6 +224,12 @@ TOOLSETS = {
         "includes": [],
     },
 
+    "pa-message-recall": {
+        "description": "PA read-only recall of a stored conversation message by id: read_full_message returns the full text of a message cut when it was carried through compaction",
+        "tools": ["read_full_message"],
+        "includes": [],
+    },
+
     "pa-observability": {
         "description": "PA universal observability: record_event lets the agent emit semantic events for the PA portal (observability only, no client mutation)",
         "tools": ["record_event"],
@@ -276,6 +282,14 @@ TOOLSETS = {
     "delegation": {
         "description": "Spawn subagents with isolated context for complex subtasks",
         "tools": ["delegate_task"],
+        "includes": []
+    },
+
+    # PA-203 round 2: the workflow runner (agent/pa_workflow.py via
+    # tools/pa_workflow_tool.py); available only on the scoped TGG Management route.
+    "pa-workflow": {
+        "description": "Run a large read-only review as one recorded workflow of fixed-kind helpers",
+        "tools": ["workflow_start", "workflow_status"],
         "includes": []
     },
 

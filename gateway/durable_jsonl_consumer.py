@@ -16,9 +16,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import concurrent.futures
 import copy
 import contextlib
 import fcntl
+import functools
 import hashlib
 import json
 import os
@@ -30,13 +32,18 @@ import threading
 import time
 import uuid
 from collections import Counter
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
 import yaml
+
+from gateway.management_engine import (
+    ManagementEngineConfigError,
+    parse_management_engine,
+)
 
 
 CURSOR_VERSION = 1
@@ -83,6 +90,72 @@ def _stop_cron_ticker(stop_event: threading.Event, thread: threading.Thread) -> 
     thread.join(timeout=5)
 
 
+# PA-333: the capability's photo-fill lane, a third background lane beside the
+# scheduler tick and media retention.  Its own thread: no site_concurrency slot,
+# no chat lock; a lane failure is logged and retried at the next loop.
+PHOTO_FILL_LANE = Path("runtime/capabilities/christopher-tgg/current/scripts/photo_fill_lane.py")
+_PHOTO_FILL: dict[str, Any] = {}
+
+
+def _photo_fill_lane(stop_event: threading.Event, config_path: Path, case_db: Path, status: dict, interval_seconds: float = 60.0) -> None:
+    import importlib.util
+    import logging
+
+    lane_path = config_path.parent / PHOTO_FILL_LANE
+    while not stop_event.is_set():
+        try:
+            if not lane_path.is_file():
+                status["last_outcome"] = "lane_not_installed"
+            else:
+                spec = importlib.util.spec_from_file_location("christopher_photo_fill_lane", lane_path)
+                module = importlib.util.module_from_spec(spec)
+                sys.modules[spec.name] = module
+                spec.loader.exec_module(module)
+                module.run_lane(stop_event, config_path, case_db, status=status)
+        except Exception as exc:
+            status["last_error_class"] = type(exc).__name__
+            logging.getLogger(__name__).exception("Christopher photo-fill lane failed")
+        stop_event.wait(interval_seconds)
+
+
+def _start_photo_fill_lane(config_path: Path, case_db: Path) -> tuple[threading.Event, threading.Thread]:
+    stop_event, status = threading.Event(), {"mode": None, "last_loop_at": None, "last_outcome": None, "last_case": None, "last_error_class": None}
+    thread = threading.Thread(target=_photo_fill_lane, args=(stop_event, config_path, case_db, status), name="christopher-photo-fill-lane", daemon=True)
+    _PHOTO_FILL.update(status=status, thread=thread)
+    thread.start()
+    return stop_event, thread
+
+
+def _stop_photo_fill_lane(stop_event: threading.Event, thread: threading.Thread) -> None:
+    stop_event.set()
+    thread.join(timeout=5)
+
+
+def _photo_fill_status() -> dict[str, Any]:
+    thread = _PHOTO_FILL.get("thread")
+    return {"photo_fill_lane": {**_PHOTO_FILL["status"], "thread_alive": thread.is_alive()}} if thread else {}
+
+
+def _protobuf_long_value(value: Mapping[str, Any]) -> int:
+    """Combine a protobuf Long serialised as ``{low, high, unsigned}``.
+
+    This follows JavaScript Long: ``low`` is always an unsigned 32-bit word;
+    ``high`` is unsigned when ``unsigned`` is set and a signed int32 otherwise.
+    Only integer words (bool is not an integer) that fit 32 bits are accepted.
+    """
+    low, high = value.get("low"), value.get("high", 0)
+    for part in (low, high):
+        if (
+            not isinstance(part, int) or isinstance(part, bool)
+            or not -(2**31) <= part < 2**32
+        ):
+            raise ConsumerError(f"invalid ingress timestamp: {dict(value)!r}")
+    high &= 0xFFFFFFFF
+    if not value.get("unsigned") and high >= 2**31:
+        high -= 2**32
+    return (low & 0xFFFFFFFF) + high * 2**32
+
+
 def _parse_ingress_timestamp(value: Any) -> datetime:
     """Normalize bridge timestamps without guessing the timezone.
 
@@ -90,6 +163,11 @@ def _parse_ingress_timestamp(value: Any) -> datetime:
     strings.  Naive strings are refused because a bounded production replay
     must not silently move its cutoff with the host timezone.
     """
+    if isinstance(value, Mapping):
+        try:
+            return _parse_ingress_timestamp(_protobuf_long_value(value))
+        except (OverflowError, OSError, ValueError) as exc:
+            raise ConsumerError(f"invalid ingress timestamp: {dict(value)!r}") from exc
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         number = float(value)
         if number > 10_000_000_000:
@@ -107,6 +185,14 @@ def _parse_ingress_timestamp(value: Any) -> datetime:
     if parsed.tzinfo is None:
         raise ConsumerError("naive ingress timestamp is forbidden")
     return parsed.astimezone(timezone.utc)
+
+
+HISTORY_SYNC_REPLAY_NOT_LIVE = "HISTORY_SYNC_REPLAY_NOT_LIVE"
+
+
+def _is_history_sync_record(record: "InboxRecord") -> bool:
+    """True when the bridge marked the record as a WhatsApp history-sync replay."""
+    return record.raw.get("historySync") is True
 
 
 def _record_ingress_timestamp(record: "InboxRecord") -> datetime:
@@ -369,6 +455,27 @@ def _declared_document_mime(value: Any) -> str:
     return ""
 
 
+def _declared_document_file_name(value: Any) -> str:
+    """Recover the sender's exact document file name from the capture record.
+
+    The capture bridge stores a document under a sanitised name and its
+    normalized item carries only that path; the provider message in ``raw``
+    still has WhatsApp's ``fileName``, which is the name the sender sees.
+    """
+    if not isinstance(value, Mapping):
+        return ""
+    document = value.get("documentMessage")
+    if isinstance(document, Mapping):
+        name = document.get("fileName") or document.get("title") or ""
+        return name if isinstance(name, str) else ""
+    for nested in value.values():
+        if isinstance(nested, Mapping):
+            name = _declared_document_file_name(nested)
+            if name:
+                return name
+    return ""
+
+
 @dataclass(frozen=True)
 class InboxRecord:
     seq: int
@@ -383,6 +490,9 @@ class InboxRecord:
     source_envelope: dict[str, Any] | None = None
     retention_state: str | None = None
     retention_quarantined: bool = False
+    # PA-203: read at turn time by DurableInbox.with_retention_view().
+    retention_attempts: int = 0
+    retention_file_error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -404,6 +514,44 @@ def _management_document_delivery_key(*, entry_id: str, chat_id: str) -> str:
     return f"human-resolution:{entry_id}:destination:{chat_id}"
 
 
+def _management_document_photo_delivery_key(
+    *, entry_id: str, chat_id: str, ordinal: int
+) -> str:
+    """PA-396: a further photo message of one initial notice."""
+    return f"{_management_document_delivery_key(entry_id=entry_id, chat_id=chat_id)}:photo:{int(ordinal)}"
+
+
+def _management_document_follow_up_delivery_key(
+    *, entry_id: str, chat_id: str, bridge_message_id: str
+) -> str:
+    """PA-396: Christopher's delivered reply in a correlated turn."""
+    return (
+        f"{_management_document_delivery_key(entry_id=entry_id, chat_id=chat_id)}"
+        f":follow-up:{bridge_message_id}"
+    )
+
+
+def _is_management_document_photo_delivery_key(
+    delivery_key: str, *, entry_id: str, chat_id: str
+) -> bool:
+    prefix = f"{_management_document_delivery_key(entry_id=entry_id, chat_id=chat_id)}:photo:"
+    return delivery_key.startswith(prefix) and delivery_key[len(prefix):].isdigit()
+
+
+def _is_management_document_part_delivery_key(
+    delivery_key: str, *, notice_part: Any, entry_id: str, chat_id: str
+) -> bool:
+    """A registered photo or follow-up of one document's notice in one chat."""
+    if notice_part == "photo":
+        return _is_management_document_photo_delivery_key(
+            delivery_key, entry_id=entry_id, chat_id=chat_id,
+        )
+    if notice_part == "follow_up":
+        prefix = f"{_management_document_delivery_key(entry_id=entry_id, chat_id=chat_id)}:follow-up:"
+        return delivery_key.startswith(prefix) and bool(delivery_key[len(prefix):])
+    return False
+
+
 def _is_management_document_delivery_key(
     delivery_key: str, *, entry_id: str, chat_id: str
 ) -> bool:
@@ -412,6 +560,15 @@ def _is_management_document_delivery_key(
         _management_document_delivery_key(entry_id=entry_id, chat_id=chat_id),
         f"human-resolution:{entry_id}",
     }
+
+
+# PA-203: rows whose retention is still owed.  Pending business rows, and
+# rows already answered after at least one attempt.  Written once so the
+# partial index and every query that should use it carry identical terms.
+_RETENTION_OPEN = (
+    "retention_state IN ('pending','held') "
+    "AND (status='pending' OR retention_attempts>0)"
+)
 
 
 def _initial_retention_state(item: Mapping[str, Any]) -> str:
@@ -678,6 +835,14 @@ class DurableInbox:
                 "CREATE INDEX IF NOT EXISTS ingress_events_retention_queue_idx "
                 "ON ingress_events(status,retention_state,seq)"
             )
+            # PA-203: open retention work only.  Answered rows stay here
+            # until retention converges; the 21 July legacy rows (no
+            # attempt, no longer pending) never enter it.
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS ingress_events_retention_open_idx "
+                "ON ingress_events(retention_state,retention_updated_at,seq) "
+                f"WHERE {_RETENTION_OPEN}"
+            )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS ingress_events_projection_queue_idx "
                 "ON ingress_events(projection_state,projection_updated_at,seq)"
@@ -741,6 +906,13 @@ class DurableInbox:
                 declared_document_mime = _declared_document_mime(decoded)
                 if declared_document_mime and len(item.get("mediaUrls") or []) == 1:
                     item["mediaMimes"] = [declared_document_mime]
+                declared_file_name = _declared_document_file_name(decoded)
+                if (
+                    declared_file_name
+                    and not item.get("mediaFileNames")
+                    and len(item.get("mediaUrls") or []) == 1
+                ):
+                    item["mediaFileNames"] = [declared_file_name]
                 message_id = str(item["messageId"])
                 staged.append((start, end, item, decoded))
                 last_message_id = message_id
@@ -847,6 +1019,10 @@ class DurableInbox:
         A chat appears at most once.  Rows stay pending until the scheduler has
         capacity and claims that chat's batch, so no unrelated chat can own or
         strand them.  Ordering is oldest pending row per chat, then row seq.
+
+        A row is eligible as soon as it is captured.  Media retention does not
+        gate the turn (PA-203): the turn reads its attachments from capture,
+        and retention converges independently in the capture lane.
         """
         size = max(1, int(batch_size))
         priority = set(priority_chats or ())
@@ -858,8 +1034,7 @@ class DurableInbox:
                 "q.ingress_seq IS NOT NULL AS retention_quarantined "
                 "FROM ingress_events e LEFT JOIN media_retention_quarantine q "
                 "ON q.ingress_seq=e.seq AND q.status='quarantined' "
-                "WHERE e.status='pending' "
-                "AND e.retention_state IN ('complete','bypassed') ORDER BY e.seq"
+                "WHERE e.status='pending' ORDER BY e.seq"
             ).fetchall()
         grouped: dict[str, list[InboxRecord]] = {}
         latest_created_at: dict[str, datetime] = {}
@@ -901,7 +1076,7 @@ class DurableInbox:
         return management, site
 
     def pending_chat_batch(self, chat_id: str, *, batch_size: int) -> list[InboxRecord]:
-        """Return one retained, pending FIFO batch for an already-active chat."""
+        """Return one pending FIFO batch for an already-active chat."""
         management, _ = self.pending_chat_batches(
             batch_size=batch_size,
             priority_chats={chat_id},
@@ -1398,6 +1573,11 @@ class DurableInbox:
                 continue
             if not isinstance(correlation, Mapping):
                 continue
+            if correlation.get("notice_part") in {"photo", "follow_up"}:
+                # PA-396: a photo of the notice, or Christopher's follow-up in
+                # a correlated turn, correlates replies but is never the quote
+                # anchor; the original notice is.
+                continue
             if (
                 correlation.get("document_id") == document_id
                 and (
@@ -1447,14 +1627,21 @@ class DurableInbox:
     def retention_candidates(
         self, *, limit: int, retry_interval_seconds: float = 0
     ) -> list[InboxRecord]:
-        """Bounded pending-business work, with spaced retries behind new rows."""
+        """Unconverged retention work, with spaced retries behind new rows.
+
+        Pending business rows are eligible as before.  A row the business lane
+        has already answered stays eligible after its first retention attempt,
+        so retention keeps converging after the turn (PA-203).  Rows with no
+        attempt that are no longer pending (the 21 July legacy rows) are never
+        swept in, and claimed rows are left to the claim-path attempt.
+        """
         retry_interval = max(0.0, float(retry_interval_seconds))
         with self.connect() as conn:
             rows = conn.execute(
                 "SELECT seq,message_id,chat_id,start_offset,end_offset,raw_json,"
                 "retention_state "
-                "FROM ingress_events WHERE status='pending' "
-                "AND retention_state IN ('pending','held') "
+                f"FROM ingress_events WHERE {_RETENTION_OPEN} "
+                "AND status!='processing' "
                 "AND (retention_state='pending' OR retention_updated_at IS NULL "
                 "OR julianday(retention_updated_at) <= "
                 "julianday('now', ?)) "
@@ -1591,6 +1778,57 @@ class DurableInbox:
                 "LIMIT 1"
             ).fetchone()
         return str(row[0]) if row and row[0] else None
+
+    def with_retention_view(self, record: InboxRecord) -> InboxRecord:
+        """Return ``record`` with its current retention state and quarantine flag."""
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT e.retention_state,e.retention_attempts,e.retention_last_error,"
+                "q.ingress_seq IS NOT NULL AS retention_quarantined,"
+                "(SELECT f.quarantine_eligible FROM media_retention_failures f "
+                "WHERE f.ingress_seq=e.seq ORDER BY f.attempt DESC LIMIT 1) "
+                "AS last_failure_file_level "
+                "FROM ingress_events e LEFT JOIN media_retention_quarantine q "
+                "ON q.ingress_seq=e.seq AND q.status='quarantined' WHERE e.seq=?",
+                (record.seq,),
+            ).fetchone()
+        if row is None:
+            raise ConsumerError(f"inbox record {record.seq} disappeared")
+        state = str(row["retention_state"])
+        # A held row whose latest failure was about the file itself (missing,
+        # unreadable, not the declared type), not about Systems.
+        file_error = (
+            str(row["retention_last_error"] or "media file check failed")
+            if state == "held" and row["last_failure_file_level"]
+            else None
+        )
+        return replace(
+            record,
+            retention_state=state,
+            retention_quarantined=bool(row["retention_quarantined"]),
+            retention_attempts=int(row["retention_attempts"] or 0),
+            retention_file_error=file_error,
+        )
+
+    def retention_attempt_due(
+        self, record: InboxRecord, *, retry_interval_seconds: float
+    ) -> bool:
+        """Whether a retention attempt on this row is due now (PA-203).
+
+        A row nobody has attempted is due.  A row with an attempt is due only
+        after the retry interval, the same spacing the capture lane keeps.
+        """
+        interval = max(0.0, float(retry_interval_seconds))
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT retention_attempts,retention_updated_at IS NULL "
+                "OR julianday(retention_updated_at) <= julianday('now', ?) AS spaced "
+                "FROM ingress_events WHERE seq=?",
+                (f"-{interval:.6f} seconds", record.seq),
+            ).fetchone()
+        if row is None:
+            raise ConsumerError(f"inbox record {record.seq} disappeared")
+        return int(row["retention_attempts"] or 0) == 0 or bool(row["spaced"])
 
     def retention_result(self, record: InboxRecord) -> dict[str, Any] | None:
         with self.connect() as conn:
@@ -1743,11 +1981,11 @@ class DurableInbox:
                 "SELECT COALESCE(SUM(retained_media_count),0),"
                 "COALESCE(SUM(retention_failures),0),"
                 "COALESCE(SUM(retention_attempts),0),"
-                "COALESCE(SUM(CASE WHEN status='pending' "
+                f"COALESCE(SUM(CASE WHEN {_RETENTION_OPEN} "
                 "AND retention_state='pending' THEN 1 ELSE 0 END),0),"
                 "COALESCE(SUM(CASE WHEN retention_state='complete' THEN 1 ELSE 0 END),0),"
                 "COALESCE(SUM(CASE WHEN retention_state='bypassed' THEN 1 ELSE 0 END),0),"
-                "COALESCE(SUM(CASE WHEN status IN ('pending','processing') "
+                f"COALESCE(SUM(CASE WHEN {_RETENTION_OPEN} "
                 "AND retention_state='held' THEN 1 ELSE 0 END),0) "
                 "FROM ingress_events"
             ).fetchone()
@@ -1785,12 +2023,15 @@ class DurableInbox:
         return [str(row["message_id"]) for row in rows]
 
     def retention_last_error(self) -> str | None:
-        """Newest unresolved retention hold, independent across chat lanes."""
+        """Newest unresolved retention hold, independent across chat lanes.
+
+        Same population as ``retention_held``, including answered rows whose
+        retention has not converged, so the count and its evidence agree.
+        """
         with self.connect() as conn:
             row = conn.execute(
                 "SELECT retention_last_error FROM ingress_events "
-                "WHERE status IN ('pending','processing') "
-                "AND retention_state='held' "
+                f"WHERE {_RETENTION_OPEN} AND retention_state='held' "
                 "ORDER BY retention_updated_at DESC, seq DESC LIMIT 1"
             ).fetchone()
         return str(row[0]) if row else None
@@ -1901,6 +2142,9 @@ class DurableInbox:
             raise ConsumerError("human-resolution delivery correlation is incomplete")
         if not _is_management_document_delivery_key(
             str(row["delivery_key"]), entry_id=entry_id, chat_id=record.chat_id
+        ) and not _is_management_document_part_delivery_key(
+            str(row["delivery_key"]), notice_part=stored.get("notice_part"),
+            entry_id=entry_id, chat_id=record.chat_id,
         ):
             raise ConsumerError("human-resolution delivery correlation key mismatch")
         correlation = {
@@ -1910,12 +2154,92 @@ class DurableInbox:
             "reply_message_id": record.message_id,
             "confidence": "quoted_outbound_notice_exact",
         }
+        if stored.get("notice_part") in {"photo", "follow_up"}:
+            # PA-396: an uncaptioned photo or a follow-up does not show the
+            # question itself; carry the original notice's text so the reply
+            # turn sees what was asked.  A quote of the notice already does.
+            notice = self.initial_management_document_notice(
+                chat_id=record.chat_id, document_id=document_id,
+            )
+            if notice is not None and notice.get("body"):
+                correlation["question_text"] = str(notice["body"])
         canary_projection = stored.get("pa75_canary_projection")
         if canary_projection is not None:
             if not isinstance(canary_projection, Mapping):
                 raise ConsumerError("human-resolution canary projection is invalid")
             correlation["pa75_canary_projection"] = dict(canary_projection)
         return correlation
+
+    def management_open_question_candidates(
+        self, record: InboxRecord
+    ) -> list[dict[str, Any]] | None:
+        """Questions Christopher had already asked in this chat (PA-396).
+
+        For a human message, every record whose delivered initial notice in
+        this same chat was claimed before the message's own timestamp: one
+        entry per record, never a photo or follow-up row.  Returns ``None``
+        for Christopher's own messages and internal events, which get no
+        candidates.  It only lists what was asked; a capability tool decides
+        whether the message answers one, and closure owns open or closed.
+        """
+        item = _bridge_item(record.raw)
+        sender = str(item.get("senderId") or "").strip().lower()
+        if bool(item.get("fromMe")) or sender.endswith("@internal"):
+            return None
+        message_at = _timestamp_epoch_seconds(item.get("timestamp"))
+        if message_at is None:
+            return []
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT delivery_key,bridge_message_id,correlation_json,created_at "
+                "FROM reply_deliveries WHERE chat_id=? AND status='delivered' "
+                "AND bridge_message_id IS NOT NULL AND bridge_message_id!='' "
+                "AND delivery_key GLOB 'human-resolution:*' ORDER BY created_at,delivery_key",
+                (record.chat_id,),
+            ).fetchall()
+        candidates: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for row in rows:
+            try:
+                correlation = json.loads(row["correlation_json"] or "{}")
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(correlation, Mapping) or correlation.get("notice_part") is not None:
+                continue
+            if not (
+                correlation.get("notice_role") == "initial_notice"
+                or (
+                    correlation.get("notice_role") is None
+                    and correlation.get("entry_kind") == "initial_default"
+                )
+            ):
+                continue
+            document_id = str(correlation.get("document_id") or "").strip()
+            entry_id = str(correlation.get("entry_id") or "").strip()
+            if not document_id or not entry_id or document_id in seen:
+                continue
+            # Only the destination-scoped notice key
+            # (human-resolution:<entry>:destination:<chat>), never the
+            # pre-PA-83 key without a destination.
+            if str(row["delivery_key"]) != _management_document_delivery_key(
+                entry_id=entry_id, chat_id=record.chat_id
+            ):
+                continue
+            # The notice row is claimed immediately before its post and the
+            # table keeps no separate delivery time, so the claim time is
+            # the notice's time.
+            delivered_at = _timestamp_epoch_seconds(row["created_at"])
+            if delivered_at is None or delivered_at >= message_at:
+                continue
+            seen.add(document_id)
+            candidates.append({
+                "document_id": document_id,
+                "entry_id": entry_id,
+                "notice_delivery_key": str(row["delivery_key"]),
+                "notice_bridge_message_id": str(row["bridge_message_id"]),
+                "notice_delivered_at": str(row["created_at"]),
+            })
+        return candidates
 
     def record_reply_delivery(
         self,
@@ -2763,6 +3087,231 @@ def ensure_record_media_retained(
     return result
 
 
+# PA-203: one retention attempt per row at a time.  The capture lane and the
+# claim path (including active steering) can reach the same row at once; the
+# second caller skips, so each recorded attempt is one actual attempt.
+_RETENTION_IN_FLIGHT: set[int] = set()
+_RETENTION_IN_FLIGHT_LOCK = threading.Lock()
+# Claim-path attempts run beside the turn, never ahead of it.
+_BACKGROUND_RETENTION: set[asyncio.Task] = set()
+# Retention threads have their own small pool, so a stalled Systems never
+# takes the default pool's threads from the turn's evidence write or presence
+# calls.  run_consumer shuts it down (waiting) before it returns.
+_RETENTION_WORKERS = 2
+_RETENTION_EXECUTOR: concurrent.futures.ThreadPoolExecutor | None = None
+_RETENTION_EXECUTOR_LOCK = threading.Lock()
+_CLAIM_PATH_NOT_COMPLETED = (
+    "media-retention-retry: claim-path attempt did not complete"
+)
+
+
+def _retention_executor() -> concurrent.futures.ThreadPoolExecutor:
+    global _RETENTION_EXECUTOR
+    with _RETENTION_EXECUTOR_LOCK:
+        if _RETENTION_EXECUTOR is None:
+            _RETENTION_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+                max_workers=_RETENTION_WORKERS,
+                thread_name_prefix="pa-media-retention",
+            )
+        return _RETENTION_EXECUTOR
+
+
+def _shutdown_retention_executor() -> None:
+    """Drop queued attempts and wait for running ones; none outlive the caller."""
+    global _RETENTION_EXECUTOR
+    with _RETENTION_EXECUTOR_LOCK:
+        executor, _RETENTION_EXECUTOR = _RETENTION_EXECUTOR, None
+    if executor is not None:
+        executor.shutdown(wait=True, cancel_futures=True)
+
+
+async def _in_retention_thread(function: Any, /, *args: Any, **kwargs: Any) -> Any:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        _retention_executor(), functools.partial(function, *args, **kwargs)
+    )
+
+
+def _retention_retry_cap(config_path: Path) -> int:
+    config = _retention_config(config_path)
+    return int(config["max_attempts"]) if config is not None else 5
+
+
+def _retention_retry_interval(config_path: Path) -> float:
+    config = _retention_config(config_path)
+    return float(config["retry_interval_seconds"]) if config is not None else 60.0
+
+
+@contextlib.contextmanager
+def _retention_claim(record: InboxRecord) -> Iterable[bool]:
+    """Hold this row's in-flight slot; yields False when another caller has it."""
+    with _RETENTION_IN_FLIGHT_LOCK:
+        if record.seq in _RETENTION_IN_FLIGHT:
+            owned = False
+        else:
+            _RETENTION_IN_FLIGHT.add(record.seq)
+            owned = True
+    try:
+        yield owned
+    finally:
+        if owned:
+            with _RETENTION_IN_FLIGHT_LOCK:
+                _RETENTION_IN_FLIGHT.discard(record.seq)
+
+
+def _ensure_retained_unless_in_flight(
+    inbox: DurableInbox,
+    record: InboxRecord,
+    *,
+    config_path: Path,
+    claim_path: bool = False,
+) -> dict[str, Any] | None:
+    """ensure_record_media_retained(), or None when the row is not ours to try.
+
+    None when another caller holds the row.  On the claim path, also None when
+    the row's state, re-read inside the claim, shows an attempt within the
+    retry interval (the capture lane just tried it).  On the claim path an
+    unexpected error is recorded as a retryable failure, so the row stays open
+    and counted, and is raised as MediaRetentionError.
+    """
+    with _retention_claim(record) as owned:
+        if not owned:
+            return None
+        if claim_path and not inbox.retention_attempt_due(
+            record, retry_interval_seconds=_retention_retry_interval(config_path)
+        ):
+            return None
+        try:
+            return ensure_record_media_retained(inbox, record, config_path=config_path)
+        except MediaRetentionError:
+            raise
+        except Exception as exc:
+            if not claim_path:
+                raise
+            error = f"media-retention-retry: claim-path attempt failed: {type(exc).__name__}: {exc}"
+            with contextlib.suppress(Exception):
+                inbox.record_retention(
+                    record, error=error, retry_cap=_retention_retry_cap(config_path)
+                )
+            raise MediaRetentionError(error) from exc
+
+
+def _record_claim_path_not_completed(
+    inbox: DurableInbox, record: InboxRecord, *, config_path: Path
+) -> bool:
+    """Keep a claimed row open when its claim-path attempt never recorded.
+
+    The row is about to become terminal; the capture lane retries terminal
+    rows only after an attempt, so an unrecorded attempt is recorded as a
+    retryable failure.  Skipped while another caller holds the row: its
+    attempt records.
+    """
+    with _retention_claim(record) as owned:
+        if not owned:
+            return False
+        view = inbox.with_retention_view(record)
+        if view.retention_state != "pending" or view.retention_attempts:
+            return False
+        inbox.record_retention(
+            record,
+            error=_CLAIM_PATH_NOT_COMPLETED,
+            retry_cap=_retention_retry_cap(config_path),
+        )
+        return True
+
+
+async def _retain_claimed_records(
+    inbox: DurableInbox, records: Sequence[InboxRecord], *, config_path: Path
+) -> None:
+    for record in records:
+        try:
+            await _in_retention_thread(
+                _ensure_retained_unless_in_flight,
+                inbox,
+                record,
+                config_path=config_path,
+                claim_path=True,
+            )
+        except MediaRetentionError as exc:
+            print(
+                "media retention not yet converged; turn proceeds from capture: "
+                f"chat={record.chat_id} message={record.message_id} error={exc}",
+                file=sys.stderr,
+            )
+
+
+@dataclass
+class _ClaimPathRetention:
+    task: asyncio.Task
+    records: list[InboxRecord]
+
+
+def _start_claim_path_retention(
+    inbox: DurableInbox, records: Sequence[InboxRecord], *, config_path: Path
+) -> _ClaimPathRetention | None:
+    """One best-effort attempt for claimed rows nobody has attempted yet (PA-203).
+
+    It runs beside the turn, so a slow or stalled Systems never delays the
+    turn's start.  Rows that already have an attempt are left to the capture
+    lane, which keeps retrying them after the turn.  The caller settles it
+    with _settle_claim_path_retention() before the rows become terminal.
+    """
+    owed = [
+        record for record in records
+        if record.retention_state == "pending" and record.retention_attempts == 0
+    ]
+    if not owed:
+        return None
+    task = asyncio.create_task(
+        _retain_claimed_records(inbox, owed, config_path=config_path)
+    )
+    _BACKGROUND_RETENTION.add(task)
+    task.add_done_callback(_BACKGROUND_RETENTION.discard)
+    return _ClaimPathRetention(task=task, records=owed)
+
+
+async def _settle_claim_path_retention(
+    inbox: DurableInbox, pending: _ClaimPathRetention | None, *, config_path: Path
+) -> None:
+    """Wait for the claim-path attempt, then make sure each row stays open.
+
+    Errors are suppressed: the turn's outcome never depends on retention.  A
+    row whose attempt was cancelled before it ran, or failed without being
+    recorded, gets a recorded retryable failure, so it is never terminal with
+    no attempt, which the capture lane would never retry.
+    """
+    if pending is None:
+        return
+    await asyncio.wait({pending.task})
+    if pending.task.cancelled():
+        reason = "cancelled"
+    else:
+        failure = pending.task.exception()
+        reason = f"{type(failure).__name__}: {failure}" if failure else None
+    if reason:
+        print(f"media retention claim-path task ended early: {reason}", file=sys.stderr)
+    for record in pending.records:
+        try:
+            if _record_claim_path_not_completed(inbox, record, config_path=config_path):
+                print(
+                    "media retention claim-path attempt did not complete; recorded for retry: "
+                    f"chat={record.chat_id} message={record.message_id}",
+                    file=sys.stderr,
+                )
+        except Exception as exc:
+            print(
+                "media retention claim-path settle FAILED: "
+                f"chat={record.chat_id} message={record.message_id} error={exc}",
+                file=sys.stderr,
+            )
+
+
+async def _drain_background_retention() -> None:
+    """Wait for claim-path attempts (the --once boundary and tests)."""
+    while _BACKGROUND_RETENTION:
+        await asyncio.gather(*list(_BACKGROUND_RETENTION), return_exceptions=True)
+
+
 async def retain_pending_media(
     inbox: DurableInbox, *, config_path: Path, limit: int
 ) -> dict[str, int]:
@@ -2783,12 +3332,14 @@ async def retain_pending_media(
     ):
         summary["examined"] += 1
         try:
-            result = await asyncio.to_thread(
-                ensure_record_media_retained,
+            result = await _in_retention_thread(
+                _ensure_retained_unless_in_flight,
                 inbox,
                 record,
                 config_path=config_path,
             )
+            if result is None:
+                continue
         except MediaRetentionError as exc:
             summary["held"] += 1
             print(
@@ -2853,6 +3404,43 @@ def configured_engine(config_path: Path) -> tuple[str, str]:
     return provider, selected
 
 
+def configured_chat_engine(config_path: Path, chat_id: str) -> tuple[str, str]:
+    """The (provider, model) a turn in ``chat_id`` must have run on.
+
+    A chat bound to the ``tgg_management`` selector expects the engine in
+    ``pa.management_engine`` (same provider, that model) when the config has
+    the block.  Every other chat, and Management without the block, expects the
+    gateway engine from ``configured_engine``.
+    """
+    provider, model = configured_engine(config_path)
+    if chat_id in _management_selector_chats(config_path):
+        data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        try:
+            management = parse_management_engine(data)
+        except ManagementEngineConfigError as exc:
+            raise ConsumerError(str(exc)) from exc
+        if management is not None:
+            return provider, management.model
+    return provider, model
+
+
+def configured_fallback_engines(config_path: Path) -> frozenset[tuple[str, str]]:
+    """(provider, model) pairs the config lists under fallback_providers.
+
+    A turn that ran on a listed fallback, from the start or after a mid-turn
+    switch, is an accepted engine; any other engine still fails the check.
+    """
+    data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    entries = data.get("fallback_providers") if isinstance(data, dict) else None
+    if not isinstance(entries, list):
+        return frozenset()
+    return frozenset(
+        (str(entry["provider"]).strip(), str(entry["model"]).strip())
+        for entry in entries
+        if isinstance(entry, dict) and entry.get("provider") and entry.get("model")
+    )
+
+
 def _turn_row(
     state_db: Path,
     *,
@@ -2887,6 +3475,7 @@ def _assert_completed_turn(
     provider: str,
     model: str,
     require_response: bool,
+    fallback_engines: frozenset[tuple[str, str]] = frozenset(),
 ) -> str:
     if row is None:
         raise ConsumerError("Hermes produced no pa_turn record")
@@ -2894,7 +3483,8 @@ def _assert_completed_turn(
         raise ConsumerError(
             f"Hermes pa_turn {row['turn_id']} status={row['turn_status']}"
         )
-    if str(row["provider"]) != provider or str(row["model"]) != model:
+    served = (str(row["provider"]), str(row["model"]))
+    if served != (provider, model) and served not in fallback_engines:
         raise ConsumerError(
             f"Hermes pa_turn engine mismatch: {row['provider']}/{row['model']}"
         )
@@ -2938,6 +3528,7 @@ async def process_replay_records(
         provider=provider,
         model=model,
         require_response=True,
+        fallback_engines=configured_fallback_engines(config_path),
     )
     return {
         "turn_id": turn_id,
@@ -3010,11 +3601,40 @@ def _mutable_bridge_item(value: dict[str, Any]) -> dict[str, Any]:
     return item
 
 
+def _capture_media_unavailable(
+    item: Mapping[str, Any], source_roots: Sequence[Path]
+) -> str | None:
+    """Why this event's attachment cannot be read from capture, or None.
+
+    PA-203: the turn reads attachments from capture and no longer waits for
+    retention, so the turn itself must say when a file it was told about is
+    not there (for example a failed download).  Local checks only, the same
+    ones retention applies to the source file; Systems is never asked.
+    """
+    try:
+        images = _event_media(item)
+        documents = _event_retainable_documents(item)
+    except ItemMediaRetentionError as exc:
+        return str(exc)
+    if not images and not documents:
+        coarse = str(item.get("mediaType") or item.get("mimeType") or "")
+        if coarse.split("/", 1)[0].strip().lower() == "image" and item.get("hasMedia") is True:
+            return "mandatory inbound media has no resolvable capture path"
+        return None
+    for _ordinal, raw_path, _declared in (*documents, *images):
+        try:
+            _contained_existing_file(raw_path, source_roots)
+        except ItemMediaRetentionError as exc:
+            return str(exc)
+    return None
+
+
 def _replay_messages_with_retained_documents(
     records: Sequence[InboxRecord],
     *,
     config_path: Path,
     management_document_correlations: Mapping[str, Mapping[str, Any]] | None = None,
+    management_open_question_candidates: Mapping[str, Sequence[Mapping[str, Any]]] | None = None,
 ) -> tuple[dict[str, Any], ...]:
     """Copy records and append retention evidence or quarantine warnings."""
     config = _retention_config(config_path)
@@ -3047,6 +3667,15 @@ def _replay_messages_with_retained_documents(
             context = dict(existing_context) if isinstance(existing_context, Mapping) else {}
             context["management_document_correlation"] = dict(correlation)
             item["_hermes_pa_context"] = context
+        candidates = (management_open_question_candidates or {}).get(record.message_id)
+        if candidates is not None:
+            # PA-396: the questions already asked in this chat, so a typed
+            # answer that quotes nothing can still be bound by Christopher's
+            # capability tool.  Additional to any explicit correlation.
+            existing_context = item.get("_hermes_pa_context")
+            context = dict(existing_context) if isinstance(existing_context, Mapping) else {}
+            context["management_open_question_candidates"] = [dict(value) for value in candidates]
+            item["_hermes_pa_context"] = context
         # The durable consumer enters Hermes through the replay adapter.  That
         # adapter only exposes PA turn metadata from these private bridge
         # fields; retaining ``metadata`` on the raw capture record is not
@@ -3072,10 +3701,40 @@ def _replay_messages_with_retained_documents(
                 context["continuous_interval"] = True
                 context["continuous_contract"] = metadata.get("continuous_contract")
             item["_hermes_pa_context"] = context
+        # PA-689: an admitted recheck record carries its correlation to the
+        # turn.  The append tool's recheck mode reads it from here and accepts
+        # an entry only for a document this correlation lists.
+        if (
+            isinstance(metadata, Mapping)
+            and metadata.get("job_type") == RECHECK_JOB_TYPE
+            and _priority_direct_trigger(record, config_path)
+        ):
+            item["_hermes_pa_job_type"] = RECHECK_JOB_TYPE
+            item["_hermes_pa_context"] = {
+                "job_type": RECHECK_JOB_TYPE,
+                "evidence_recheck_correlation": {
+                    "kind": "evidence_recheck",
+                    "recheck_run_id": metadata.get("recheck_run_id"),
+                    "master_content_hash": metadata.get("master_content_hash"),
+                    "document_ids": list(metadata.get("document_ids") or []),
+                },
+            }
         if record.retention_quarantined:
             warning = (
                 "[Attachment unavailable: retention quarantine for message "
                 f"{record.message_id}. Do not infer or claim the attachment's contents.]"
+            )
+            body = str(item.get("body") or item.get("text") or "").rstrip()
+            item["body"] = (body + "\n\n" if body else "") + warning
+            continue
+        if record.retention_file_error is not None or (
+            config is not None
+            and _capture_media_unavailable(item, config["source_roots"]) is not None
+        ):
+            warning = (
+                "[Attachment unavailable: the captured file for message "
+                f"{record.message_id} is missing or failed its file check. "
+                "Do not infer or claim the attachment's contents.]"
             )
             body = str(item.get("body") or item.get("text") or "").rstrip()
             item["body"] = (body + "\n\n" if body else "") + warning
@@ -3128,10 +3787,12 @@ async def process_live_records(
     runner: Any | None = None,
     defer_provider_errors: bool = False,
     management_document_correlations: Mapping[str, Mapping[str, Any]] | None = None,
+    management_open_question_candidates: Mapping[str, Sequence[Mapping[str, Any]]] | None = None,
     capture_business_writes_for_test_management: bool = False,
     replay_messages: Sequence[Mapping[str, Any]] | None = None,
     replay_session_key_override: str | None = None,
     replay_internal_message_ids: tuple[str, ...] = (),
+    live_business_writes: bool = True,
 ) -> dict[str, Any]:
     """Process live durable records through the replay orchestrator.
 
@@ -3156,7 +3817,14 @@ async def process_live_records(
     from gateway.replay import ReplayPlan
     from gateway.run import GatewayRunner
 
-    provider, model = configured_engine(config_path)
+    batch_engines = {
+        configured_chat_engine(config_path, chat_id)
+        for chat_id in {record.chat_id for record in records}
+    } or {configured_engine(config_path)}
+    if len(batch_engines) != 1:
+        raise ConsumerError("a live batch must run on one engine")
+    provider, model = next(iter(batch_engines))
+    fallback_engines = configured_fallback_engines(config_path)
     business_write_mode = "apply"
     if capture_business_writes_for_test_management:
         # This is the only PA-75 selector.  It is evaluated by the durable
@@ -3181,6 +3849,7 @@ async def process_live_records(
                 records,
                 config_path=config_path,
                 management_document_correlations=management_document_correlations,
+                management_open_question_candidates=management_open_question_candidates,
             )
         ),
         run_id=run_id,
@@ -3188,18 +3857,19 @@ async def process_live_records(
         delivery_mode="capture",
         bypass_require_mention=True,
         bypass_auth=True,
-        live_business_writes=True,
+        # PA-396: a question-trigger turn runs with business writes off, as
+        # the document-notice turn does; every other caller keeps them on.
+        live_business_writes=live_business_writes,
         business_write_mode=business_write_mode,
         source_path="durable-jsonl-consumer-live",
         # Ordinary live drain is one ongoing conversation per chat. Bounded
         # backplay is recovery/diagnostic replay and remains isolated.
-        # A persisted conversation cannot safely carry its engine identity
-        # across a provider/model switch. Include that identity in the live
-        # namespace so ordinary restarts retain context, while an intentional
-        # engine change starts a fresh session instead of producing an audit
-        # mismatch and suppressing reply delivery.
+        # The namespace carries no provider or model (PA-203 round 2): an
+        # engine change resumes the same conversation.  The turn record takes
+        # its provider and model from the agent that ran, so the engine check
+        # below still compares the engine that actually answered.
         replay_namespace=(
-            f"agent:live-drain:persistent-chat:{provider}:{model}"
+            persistent_chat_namespace()
             if persistent_session
             else None
         ),
@@ -3240,6 +3910,7 @@ async def process_live_records(
                 provider=provider,
                 model=model,
                 require_response=False,
+                fallback_engines=fallback_engines,
             )
         except ConsumerError as exc:
             detail = str(exc)
@@ -3278,7 +3949,86 @@ async def process_live_records(
         "provider_errors": provider_errors,
         "outbound_sent": 0,
         "submitted_message_ids": [record.message_id for record in records],
+        # PA-611: messages the gateway steered into an already running turn.
+        # They are answered by that turn, so this replay has no turn for them.
+        "steered_message_ids": [
+            str(value)
+            for value in (getattr(result, "steered_message_ids", None) or [])
+        ],
     }
+
+
+# PA-203 round 2: the live conversation namespace is independent of the
+# provider and model, so an engine change resumes Krisleen's conversation.
+# It is deliberately a new string, not the bare pre-engine
+# ``agent:live-drain:persistent-chat`` namespace, so an entry left under that
+# older key can never be resumed by mistake.
+# Earlier releases keyed the live namespace on the engine,
+# ``agent:live-drain:persistent-chat:{provider}:{model}``; the carry-over in
+# ``gateway.conversation_key_carryover`` moves those conversations once.
+from gateway.conversation_key_carryover import (  # noqa: E402
+    LEGACY_PREFIX as LEGACY_ENGINE_NAMESPACE_PREFIX,
+    NEW_NAMESPACE as PERSISTENT_CHAT_NAMESPACE,
+)
+
+
+def persistent_chat_namespace() -> str:
+    """Session namespace of the ordinary live drain: one conversation per chat.
+
+    It carries no provider or model, so a model or provider change resumes
+    the same Management and site conversations.
+    """
+    return PERSISTENT_CHAT_NAMESPACE
+
+
+def legacy_engine_chat_namespace(provider: str, model: str) -> str:
+    """The engine-keyed namespace earlier releases used for the live drain."""
+    return f"{LEGACY_ENGINE_NAMESPACE_PREFIX}:{provider}:{model}"
+
+
+def management_conversation_session_key(
+    config_path: Path, *, platform: str, chat_id: str
+) -> str | None:
+    """Stable session key of one configured Management chat's live conversation.
+
+    This is the key the ordinary live drain gives that chat's turns, so it
+    also owns the chat's persistent sandbox workspace (PA-129) and survives
+    compaction.  A scheduled job created from that chat uses it to work in
+    the same folder (PA-203).  Returns ``None`` when the chat is not a
+    configured WhatsApp Management chat, when its ordinary turns run in
+    isolated nightly sessions, or when per-participant group sessions mean no
+    single chat-level conversation exists.
+    """
+    chat = str(chat_id or "").strip()
+    if str(platform or "").strip().lower() != "whatsapp" or not chat:
+        return None
+    if chat not in _management_selector_chats(config_path):
+        return None
+    if chat in _nightly_selector_chats(config_path):
+        return None
+    from gateway.config import Platform, load_gateway_config
+    from gateway.replay import namespace_session_key
+    from gateway.session import SessionSource, build_session_key
+
+    gateway_config = load_gateway_config()
+    group_sessions_per_user = bool(
+        getattr(gateway_config, "group_sessions_per_user", True)
+    )
+    is_group = chat.endswith("@g.us")
+    if is_group and group_sessions_per_user:
+        return None
+    base_key = build_session_key(
+        SessionSource(
+            platform=Platform.WHATSAPP,
+            chat_id=chat,
+            chat_type="group" if is_group else "dm",
+        ),
+        group_sessions_per_user=group_sessions_per_user,
+        thread_sessions_per_user=bool(
+            getattr(gateway_config, "thread_sessions_per_user", False)
+        ),
+    )
+    return namespace_session_key(base_key, persistent_chat_namespace())
 
 
 def _management_selector_chats(config_path: Path) -> frozenset[str]:
@@ -3333,12 +4083,43 @@ def _priority_selector_chats(config_path: Path) -> frozenset[str]:
             continue
         match = selector.get("match") or {}
         if (
-            selector.get("job_type") in {"tgg_management", "tgg_nightly_whatsapp"}
+            selector.get("job_type") in {"tgg_management", "tgg_nightly_whatsapp", RECHECK_JOB_TYPE}
             and match.get("source.platform") == "whatsapp"
             and match.get("source.chat_id")
         ):
             chats.add(str(match.get("source.chat_id")))
     return frozenset(chats)
+
+
+# PA-689: Christopher's recheck of his open human-resolution documents after
+# an applied Master reconcile.  One internal record per run, on one reserved
+# pseudo chat that continuous processing never reads.
+RECHECK_JOB_TYPE = "tgg_resolution_recheck"
+RECHECK_CHAT = "900000000000000010@g.us"
+_RECHECK_RUN_ID = re.compile(r"reconcile-\d{13}-[0-9a-f]{8}")
+_RECHECK_CONTENT_HASH = re.compile(r"[0-9a-f]{64}")
+_RECHECK_DOCUMENT_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+
+
+def _recheck_brief(config_path: Path) -> tuple[frozenset[str], int]:
+    """The recheck selector chats and the brief's per-run document limit."""
+    data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    pa = data.get("pa") if isinstance(data, dict) else None
+    constitution_raw = str((pa or {}).get("constitution_path") or "")
+    if not constitution_raw or not Path(constitution_raw).is_file():
+        return frozenset(), 0
+    constitution = yaml.safe_load(Path(constitution_raw).read_text(encoding="utf-8")) or {}
+    chats = {
+        str((selector.get("match") or {}).get("source.chat_id"))
+        for selector in constitution.get("selectors") or []
+        if isinstance(selector, Mapping)
+        and selector.get("job_type") == RECHECK_JOB_TYPE
+        and (selector.get("match") or {}).get("source.platform") == "whatsapp"
+        and (selector.get("match") or {}).get("source.chat_id")
+    }
+    brief = (constitution.get("job_briefs") or {}).get(RECHECK_JOB_TYPE)
+    limit = brief.get("max_documents_per_run") if isinstance(brief, Mapping) else None
+    return frozenset(chats), limit if type(limit) is int and limit > 0 else 0
 
 
 def _nightly_selector_chats(config_path: Path) -> frozenset[str]:
@@ -3465,6 +4246,21 @@ def _priority_direct_trigger(record: InboxRecord, config_path: Path) -> bool:
     if record.chat_id not in nightly_chats:
         return False
     metadata = item.get("metadata")
+    if isinstance(metadata, Mapping) and metadata.get("job_type") == RECHECK_JOB_TYPE:
+        # PA-689: only on the reserved recheck chat, with a manifest run id,
+        # a Master content hash and 1..N record UUIDs (N from the brief).
+        recheck_chats, limit = _recheck_brief(config_path)
+        document_ids = metadata.get("document_ids")
+        return bool(
+            record.chat_id == RECHECK_CHAT
+            and record.chat_id in recheck_chats
+            and _RECHECK_RUN_ID.fullmatch(str(metadata.get("recheck_run_id") or ""))
+            and _RECHECK_CONTENT_HASH.fullmatch(str(metadata.get("master_content_hash") or ""))
+            and isinstance(document_ids, list)
+            and 0 < len(document_ids) <= limit
+            and len(set(document_ids)) == len(document_ids)
+            and all(isinstance(value, str) and _RECHECK_DOCUMENT_ID.fullmatch(value) for value in document_ids)
+        )
     if not isinstance(metadata, Mapping) or metadata.get("job_type") != "tgg_nightly_whatsapp":
         return False
     batch_id = str(metadata.get("nightly_batch_id") or "")
@@ -3506,6 +4302,33 @@ def _continuous_interval_batch(records: Sequence[InboxRecord], config_path: Path
     return bool(records) and all(_continuous_interval_trigger(record, config_path) for record in records)
 
 
+def _continuous_analyzer_retry_trigger(record: InboxRecord, config_path: Path) -> bool:
+    """A validated continuous trigger that the runner issued as its one analyzer retry."""
+    if not _continuous_interval_trigger(record, config_path):
+        return False
+    item = _bridge_item_ref(record.raw)
+    metadata = item.get("metadata") if isinstance(item, Mapping) else None
+    return bool(
+        isinstance(metadata, Mapping)
+        and metadata.get("continuous_analyzer_retry") is True
+        and metadata.get("continuous_analyzer_retry_contract")
+        == "tgg-continuous-analyzer-retry/v1"
+    )
+
+
+def _persistent_continuous_interval_batch(
+    records: Sequence[InboxRecord], config_path: Path
+) -> bool:
+    """Continuous intervals share the chat's session, except an analyzer retry.
+
+    PA-430: the retry follows a turn that ended without a seal, often in a
+    session that compaction had already cut down, so it starts a fresh one.
+    """
+    return _continuous_interval_batch(records, config_path) and not any(
+        _continuous_analyzer_retry_trigger(record, config_path) for record in records
+    )
+
+
 def _same_session_steering_allowed(
     active: Sequence[InboxRecord], followups: Sequence[InboxRecord], config_path: Path,
 ) -> bool:
@@ -3540,13 +4363,28 @@ def _parse_captured_send(entry: Mapping[str, Any]) -> dict[str, Any] | None:
         "chat_id": chat_id,
         "content": content,
         "reply_to": str(reply_to) if reply_to else None,
+        "workspace_owner": str(entry.get("workspace_owner") or "").strip() or None,
     }
 
 
 _CAPTURED_IMAGE_MEDIA_RE = re.compile(
-    r"MEDIA:\s*(?P<path>(?:file://)?(?:~/|/)\S+)",
+    # A quoted or backticked path may contain spaces, so a file whose exact
+    # name has spaces or parentheses can be sent under that name.
+    r"MEDIA:\s*(?:"
+    r"\"(?P<quoted>(?:(?:file://)?(?:~/|/)|work/)[^\"\n]+)\""
+    r"|`(?P<backticked>(?:(?:file://)?(?:~/|/)|work/)[^`\n]+)`"
+    r"|(?P<path>(?:(?:file://)?(?:~/|/)\S+|work/\S+)))",
     re.IGNORECASE,
 )
+
+
+def _captured_media_match_path(match: re.Match[str]) -> str:
+    return (
+        match.group("quoted")
+        or match.group("backticked")
+        or match.group("path")
+        or ""
+    )
 
 
 def _expand_captured_send(send: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -3570,7 +4408,7 @@ def _expand_captured_send(send: Mapping[str, Any]) -> list[dict[str, Any]]:
             {
                 "send_kind": "media",
                 "chat_id": str(send.get("chat_id") or ""),
-                "path": match.group("path"),
+                "path": _captured_media_match_path(match),
                 "caption": cleaned if ordinal == 0 and cleaned else None,
                 # Keep the answer on every expanded item so delivery can send
                 # it separately if any attachment fails.  This field is never
@@ -3578,15 +4416,23 @@ def _expand_captured_send(send: Mapping[str, Any]) -> list[dict[str, Any]]:
                 "response_text": cleaned or None,
                 "reply_to": send.get("reply_to"),
                 "ordinal": ordinal,
+                "workspace_owner": send.get("workspace_owner"),
             }
         )
     return expanded
 
 
 def _resolve_captured_media_path(
-    raw_path: Any, retention: Mapping[str, Any]
+    raw_path: Any,
+    retention: Mapping[str, Any] | None,
+    *,
+    workspace_owner: str | None = None,
+    for_delivery: bool = False,
 ) -> Path:
     """Resolve a captured local path or configured opaque media reference.
+
+    ``for_delivery`` (PA-203, agent workspace): return the immutable,
+    digest-checked copy under ``records/sent/`` that is actually sent.
 
     Business tools expose retained files using ``media_ref_prefix`` rather
     than leaking the host filesystem root.  Convert only an exact
@@ -3599,12 +4445,34 @@ def _resolve_captured_media_path(
     text = str(raw_path or "").strip()
     if not text or any(marker in text for marker in ("?", "#", "\r", "\n")):
         raise MediaRetentionError("captured media reference is invalid")
+    if for_delivery and text.startswith(("work/", "/work/", "records/", "/records/")):
+        from tools.python_sandbox_tool import agent_workspace_enabled
+
+        if agent_workspace_enabled():
+            from tools.pa_agent_workspace import delivery_snapshot
+
+            try:
+                path, _sha = delivery_snapshot(
+                    text, str(workspace_owner or ""), any_file_allowed=True
+                )
+                return path
+            except ValueError as exc:
+                raise MediaRetentionError(str(exc)) from exc
+    if text.startswith(("work/", "/work/", "records/", "/records/")):
+        from tools.python_sandbox_tool import resolve_sandbox_work_path
+
+        try:
+            return resolve_sandbox_work_path(text, str(workspace_owner or ""))
+        except ValueError as exc:
+            raise MediaRetentionError(str(exc)) from exc
     if text.startswith("file://"):
         parsed = urlsplit(text)
         if parsed.scheme != "file" or parsed.netloc not in {"", "localhost"}:
             raise MediaRetentionError("captured media file URI is invalid")
         text = unquote(parsed.path)
 
+    if retention is None:
+        raise MediaRetentionError("retained media is not configured")
     ref_prefix = str(retention["ref_prefix"])
     prefix = f"{ref_prefix}/"
     if text.startswith(prefix):
@@ -3630,6 +4498,187 @@ def _resolve_captured_media_path(
     if not resolved.is_file() or not resolved.is_relative_to(root):
         raise MediaRetentionError("captured media path escapes retained-media root")
     return resolved
+
+
+def _captured_document_display_name(send: Mapping[str, Any], media_path: Path) -> str:
+    """The exact name WhatsApp shows for a document this send delivers.
+
+    An explicit ``file_name`` (``send_document``'s, which ``tgg_file_return``
+    sets) wins; otherwise the name at the end of the requested path, as
+    written in the ``MEDIA:`` directive.  The stored copy keeps a safe name.
+    """
+    from tools.pa_agent_workspace import display_file_name, requested_display_name
+
+    explicit = send.get("file_name")
+    if explicit:
+        try:
+            return display_file_name(explicit)
+        except ValueError as exc:
+            raise MediaRetentionError(f"display file name refused: {exc}") from exc
+    return requested_display_name(send.get("path")) or media_path.name
+
+
+def _keep_sent_file_in_workspace(
+    path: Path, *, chat_id: str, message_id: str = "", display_name: str = ""
+) -> None:
+    """Keep a file Christopher sent in the agent workspace (PA-203 round 2).
+
+    A sandbox file is already there and is only logged; a retained-media or
+    other local file is copied in, so a later turn in any conversation can
+    open exactly what was sent.  Never fails the delivery.
+    """
+    try:
+        from tools.python_sandbox_tool import record_workspace_file
+
+        record_workspace_file(
+            path,
+            direction="sent",
+            folder="sent",
+            details={
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "display_name": display_name,
+            },
+        )
+    except Exception as exc:
+        print(
+            f"sent file was not kept in the agent workspace: chat={chat_id} error={exc}",
+            file=sys.stderr,
+        )
+
+
+def _recent_valid_sandbox_file_paths(
+    messages: Sequence[Mapping[str, Any]],
+    *,
+    workspace_owner: str,
+) -> tuple[str, ...]:
+    """Return exact paths from the newest sandbox result that has usable files."""
+    for message in reversed(messages):
+        if not isinstance(message, Mapping) or message.get("role") != "tool":
+            continue
+        content = message.get("content")
+        if not isinstance(content, str):
+            continue
+        try:
+            payload = json.loads(content)
+        except (TypeError, ValueError):
+            continue
+        files = payload.get("files") if isinstance(payload, Mapping) else None
+        if not isinstance(files, Sequence) or isinstance(files, (str, bytes)):
+            continue
+        exact_paths: list[str] = []
+        for item in files:
+            if not isinstance(item, Mapping):
+                continue
+            path = str(item.get("path") or "").strip()
+            if not path or path in exact_paths:
+                continue
+            try:
+                resolved = _resolve_captured_media_path(
+                    path,
+                    None,
+                    workspace_owner=workspace_owner,
+                )
+                _validated_captured_media_type(resolved)
+            except (OSError, MediaRetentionError):
+                continue
+            exact_paths.append(path)
+        if exact_paths:
+            return tuple(exact_paths)
+    return ()
+
+
+def validate_management_attachment_response(
+    response_text: str,
+    messages: Sequence[Mapping[str, Any]],
+    *,
+    retention: Mapping[str, Any] | None,
+    workspace_owner: str,
+) -> str | None:
+    """Validate proposed Management attachments before replay captures a send.
+
+    A returned string is a runtime-generated correction observation for the
+    model, not a client message.  ``None`` accepts the response unchanged.
+    """
+    proposed = str(response_text or "")
+    raw_directives = re.findall(r"(?im)\bMEDIA:\s*([^\s]+)", proposed)
+    if not raw_directives:
+        return None
+
+    expanded = _expand_captured_send(
+        {
+            "send_kind": "text",
+            "chat_id": "validation-only",
+            "content": proposed,
+            "reply_to": None,
+            "workspace_owner": workspace_owner,
+        }
+    )
+    media_sends = [
+        item for item in expanded if item.get("send_kind") == "media"
+    ]
+    refusal: str | None = None
+    if len(media_sends) != len(raw_directives):
+        refusal = "the MEDIA directive is not a supported attachment reference"
+    else:
+        for send in media_sends:
+            try:
+                path = _resolve_captured_media_path(
+                    send.get("path"),
+                    retention,
+                    workspace_owner=workspace_owner,
+                )
+                _validated_captured_media_type(path)
+            except (OSError, MediaRetentionError) as exc:
+                refusal = str(exc)
+                break
+    if refusal is None:
+        return None
+
+    exact_paths = _recent_valid_sandbox_file_paths(
+        messages,
+        workspace_owner=workspace_owner,
+    )
+    if exact_paths:
+        rendered = ", ".join(f"`{path}`" for path in exact_paths)
+        exact_hint = (
+            "The newest usable sandbox result returned these exact "
+            f"files[].path values: {rendered}. Copy the intended value unchanged. "
+        )
+    else:
+        exact_hint = (
+            "Use an exact files[].path value returned by the current sandbox "
+            "result. If no such value is available, explain that the attachment "
+            "could not be sent. "
+        )
+    return (
+        "[Runtime attachment validation — not a client message] The proposed "
+        f"attachment was rejected before sending because {refusal}. "
+        f"{exact_hint}Do not construct or infer a /media/... reference. "
+        "Produce the corrected final response now."
+    )
+
+
+def build_management_attachment_response_validator(
+    *,
+    config_path: Path,
+    workspace_owner: str,
+):
+    """Build the exact pre-send validator used by the Management response loop."""
+    retention = _retention_config(config_path)
+
+    def _validate(
+        response_text: str,
+        messages: Sequence[Mapping[str, Any]],
+    ) -> str | None:
+        return validate_management_attachment_response(
+            response_text,
+            messages,
+            retention=retention,
+            workspace_owner=workspace_owner,
+        )
+
+    return _validate
 
 
 def _captured_provider_error(
@@ -3721,9 +4770,11 @@ def _parse_captured_media(entry: Mapping[str, Any]) -> list[dict[str, Any]]:
             reply_to = args[4]
     if not chat_id:
         return []
+    display_name = None
     if kind == "send_document":
         path = kwargs.get("file_path") or (args[1] if len(args) > 1 else None)
         caption = kwargs.get("caption") or (args[2] if len(args) > 2 else None)
+        display_name = kwargs.get("file_name") or (args[3] if len(args) > 3 else None)
         values = [(path, caption)] if path else []
     elif kind == "send_image_file":
         path = kwargs.get("image_path") or (args[1] if len(args) > 1 else None)
@@ -3755,6 +4806,12 @@ def _parse_captured_media(entry: Mapping[str, Any]) -> list[dict[str, Any]]:
                 "caption": str(caption) if caption else None,
                 "reply_to": str(reply_to) if reply_to else None,
                 "ordinal": ordinal,
+                "workspace_owner": str(entry.get("workspace_owner") or "").strip() or None,
+                **(
+                    {"file_name": display_name}
+                    if isinstance(display_name, str) and display_name
+                    else {}
+                ),
             })
     return parsed
 
@@ -3888,6 +4945,67 @@ async def _management_typing_presence(
             await asyncio.to_thread(_post_typing_presence, chat_id, "paused")
 
 
+def _register_management_document_follow_up(
+    inbox: DurableInbox,
+    document_correlations: Mapping[str, Mapping[str, Any]] | None,
+    *,
+    chat_id: str,
+    anchor: str,
+    explicitly_anchored: bool,
+    delivery_key: str,
+    bridge_message_id: str,
+) -> None:
+    """Bind Christopher's delivered reply to a correlated reply it answers.
+
+    Only a reply whose own reply anchor is the correlated inbound message is
+    registered.  An unanchored reply, or one anchored to anyone else's
+    message in the same batch, never is: a later swipe-reply to it must not
+    be tied to the question.
+
+    A second row, never a change to the reply's own at-most-once claim.  It
+    carries no notice_body and is skipped by the initial-notice lookup, so it
+    never becomes the outbox's quote anchor.  A failure here never affects
+    the delivery itself.
+    """
+    if not explicitly_anchored or not document_correlations or not bridge_message_id:
+        return
+    correlation = document_correlations.get(anchor)
+    if not isinstance(correlation, Mapping):
+        return
+    document_id = str(correlation.get("document_id") or "").strip()
+    entry_id = str(correlation.get("document_entry_id") or "").strip()
+    if not document_id or not entry_id:
+        return
+    key = _management_document_follow_up_delivery_key(
+        entry_id=entry_id, chat_id=chat_id, bridge_message_id=bridge_message_id,
+    )
+    try:
+        if inbox.claim_reply_delivery(
+            key,
+            chat_id=chat_id,
+            reply_to_message_id=anchor,
+            correlation={
+                "document_id": document_id,
+                "entry_id": entry_id,
+                "notice_part": "follow_up",
+                "follow_up_delivery_key": delivery_key,
+                "answers_reply_message_id": str(correlation.get("reply_message_id") or "") or None,
+            },
+        ):
+            inbox.record_reply_delivery(
+                key,
+                status="delivered",
+                bridge_message_id=bridge_message_id,
+                provider_outcome="follow-up-registered",
+            )
+    except Exception as exc:
+        print(
+            "document follow-up registration FAILED (delivery unaffected): "
+            f"chat={chat_id} anchor={anchor} error={exc}",
+            file=sys.stderr,
+        )
+
+
 def deliver_management_replies(
     inbox: DurableInbox,
     *,
@@ -3897,6 +5015,8 @@ def deliver_management_replies(
     gate_changed_at: str,
     handled_groups: Sequence[Mapping[str, Any]],
     continuation: Mapping[str, Any] | None = None,
+    completion: Mapping[str, Any] | None = None,
+    document_correlations: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, int]:
     """Deliver mgmt-selector responses through the rung-gated bridge.
 
@@ -3911,6 +5031,10 @@ def deliver_management_replies(
       no allowlist logic is duplicated here and a bridge refusal is final.
     - at-most-once per turn response: a durable claim precedes the send; a
       failure logs loudly and records undelivered — never retries.
+    - PA-396: a delivered reply anchored to an authenticated quoted reply to
+      a document message is also registered as a follow-up of that document,
+      so a quoted answer to it correlates too.  Replies anchored elsewhere,
+      or not anchored, are never registered.
     """
     from urllib.request import Request, urlopen
     from urllib.error import HTTPError, URLError
@@ -3926,6 +5050,17 @@ def deliver_management_replies(
             str(continuation.get("internal_message_id") or ""),
         ):
             raise ConsumerError("management continuation internal turn identity invalid")
+    if completion is not None:
+        # PA-203 round 2: a background-completion turn replies to the original
+        # request under its own delivery key, so the original turn's earlier
+        # reply to the same message cannot suppress it.  Files may be sent.
+        if set(completion) != {"completion_id", "original_message_id", "internal_message_id"} or not (
+            completion.get("completion_id") and completion.get("original_message_id")
+        ) or str(completion.get("internal_message_id") or "") != (
+            f"background-completion:{completion['completion_id']}"
+        ):
+            raise ConsumerError("background completion delivery identity invalid")
+    anchored = continuation if continuation is not None else completion
 
     summary = {"delivered": 0, "undelivered": 0, "suppressed": 0, "duplicate": 0}
     sends: list[dict[str, Any]] = []
@@ -3965,6 +5100,7 @@ def deliver_management_replies(
             {
                 "response_text": str(send.get("response_text") or "").strip(),
                 "anchor_item": dict(anchor_item),
+                "failure_note": str(send.get("failure_note") or "").strip(),
             },
         )
         if not entry.get("response_text") and send.get("response_text"):
@@ -3979,8 +5115,8 @@ def deliver_management_replies(
             summary["suppressed"] += 1
             continue
         anchor = send["reply_to"] or newest_message_by_chat.get(chat_id)
-        if continuation is not None:
-            anchor = str(continuation["original_message_id"])
+        if anchored is not None:
+            anchor = str(anchored["original_message_id"])
         if anchor and "+" in str(anchor) and anchor not in handled_message_ids:
             # A multi-message WhatsApp turn bundle carries a synthetic
             # composite id ("id1+id2+..."; platforms/whatsapp.py join). The
@@ -4002,8 +5138,8 @@ def deliver_management_replies(
             anchor_item.get("timestamp") if anchor_item else None
         )
         handled_anchor = (
-            str(continuation["internal_message_id"])
-            if continuation is not None and continuation.get("internal_message_id")
+            str(anchored["internal_message_id"])
+            if anchored is not None and anchored.get("internal_message_id")
             else anchor
         )
         if (
@@ -4012,7 +5148,7 @@ def deliver_management_replies(
             or anchor_record is None
             or anchor_record.chat_id != chat_id
             or anchor_epoch is None
-            or (continuation is None and anchor_epoch < gate_epoch)
+            or (anchored is None and anchor_epoch < gate_epoch)
         ):
             summary["suppressed"] += 1
             continue
@@ -4024,17 +5160,63 @@ def deliver_management_replies(
         # again.  ``anchor`` is the source-native messageId, not replay-1.
         if send.get("send_kind", "text") == "media":
             retention = _retention_config(config_path)
-            if retention is None:
-                summary["suppressed"] += 1
-                continue
             try:
-                media_path = _resolve_captured_media_path(send["path"], retention)
+                media_path = _resolve_captured_media_path(
+                    send["path"],
+                    retention,
+                    workspace_owner=send.get("workspace_owner"),
+                    for_delivery=True,
+                )
                 media_type, media_mime, media_file_name = (
                     _validated_captured_media_type(media_path)
                 )
+                if media_type == "document":
+                    media_file_name = _captured_document_display_name(
+                        send, media_path
+                    )
                 media_identity = hashlib.sha256(media_path.read_bytes()).hexdigest()
-            except (OSError, MediaRetentionError):
-                summary["suppressed"] += 1
+            except (OSError, MediaRetentionError) as exc:
+                requested_reference = str(send.get("path") or "")
+                if not requested_reference.startswith(
+                    ("work/", "/work/", "records/", "/records/")
+                ):
+                    summary["suppressed"] += 1
+                    continue
+                refusal_identity = json.dumps(
+                    {
+                        "chat_id": chat_id,
+                        "anchor": str(anchor),
+                        "ordinal": int(send.get("ordinal") or 0),
+                        "requested_reference": requested_reference,
+                        "workspace_owner": str(send.get("workspace_owner") or ""),
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                refusal_digest = hashlib.sha256(refusal_identity.encode()).hexdigest()
+                delivery_key = f"media-refused::{chat_id}::{anchor}::{refusal_digest}"
+                if completion is not None:
+                    delivery_key = f"completion::{completion['completion_id']}::{delivery_key}"
+                if not inbox.claim_reply_delivery(
+                    delivery_key,
+                    chat_id=chat_id,
+                    reply_to_message_id=anchor,
+                ):
+                    summary["duplicate"] += 1
+                    continue
+                inbox.record_reply_delivery(
+                    delivery_key,
+                    status="undelivered",
+                    error=f"sandbox attachment refused: {exc}"[:300],
+                )
+                summary["undelivered"] += 1
+                failed_send = dict(send)
+                failed_send["failure_note"] = (
+                    "I couldn't send the attachment. Use the exact files[].path "
+                    "returned by the sandbox, or an existing /media/... reference."
+                )
+                note_media_failure(failed_send, chat_id, str(anchor), anchor_item)
                 continue
             delivery_key = (
                 f"media::{chat_id}::{anchor}::{media_identity}::{send['ordinal']}"
@@ -4043,9 +5225,11 @@ def deliver_management_replies(
             delivery_key = f"{chat_id}::{anchor or 'no-anchor'}"
         if continuation is not None:
             delivery_key = f"continuation::{continuation['list_id']}::{delivery_key}"
+        elif completion is not None:
+            delivery_key = f"completion::{completion['completion_id']}::{delivery_key}"
         if not inbox.claim_reply_delivery(
             delivery_key, chat_id=chat_id, reply_to_message_id=anchor,
-            **({"correlation": dict(continuation)} if continuation is not None else {}),
+            **({"correlation": dict(anchored)} if anchored is not None else {}),
         ):
             summary["duplicate"] += 1
             continue
@@ -4107,6 +5291,33 @@ def deliver_management_replies(
                     provider_outcome=str(payload.get("outcome") or "delivered"),
                 )
                 summary["delivered"] += 1
+                _register_management_document_follow_up(
+                    inbox,
+                    document_correlations,
+                    chat_id=chat_id,
+                    anchor=str(anchor),
+                    # The reply's own anchor, exactly: a bundle's composite
+                    # "id1+id2" resolved to its newest component is the
+                    # runtime's choice, not Christopher's, and never counts.
+                    explicitly_anchored=bool(send.get("reply_to"))
+                    and str(send.get("reply_to")) == str(anchor),
+                    delivery_key=delivery_key,
+                    bridge_message_id=str(payload.get("messageId") or ""),
+                )
+                if send.get("send_kind", "text") == "media":
+                    # Off the delivery loop: keeping the file waits for the
+                    # workspace lock, which a sandbox run holds while it runs.
+                    threading.Thread(
+                        target=_keep_sent_file_in_workspace,
+                        args=(media_path,),
+                        kwargs={
+                            "chat_id": chat_id,
+                            "message_id": str(payload.get("messageId") or ""),
+                            "display_name": media_file_name or "",
+                        },
+                        name="pa203-keep-sent-file",
+                        daemon=True,
+                    ).start()
                 if send.get("send_kind", "text") == "media" and send.get("caption"):
                     media_caption_delivered.add((chat_id, str(anchor)))
             else:
@@ -4164,13 +5375,19 @@ def deliver_management_replies(
     # neither the attachment nor fallback is retried after an uncertain outcome.
     for (chat_id, anchor), failure in media_failures.items():
         fallback_key = f"media-fallback::{chat_id}::{anchor}"
+        if completion is not None:
+            # A completion's fallback must not collide with the original
+            # turn's fallback for the same message (integration finding 5).
+            fallback_key = f"completion::{completion['completion_id']}::{fallback_key}"
         if not inbox.claim_reply_delivery(
             fallback_key, chat_id=chat_id, reply_to_message_id=anchor
         ):
             summary["duplicate"] += 1
             continue
         answer = str(failure.get("response_text") or "").strip()
-        note = "I couldn't send one or more of the selected images."
+        note = str(failure.get("failure_note") or "").strip() or (
+            "I couldn't send one or more of the selected images."
+        )
         if (chat_id, anchor) in media_caption_delivered:
             message = note
         else:
@@ -4462,7 +5679,7 @@ async def _run_management_document_turn(
             bypass_auth=True,
             live_business_writes=False,
             source_path="tgg-management-document-event",
-            replay_namespace=f"agent:live-drain:persistent-chat:{provider}:{model}",
+            replay_namespace=persistent_chat_namespace(),
         )
     )
     captured = [dict(item) for item in result.outbound if isinstance(item, Mapping)]
@@ -4753,7 +5970,7 @@ def _pa75_capture_receipt(
     receipt_key = hashlib.sha256(
         (json.dumps(identity, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode()
     ).hexdigest()
-    provider, model = configured_engine(config_path)
+    provider, model = configured_chat_engine(config_path, records[0].chat_id)
     receipt = {
         "contract": "tgg-pa75-capture-mutation-receipt/v1",
         "receipt_key_sha256": receipt_key,
@@ -4854,8 +6071,43 @@ async def process_management_document_canary_event(
     }
 
 
+def _loaded_catalog_status() -> Mapping[str, Any]:
+    """What this process has actually loaded: plugins and registered tools.
+
+    Read-only view of the in-process plugin manager and tool registry, so a
+    release readback can check the running service rather than a fresh
+    process.  It never triggers plugin discovery itself.
+    """
+    try:
+        from hermes_cli.plugins import get_plugin_manager
+        from tools.registry import registry
+
+        manager = get_plugin_manager()
+        return {
+            "pid": os.getpid(),
+            "plugins_discovered": bool(getattr(manager, "_discovered", False)),
+            "plugins": sorted(
+                name
+                for name, plugin in getattr(manager, "_plugins", {}).items()
+                if getattr(plugin, "enabled", False)
+            ),
+            "tools": sorted(getattr(registry, "_tools", {})),
+        }
+    except Exception as exc:  # status must never fail the consumer
+        return {"pid": os.getpid(), "error": f"{type(exc).__name__}: {exc}"[:300]}
+
+
 def _write_status(path: Path, payload: Mapping[str, Any]) -> None:
-    _atomic_write_json(path, {"version": 1, "updated_at": _utc_now(), **dict(payload)})
+    _atomic_write_json(
+        path,
+        {
+            "version": 1,
+            "updated_at": _utc_now(),
+            **dict(payload),
+            "loaded_catalog": _loaded_catalog_status(),
+            **_photo_fill_status(),
+        },
+    )
 
 
 def _management_continuation_status(
@@ -4954,6 +6206,582 @@ async def run_management_document_canary(args: argparse.Namespace) -> int:
     return 0
 
 
+# PA-396: one operator-approved Management question for one human-resolution
+# record.  No model turn, no outbox poll and no cursor movement: the operator
+# supplies the exact approved wording and the destination, and the send is
+# registered as the record's initial notice so the existing quoted-reply
+# correlation recognises the answer.
+MANAGEMENT_QUESTION_CONTRACT = "tgg-management-question-send/v1"
+_MANAGEMENT_QUESTION_USER_AGENT = "christopher-hermes/management-question"
+
+
+@dataclass(frozen=True)
+class ManagementQuestionSource:
+    """Explicit Systems read for one record; never the outbox drain's env."""
+
+    api_url: str
+    token_env: str
+    tenant: str | None = None
+
+
+@dataclass(frozen=True)
+class ManagementQuestionPhoto:
+    path: Path
+    digest: str
+    mime: str
+    message_id: str = ""
+    media_ordinal: int | None = None
+    sender_id: str | None = None
+    sent_at: str | None = None
+
+
+def _management_question_document(
+    source: ManagementQuestionSource, record_id: str
+) -> dict[str, Any]:
+    """Read one record's human-resolution document through the operator API."""
+    from urllib.error import HTTPError, URLError
+    from urllib.parse import quote
+    from urllib.request import Request, urlopen
+
+    token = os.environ.get(source.token_env, "").strip()
+    if not token:
+        raise ConsumerError("management question service token is absent")
+    headers = {
+        "Accept": "application/json",
+        "Authorization": f"Bearer {token}",
+        "User-Agent": _MANAGEMENT_QUESTION_USER_AGENT,
+    }
+    if source.tenant:
+        headers["X-PS-Tenant"] = source.tenant
+    request = Request(
+        f"{source.api_url}/api/operator/human-resolution-documents/{quote(record_id, safe='')}",
+        headers=headers,
+        method="GET",
+    )
+    try:
+        with urlopen(request, timeout=30) as response:
+            status_code = int(getattr(response, "status", 0) or 0)
+            payload = json.loads(response.read() or b"{}")
+    except HTTPError as exc:
+        if exc.code == 404:
+            raise ConsumerError(f"human-resolution record not found: {record_id}") from exc
+        raise ConsumerError(f"human-resolution record read HTTP {exc.code}") from exc
+    except (URLError, TimeoutError, OSError, ValueError) as exc:
+        raise ConsumerError(f"human-resolution record read failed: {exc}") from exc
+    if status_code != 200 or not isinstance(payload, Mapping):
+        raise ConsumerError("human-resolution record read returned an invalid envelope")
+    data = payload.get("data", payload)
+    if not isinstance(data, Mapping) or data.get("contract") != "tgg-human-resolution-document-entry/v1":
+        raise ConsumerError("human-resolution record read returned the wrong contract")
+    document = data.get("document")
+    record = document.get("record") if isinstance(document, Mapping) else None
+    if not isinstance(record, Mapping) or str(record.get("id") or "") != record_id:
+        raise ConsumerError("human-resolution record read returned a different record")
+    if not isinstance(document.get("entries"), list):
+        raise ConsumerError("human-resolution record read has no entry list")
+    return dict(document)
+
+
+def _management_question_initial_entry_id(document: Mapping[str, Any], record_id: str) -> str:
+    """The record's own initial outbox entry is the notice's entry identity.
+
+    Using the real Systems entry (not a synthetic one) means the dormant
+    outbox drain, if ever enabled, sees this destination as already notified
+    for that entry, and later lifecycle entries quote this notice.
+    """
+    for entry in document.get("entries") or []:
+        if (
+            isinstance(entry, Mapping)
+            and str(entry.get("entryKind") or "") == "initial_default"
+            and str(entry.get("recordId") or record_id) == record_id
+            and str(entry.get("id") or "").strip()
+        ):
+            return str(entry["id"]).strip()
+    raise ConsumerError(
+        f"human-resolution record has no initial document entry: {record_id}"
+    )
+
+
+def _management_question_prior_delivery(
+    inbox: DurableInbox, *, chat_id: str, record_id: str, entry_id: str
+) -> str | None:
+    """Any earlier notice, claim or question photo for this record and chat."""
+    status = inbox.management_document_delivery_status(entry_id=entry_id, chat_id=chat_id)
+    if status is not None:
+        return f"{entry_id}:{status}"
+    with inbox.connect() as conn:
+        rows = conn.execute(
+            "SELECT delivery_key,status,correlation_json FROM reply_deliveries "
+            "WHERE chat_id=? AND delivery_key GLOB 'human-resolution:*' "
+            "ORDER BY created_at,delivery_key",
+            (chat_id,),
+        ).fetchall()
+    for row in rows:
+        try:
+            correlation = json.loads(row["correlation_json"] or "{}")
+        except (TypeError, ValueError):
+            continue
+        if isinstance(correlation, Mapping) and str(correlation.get("document_id") or "") == record_id:
+            return f"{row['delivery_key']}:{row['status']}"
+    return None
+
+
+def _management_question_resolve(
+    command: Sequence[str], *, digest: str, mime: str, local_paths: Sequence[Path]
+) -> Path:
+    """Call the configured media resolver (local, cache or archive) once."""
+    import subprocess
+
+    request = {
+        "operation": "resolve",
+        "digest": digest,
+        "expectedMime": mime,
+        "localPaths": [str(path) for path in local_paths],
+        "purpose": "christopher_attachment_retrieval",
+    }
+    try:
+        completed = subprocess.run(
+            list(command), input=json.dumps(request), text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ConsumerError(f"media resolver failed for {digest[:12]}: {exc}") from exc
+    try:
+        result = json.loads(completed.stdout or "{}")
+    except ValueError as exc:
+        raise ConsumerError(f"media resolver response is invalid for {digest[:12]}") from exc
+    if completed.returncode != 0 or not isinstance(result, Mapping) or result.get("ok") is not True:
+        code = result.get("code") if isinstance(result, Mapping) else None
+        raise ConsumerError(f"media resolver could not supply {digest[:12]}: {code or 'unavailable'}")
+    try:
+        return Path(str(result.get("path") or "")).resolve(strict=True)
+    except OSError as exc:
+        raise ConsumerError(f"media resolver path is unavailable for {digest[:12]}") from exc
+
+
+def _management_question_photos(
+    document: Mapping[str, Any],
+    *,
+    config_path: Path,
+    resolver_command: Sequence[str] | None,
+) -> list[ManagementQuestionPhoto]:
+    """The record's cited, available image evidence as bridge-readable files.
+
+    Every file is digest-verified and ends inside the retained-media root,
+    which is the only place ordinary media replies are sent from.  A cited
+    image that cannot be supplied refuses the whole send before any claim.
+    """
+    record = document["record"]
+    media = record.get("evidenceMedia")
+    if media is None:
+        media = (record.get("citedSnapshot") or {}).get("media") or []
+    if not isinstance(media, list):
+        raise ConsumerError("human-resolution record evidence media is invalid")
+    messages = {
+        str(message.get("messageId") or ""): message
+        for message in (record.get("evidenceMessages") or (record.get("citedSnapshot") or {}).get("messages") or [])
+        if isinstance(message, Mapping)
+    }
+    wanted: list[tuple[str, str, str, Mapping[str, Any]]] = []
+    seen: set[str] = set()
+    for item in media:
+        if not isinstance(item, Mapping) or item.get("availability") != "available":
+            continue
+        mime = str(item.get("mime") or "").split(";", 1)[0].strip().lower()
+        if not mime.startswith("image/"):
+            continue
+        digest = str(item.get("digest") or "").strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise ConsumerError("human-resolution evidence image has no valid digest")
+        if digest in seen:
+            continue
+        seen.add(digest)
+        source_media = item.get("sourceMedia")
+        ref = str(
+            item.get("retrievalUrl")
+            or (source_media.get("ref") if isinstance(source_media, Mapping) else "")
+            or ""
+        ).strip()
+        wanted.append((digest, mime, ref, item))
+    if not wanted:
+        return []
+    retention = _retention_config(config_path)
+    if retention is None:
+        raise ConsumerError("retained media is not configured; evidence images cannot be sent")
+    root = Path(retention["root"])
+    prefix = f"{retention['ref_prefix']}/"
+    photos: list[ManagementQuestionPhoto] = []
+    for digest, mime, ref, item in wanted:
+        local: Path | None = None
+        if ref.startswith(prefix):
+            basename = ref[len(prefix):]
+            if basename and Path(basename).name == basename and basename not in {".", ".."}:
+                local = root / basename
+        source: Path | None = None
+        if local is not None and local.is_file() and hashlib.sha256(local.read_bytes()).hexdigest() == digest:
+            source = local.resolve()
+        elif resolver_command:
+            source = _management_question_resolve(
+                resolver_command, digest=digest, mime=mime,
+                local_paths=[local] if local is not None else [],
+            )
+        if source is None:
+            raise ConsumerError(f"evidence image {digest[:12]} is not available locally and no resolver is configured")
+        if hashlib.sha256(source.read_bytes()).hexdigest() != digest:
+            raise ConsumerError(f"evidence image {digest[:12]} digest does not match")
+        try:
+            detected_mime, ext = _validated_image_type(source, mime)
+        except MediaRetentionError as exc:
+            raise ConsumerError(f"evidence image {digest[:12]} is not a valid image: {exc}") from exc
+        if not source.is_relative_to(root):
+            # Same contained name the evidence plugin uses for inspection
+            # copies, so an existing copy is reused, never duplicated.
+            target = root / f"wa-evidence-{digest[:24]}.{ext}"
+            if target.exists():
+                if hashlib.sha256(target.read_bytes()).hexdigest() != digest:
+                    raise ConsumerError(f"retained copy of {digest[:12]} diverges")
+            else:
+                temporary = root / f".{target.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp"
+                try:
+                    shutil.copyfile(source, temporary)
+                    if hashlib.sha256(temporary.read_bytes()).hexdigest() != digest:
+                        raise ConsumerError(f"retained copy of {digest[:12]} diverges")
+                    os.chmod(temporary, 0o640)
+                    os.replace(temporary, target)
+                finally:
+                    temporary.unlink(missing_ok=True)
+            source = target
+        message_id = str(item.get("messageId") or "")
+        message = messages.get(message_id) or {}
+        try:
+            media_ordinal: int | None = int(item.get("ordinal"))
+        except (TypeError, ValueError):
+            media_ordinal = None
+        photos.append(ManagementQuestionPhoto(
+            path=source, digest=digest, mime=detected_mime,
+            message_id=message_id,
+            media_ordinal=media_ordinal,
+            sender_id=str(message.get("senderId") or "") or None,
+            sent_at=str(message.get("sgt") or message.get("timestamp") or "") or None,
+        ))
+    return photos
+
+
+def _management_question_bridge_post(
+    bridge_url: str, endpoint: str, payload: Mapping[str, Any]
+) -> dict[str, Any]:
+    """One strict bridge attempt; only HTTP 200 + success is delivered."""
+    from urllib.error import HTTPError, URLError
+    from urllib.request import Request, urlopen
+
+    request = Request(
+        f"{bridge_url}/{endpoint}",
+        data=json.dumps(dict(payload)).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=60) as response:
+            status_code = int(getattr(response, "status", 0) or 0)
+            body = json.loads(response.read() or b"{}")
+    except HTTPError as exc:
+        return {"status": "undelivered", "error": f"http-{exc.code}"}
+    except (URLError, TimeoutError, OSError, ValueError) as exc:
+        return {"status": "undelivered", "error": str(exc)[:300]}
+    if status_code == 200 and isinstance(body, Mapping) and body.get("success") is True:
+        message_id = str(body.get("messageId") or "").strip()
+        return {
+            "status": "delivered",
+            "bridge_message_id": message_id or None,
+            "provider_outcome": str(body.get("outcome") or "delivered"),
+        }
+    outcome = body.get("outcome") if isinstance(body, Mapping) else None
+    return {
+        "status": "undelivered",
+        "provider_outcome": str(outcome or "unconfirmed"),
+        "error": f"http-{status_code}-unconfirmed: {json.dumps(body)[:200]}",
+    }
+
+
+def prepare_management_question(
+    inbox: DurableInbox,
+    *,
+    config_path: Path,
+    record_id: str,
+    chat_id: str,
+    question_text: str,
+    source: ManagementQuestionSource,
+    resolver_command: Sequence[str] | None = None,
+) -> dict[str, Any]:
+    """Read one record, run every refusal and stage its photos; send nothing.
+
+    PA-396 (Teren, Telegram 109): every outbound is Christopher acting on a
+    trigger, so this no longer posts.  The operator command enqueues a
+    trigger with the result; the live consumer runs his turn and posts
+    through ``deliver_management_question`` only after checking it.
+    """
+    record_id = str(record_id or "").strip()
+    chat_id = str(chat_id or "").strip()
+    text = str(question_text or "").strip()
+    if not record_id:
+        raise ConsumerError("management question requires a record id")
+    if not text:
+        raise ConsumerError("management question text is empty")
+    if chat_id not in _management_selector_chats(config_path):
+        raise ConsumerError(
+            "management question destination is not a WhatsApp management selector"
+        )
+    document = _management_question_document(source, record_id)
+    entry_id = _management_question_initial_entry_id(document, record_id)
+    prior = _management_question_prior_delivery(
+        inbox, chat_id=chat_id, record_id=record_id, entry_id=entry_id,
+    )
+    if prior is not None:
+        raise ConsumerError(
+            f"record {record_id} already has a delivery in {chat_id} ({prior}); refusing to send again"
+        )
+    photos = _management_question_photos(
+        document, config_path=config_path, resolver_command=resolver_command,
+    )
+    receipt: dict[str, Any] = {
+        "contract": MANAGEMENT_QUESTION_CONTRACT,
+        "record_id": record_id,
+        "entry_id": entry_id,
+        "destination_chat_id": chat_id,
+        "question_sha256": hashlib.sha256(text.encode()).hexdigest(),
+        "photo_digests": [photo.digest for photo in photos],
+        # Posted in this order; the record does not say which image is whose
+        # (complaint screenshot or worker photo), so the record's own cited
+        # order is kept and shown here for the operator to read.
+        "photo_order": "record_evidence_order",
+        "photos_planned": [
+            {
+                "send_order": order,
+                "carries_caption": order == 0,
+                "message_id": photo.message_id or None,
+                "media_ordinal": photo.media_ordinal,
+                "mime": photo.mime,
+                "sender_id": photo.sender_id,
+                "sent_at": photo.sent_at,
+                "digest": photo.digest,
+            }
+            for order, photo in enumerate(photos)
+        ],
+    }
+    return {
+        "record_id": record_id,
+        "entry_id": entry_id,
+        "chat_id": chat_id,
+        "text": text,
+        "photos": photos,
+        "receipt": receipt,
+    }
+
+
+def deliver_management_question(
+    inbox: DurableInbox,
+    *,
+    chat_id: str,
+    record_id: str,
+    entry_id: str,
+    text: str,
+    photos: Sequence[ManagementQuestionPhoto],
+    bridge_url: str | None = None,
+) -> dict[str, Any]:
+    """Post a checked question once and register it as the record's notice.
+
+    The first message carries the question (as the first photo's caption, or
+    as plain text when there are no photos).  Its bridge message id is stored
+    as the record's initial notice under the same delivery key and
+    correlation shape the outbox notice uses, so a quoted reply to it
+    correlates to the record.  The notice is claimed before the post.
+    Remaining photos follow uncaptioned only after the question is confirmed,
+    each registered as a photo of that notice under its own at-most-once key.
+    The outbox cursor is never read or moved.
+    """
+    bridge = (bridge_url or os.environ.get("TGG_REPLY_BRIDGE_URL", "http://127.0.0.1:3011")).rstrip("/")
+    key = _management_document_delivery_key(entry_id=entry_id, chat_id=chat_id)
+    correlation = {
+        "document_id": record_id,
+        "entry_id": entry_id,
+        "entry_kind": "initial_default",
+        "notice_role": "initial_notice",
+        "notice_body": text,
+        "notice_source": "christopher_trigger_turn",
+        "photo_count": len(photos),
+    }
+    if not inbox.claim_reply_delivery(
+        key, chat_id=chat_id, reply_to_message_id=None, correlation=correlation,
+    ):
+        raise ConsumerError(f"record {record_id} notice was claimed concurrently; refusing to send")
+    if photos:
+        first = photos[0]
+        endpoint, payload = "send-media", {
+            "chatId": chat_id, "filePath": str(first.path), "mediaType": "image", "caption": text,
+        }
+    else:
+        endpoint, payload = "send", {"chatId": chat_id, "message": text}
+    outcome = _management_question_bridge_post(bridge, endpoint, payload)
+    inbox.record_reply_delivery(
+        key,
+        status=outcome["status"],
+        bridge_message_id=outcome.get("bridge_message_id"),
+        provider_outcome=outcome.get("provider_outcome"),
+        error=outcome.get("error"),
+    )
+    result: dict[str, Any] = {
+        "notice": {
+            "delivery_key": key,
+            "endpoint": endpoint,
+            "status": outcome["status"],
+            "message_id": outcome.get("bridge_message_id"),
+        },
+        "photos": [],
+    }
+    if outcome["status"] != "delivered":
+        # The question did not certainly arrive; never follow it with
+        # orphan photos.  The claim stays consumed: no automatic resend.
+        return result
+    for ordinal, photo in enumerate(photos[1:], start=1):
+        photo_key = _management_document_photo_delivery_key(
+            entry_id=entry_id, chat_id=chat_id, ordinal=ordinal,
+        )
+        photo_correlation = {
+            "document_id": record_id,
+            "entry_id": entry_id,
+            "entry_kind": "initial_default",
+            "notice_role": "initial_notice",
+            # A photo of the notice, never its anchor: no notice_body, and the
+            # initial-notice lookup skips notice_part=photo explicitly.
+            "notice_part": "photo",
+            "notice_delivery_key": key,
+            "photo_ordinal": ordinal,
+            "photo_digest": photo.digest,
+        }
+        if not inbox.claim_reply_delivery(
+            photo_key, chat_id=chat_id, reply_to_message_id=None,
+            correlation=photo_correlation,
+        ):
+            result["photos"].append({"ordinal": ordinal, "status": "duplicate"})
+            continue
+        photo_outcome = _management_question_bridge_post(bridge, "send-media", {
+            "chatId": chat_id, "filePath": str(photo.path), "mediaType": "image",
+        })
+        inbox.record_reply_delivery(
+            photo_key,
+            status=photo_outcome["status"],
+            bridge_message_id=photo_outcome.get("bridge_message_id"),
+            provider_outcome=photo_outcome.get("provider_outcome"),
+            error=photo_outcome.get("error"),
+        )
+        result["photos"].append({
+            "ordinal": ordinal,
+            "status": photo_outcome["status"],
+            "message_id": photo_outcome.get("bridge_message_id"),
+        })
+    return result
+
+
+def run_management_question_send(args: argparse.Namespace) -> int:
+    """CLI: stage one record's question and enqueue Christopher's trigger.
+
+    Nothing is posted by this process.  The live consumer runs his turn in
+    that chat's lane and posts only a turn that passes the check.
+    """
+    import shlex
+
+    from gateway import management_question_trigger as trigger
+    from hermes_state import SessionDB
+
+    api_url = str(args.systems_url or os.environ.get("TGG_MANAGEMENT_QUESTION_API_URL", "")).strip().rstrip("/")
+    if not api_url.startswith(("http://", "https://")):
+        raise ConsumerError("management question needs --systems-url (HTTP(S))")
+    tenant = str(args.tenant or os.environ.get("TGG_MANAGEMENT_QUESTION_TENANT", "")).strip() or None
+    try:
+        question = Path(args.question_file).read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ConsumerError(f"cannot read approved question file: {args.question_file}") from exc
+    resolver_value = str(
+        args.media_resolver_command
+        if args.media_resolver_command is not None
+        else os.environ.get("TGG_MEDIA_RESOLVER_COMMAND", "")
+    ).strip()
+    resolver = tuple(shlex.split(resolver_value)) if resolver_value else None
+    inbox = DurableInbox(Path(args.inbox).resolve())
+    config_path = Path(args.config).resolve()
+    state_db = Path(args.state_db).resolve() if args.state_db else config_path.parent / "state.db"
+    session_db = SessionDB(db_path=state_db)
+    try:
+        result = trigger.enqueue_management_question_trigger(
+            inbox,
+            session_db,
+            config_path=config_path,
+            record_id=args.record_id,
+            chat_id=args.chat_id,
+            question_text=question,
+            source=ManagementQuestionSource(api_url=api_url, token_env=args.token_env, tenant=tenant),
+            resolver_command=resolver,
+            receipt_path=Path(args.receipt) if args.receipt else None,
+            retry_after_failed=bool(args.retry_after_failed_trigger),
+            check_only=bool(args.check),
+        )
+    finally:
+        with contextlib.suppress(Exception):
+            session_db.close()
+    result["check_only"] = bool(args.check)
+    print(json.dumps(result, sort_keys=True))
+    return 0
+
+
+async def _process_claimed_management_question_trigger(
+    *,
+    row: Mapping[str, Any],
+    session_db: Any,
+    inbox: DurableInbox,
+    config_path: Path,
+    state_db: Path,
+    runner: Any,
+    activity_lock_file: Path | None,
+) -> None:
+    """Run one PA-396 trigger row in its chat lane of this live process."""
+    from gateway import management_question_trigger as trigger
+
+    with SharedActivityLock(activity_lock_file):
+        mailbox_id = str(row.get("id") or "")
+        claimed = False
+        try:
+            claimed = session_db.claim_session_mailbox(
+                mailbox_id, include_body_contract=trigger.CONTRACT,
+            )
+            if not claimed:
+                return
+            receipt = await trigger.process_claimed_question_trigger(
+                row=row, inbox=inbox, config_path=config_path,
+                state_db=state_db, runner=runner,
+            )
+            trigger.finish_trigger(session_db, row, receipt)
+            print(
+                f"management question trigger {mailbox_id}: {receipt.get('outcome')}",
+                file=sys.stderr,
+            )
+        except asyncio.CancelledError:
+            if claimed:
+                session_db.fail_session_mailbox(
+                    mailbox_id, "QUESTION_TRIGGER_CANCELLED_OUTCOME_UNKNOWN"
+                )
+            raise
+        except Exception as exc:
+            # Any failure after the claim is terminal: an uncertain model or
+            # bridge outcome is never replayed.
+            if claimed:
+                session_db.fail_session_mailbox(mailbox_id, str(exc) or type(exc).__name__)
+                trigger.write_receipt(row, {
+                    "contract": trigger.CONTRACT, "mailbox_id": mailbox_id,
+                    "outcome": "error", "reason": f"{type(exc).__name__}: {exc}"[:500],
+                })
+            print(f"management question trigger FAILED: {exc}", file=sys.stderr)
+
+
 async def _process_claimed_chat_batch_unlocked(
     inbox: DurableInbox,
     records: Sequence[InboxRecord],
@@ -4969,25 +6797,56 @@ async def _process_claimed_chat_batch_unlocked(
     steering_poll_seconds: float = 0.5,
     steering_batch_size: int = 25,
     persistent_session: bool = True,
-) -> None:
-    """Claim and process exactly one chat batch through the shared runner."""
+) -> list[InboxRecord]:
+    """Claim and process exactly one chat batch through the shared runner.
+
+    Returns the records of this batch that the gateway steered into an already
+    running turn (PA-611).  They are left in ``processing`` for the caller that
+    owns that running turn, which credits them with its turn id when it
+    finishes; the return is empty for an ordinary batch.
+    """
     if not records:
-        return
+        return []
     chat_ids = {record.chat_id for record in records}
     if len(chat_ids) != 1:
         raise ConsumerError(f"scheduler produced a mixed-chat batch: {sorted(chat_ids)}")
     inbox.claim(records)
-    if direct_trigger_required and not any(
-        _priority_direct_trigger(record, config_path) for record in records
+    # PA-429: the mention gate decides on live rows only, so a history-sync
+    # row that carries a trigger can never admit a live row that did not.
+    live = [record for record in records if not _is_history_sync_record(record)]
+    if live and direct_trigger_required and not any(
+        _priority_direct_trigger(record, config_path) for record in live
     ):
         # Retain the reason: a consumed-no-turn row must not look like an
         # unexplained model failure during nightly recovery.
+        # The row becomes terminal, so it gets its retention attempt first:
+        # the capture lane retries only terminal rows that have had one
+        # (PA-203).  There is no turn here to delay.
+        claim_retention = _start_claim_path_retention(
+            inbox,
+            [inbox.with_retention_view(record) for record in live],
+            config_path=config_path,
+        )
+        try:
+            await _settle_claim_path_retention(
+                inbox, claim_retention, config_path=config_path
+            )
+        except asyncio.CancelledError:
+            inbox.requeue(records, reason="graceful-cancellation")
+            raise
         inbox.finish(
-            records,
+            live,
             status="skipped",
             error="PRIORITY_DIRECT_TRIGGER_NOT_RECOGNIZED",
         )
-        return
+        # History rows in the same batch still go on to be projected and skipped.
+        records = [record for record in records if _is_history_sync_record(record)]
+        if not records:
+            return []
+    claim_retention: _ClaimPathRetention | None = None
+    history_retention: _ClaimPathRetention | None = None
+    # PA-611: records of later batches that were steered into this batch's turn.
+    steered_records: list[InboxRecord] = []
     try:
         context_records: tuple[Any, ...] = ()
         if (
@@ -5005,24 +6864,35 @@ async def _process_claimed_chat_batch_unlocked(
                 previous_skipped_context,
             )
 
-            context_records = previous_skipped_context(
-                inbox_db=inbox.db_path,
-                state_db=state_db,
-                current_records=records,
-                limit=steering_batch_size,
+            # Context rows get the same retention view as the claimed rows, so
+            # a missing or failed file carries the same warning (PA-203).
+            context_records = tuple(
+                inbox.with_retention_view(record)
+                for record in previous_skipped_context(
+                    inbox_db=inbox.db_path,
+                    state_db=state_db,
+                    current_records=records,
+                    limit=steering_batch_size,
+                )
             )
+        # PA-203: retention never gates or delays the turn.  The turn reads
+        # each attachment from capture.  Its retention state is re-read
+        # locally (no Systems call), so a retained-copy line, a quarantine
+        # warning or a missing-file warning reflects the latest attempt.
+        # Rows nobody has attempted get one best-effort attempt beside the
+        # turn; see _start_claim_path_retention.
+        records = [inbox.with_retention_view(record) for record in records]
         replay_records = (*context_records, *records)
-        # Capture-lane retention normally terminals while the row is pending.
-        # This claimed-chat path remains the idempotent safety net: Hermes sees
-        # either retained media, an explicit permanent refusal, or an explicit
-        # quarantine warning; it never silently assumes attachment contents.
-        for record in records:
-            await asyncio.to_thread(
-                ensure_record_media_retained,
-                inbox,
-                record,
-                config_path=config_path,
-            )
+        history = [record for record in records if _is_history_sync_record(record)]
+        live = [record for record in records if not _is_history_sync_record(record)]
+        # Separate attempts: the history rows' settle below must not wait on
+        # the live rows' media copy, which never delays the live turn.
+        claim_retention = _start_claim_path_retention(
+            inbox, live, config_path=config_path
+        )
+        history_retention = _start_claim_path_retention(
+            inbox, history, config_path=config_path
+        )
         # Systems validates business-write citations against bridge_message_log.
         # Project the exact claimed source rows before Hermes can run the model
         # and emit a business write.  The shared helper preserves the bounded
@@ -5047,6 +6917,21 @@ async def _process_claimed_chat_batch_unlocked(
             raise SourceEvidenceProjectionError(
                 f"source-evidence-projection-held: {exc}"
             ) from exc
+        # PA-429: WhatsApp resends history after a re-pair.  Its source
+        # evidence is projected above; it is never a live message, so it starts
+        # no turn and gets no reply.  The guard covers every chat: production
+        # finishes no real site-chat rows in this consumer.
+        if history:
+            # Terminal rows get their retention attempt first (PA-203).
+            await _settle_claim_path_retention(
+                inbox, history_retention, config_path=config_path
+            )
+            inbox.finish(
+                history, status="skipped", error=HISTORY_SYNC_REPLAY_NOT_LIVE
+            )
+            records = live
+            if not records:
+                return []
         # A reply quote can deterministically locate one of Christopher's own
         # prior document notices.  The metadata is only supplied to the model
         # turn; the capture event remains the same source record and ordinary
@@ -5056,6 +6941,12 @@ async def _process_claimed_chat_batch_unlocked(
             for record in records
             if record.chat_id in _management_selector_chats(config_path)
             if (correlation := inbox.management_document_correlation(record)) is not None
+        }
+        management_open_question_candidates = {
+            record.message_id: candidates
+            for record in records
+            if record.chat_id in _management_selector_chats(config_path)
+            if (candidates := inbox.management_open_question_candidates(record)) is not None
         }
         capture_canary_reply = _pa75_capture_reply_batch(
             records, management_document_correlations,
@@ -5073,11 +6964,14 @@ async def _process_claimed_chat_batch_unlocked(
                     persistent_session=persistent_session,
                     runner=runner,
                     management_document_correlations=management_document_correlations,
+                    management_open_question_candidates=management_open_question_candidates,
                     capture_business_writes_for_test_management=capture_canary_reply,
                     replay_messages=(
                         contextual_replay_message(
                             _replay_messages_with_retained_documents(
-                                replay_records,
+                                # PA-429: history rows were finished above and are
+                                # never live; only the context and live rows replay.
+                                (*context_records, *records),
                                 config_path=config_path,
                                 management_document_correlations=management_document_correlations,
                             )
@@ -5110,18 +7004,21 @@ async def _process_claimed_chat_batch_unlocked(
                     # follow-up after the active tool boundary; it never cancels
                     # file generation or another in-flight tool.
                     try:
-                        await _process_claimed_chat_batch_unlocked(
-                            inbox,
-                            followups,
-                            config_path=config_path,
-                            state_db=state_db,
-                            case_db=case_db,
-                            source_before_image_dir=source_before_image_dir,
-                            gate_changed_at=gate_changed_at,
-                            runner=runner,
-                            direct_trigger_required=False,
-                            allow_active_steering=False,
-                            persistent_session=persistent_session,
+                        steered_records.extend(
+                            await _process_claimed_chat_batch_unlocked(
+                                inbox,
+                                followups,
+                                config_path=config_path,
+                                state_db=state_db,
+                                case_db=case_db,
+                                source_before_image_dir=source_before_image_dir,
+                                gate_changed_at=gate_changed_at,
+                                runner=runner,
+                                direct_trigger_required=False,
+                                allow_active_steering=False,
+                                persistent_session=persistent_session,
+                            )
+                            or []
                         )
                     except Exception as exc:
                         print(
@@ -5137,6 +7034,25 @@ async def _process_claimed_chat_batch_unlocked(
                 "processor evidence did not conserve claimed messages: "
                 f"claimed={len(expected)} evidenced={len(submitted)}"
             )
+        # PA-611: a message the gateway steered into the running turn has no
+        # turn of this replay.  It is not skipped: it stays claimed and is
+        # finished by the batch that owns the running turn, with that turn's
+        # id.  Only a batch that ran no turn of its own defers (a batch whose
+        # turn ran answers its own messages).
+        steered_ids = {
+            str(value) for value in result.get("steered_message_ids") or []
+        } & expected
+        if steered_ids and not result.get("handled"):
+            deferred = [r for r in records if r.message_id in steered_ids]
+            records = [r for r in records if r.message_id not in steered_ids]
+            await _settle_claim_path_retention(
+                inbox, claim_retention, config_path=config_path
+            )
+            if records:
+                inbox.finish_processed_batch(records, turn_for_message={})
+            return deferred
+        # Records steered into this batch's own turn by later batches.
+        expected = expected | {record.message_id for record in steered_records}
         turn_for_message: dict[str, str] = {}
         for group in result.get("handled") or []:
             turn_id = str(group.get("turn_id") or "")
@@ -5161,20 +7077,45 @@ async def _process_claimed_chat_batch_unlocked(
                 result=result,
                 config_path=config_path,
             )
+        # The turn has run; settle the claim-path attempt before the rows
+        # become terminal, so none ends terminal without one (PA-203).
+        await _settle_claim_path_retention(
+            inbox, claim_retention, config_path=config_path
+        )
         # One transaction: a multi-turn batch can never land partially
         # terminal if the process exits between turn groups.
-        inbox.finish_processed_batch(records, turn_for_message=turn_for_message)
+        # The steered records finish with the same transaction as the turn that
+        # answered them: completed with that turn's id (PA-611).
+        inbox.finish_processed_batch(
+            [*records, *steered_records], turn_for_message=turn_for_message
+        )
+        steered_records = []
     except asyncio.CancelledError:
-        inbox.requeue(records, reason="graceful-cancellation")
+        inbox.requeue([*records, *steered_records], reason="graceful-cancellation")
         raise
     except MediaRetentionError as exc:
-        inbox.requeue(records, reason=f"media-retention-retry: {exc}")
+        inbox.requeue(
+            [*records, *steered_records], reason=f"media-retention-retry: {exc}"
+        )
         raise
     except SourceEvidenceProjectionError as exc:
-        inbox.requeue(records, reason=f"source-evidence-projection-retry: {exc}")
+        inbox.requeue(
+            [*records, *steered_records],
+            reason=f"source-evidence-projection-retry: {exc}",
+        )
         raise
     except Exception as exc:
+        for pending in (claim_retention, history_retention):
+            with contextlib.suppress(Exception):
+                await _settle_claim_path_retention(
+                    inbox, pending, config_path=config_path
+                )
         inbox.finish(records, status="failed", error=str(exc))
+        if steered_records:
+            # The running turn failed, so the messages steered into it were
+            # not answered: return them to pending for an ordinary turn.
+            with contextlib.suppress(Exception):
+                inbox.requeue(steered_records, reason="steered-turn-failed")
         raise
 
     # Delivery follows durable ingest completion.  It cannot change inbox
@@ -5187,6 +7128,7 @@ async def _process_claimed_chat_batch_unlocked(
             batch_records=records,
             gate_changed_at=gate_changed_at,
             handled_groups=result.get("handled") or [],
+            document_correlations=management_document_correlations,
         )
         if delivery.get("delivered") or delivery.get("undelivered"):
             print(f"reply deliveries: {delivery}", file=sys.stderr)
@@ -5195,6 +7137,7 @@ async def _process_claimed_chat_batch_unlocked(
             f"reply delivery machinery FAILED (ingest unaffected): {exc}",
             file=sys.stderr,
         )
+    return []
 
 
 async def _process_claimed_chat_batch(
@@ -5265,6 +7208,70 @@ async def _process_claimed_management_continuation(
             print(f"management continuation FAILED: {exc}", file=sys.stderr)
 
 
+async def _process_background_completion(
+    *,
+    row: Mapping[str, Any],
+    store: Any,
+    inbox: DurableInbox,
+    config_path: Path,
+    state_db: Path,
+    gate_changed_at: str,
+    runner: Any,
+    activity_lock_file: Path | None,
+) -> None:
+    """Run one claimed background completion under the ordinary activity lock."""
+    from gateway.pa_background_completions import process_claimed_completion
+
+    with SharedActivityLock(activity_lock_file):
+        try:
+            outcome = await process_claimed_completion(
+                row=row,
+                store=store,
+                inbox=inbox,
+                config_path=config_path,
+                state_db=state_db,
+                gate_changed_at=gate_changed_at,
+                runner=runner,
+            )
+            print(f"background completion turn: {outcome}", file=sys.stderr)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # The store kept the row pending (or failed after its retry limit).
+            print(f"background completion FAILED: {exc}", file=sys.stderr)
+
+
+def _carry_over_conversation_keys() -> dict[str, Any] | None:
+    """Idempotent start-up carry-over; a failure never stops the consumer.
+
+    Nothing is lost when it fails: every old entry is kept, and the release
+    runs the same carry-over with the service stopped.
+    """
+    from gateway.config import load_gateway_config
+    from gateway.conversation_key_carryover import carry_over
+    from hermes_constants import get_hermes_home
+
+    try:
+        result = carry_over(
+            get_hermes_home(),
+            apply=True,
+            sessions_dir=load_gateway_config().sessions_dir,
+        )
+    except Exception as exc:  # noqa: BLE001 - reported, never fatal
+        print(f"conversation key carry-over FAILED: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return None
+    if result["carried"] or result["workspaces_copied"]:
+        print(
+            "conversation key carry-over: "
+            + json.dumps(
+                {key: result[key] for key in ("carried", "workspaces_copied")},
+                sort_keys=True,
+            ),
+            file=sys.stderr,
+        )
+    return result
+
+
 async def run_consumer(args: argparse.Namespace) -> int:
     config_path = Path(args.config).resolve()
     source = Path(args.source).resolve()
@@ -5286,8 +7293,18 @@ async def run_consumer(args: argparse.Namespace) -> int:
     management_quiet_seconds = _management_quiet_seconds(config_path)
 
     with SingletonLock(Path(args.lock_file).resolve()):
+        # PA-203 round 2: carry engine-keyed conversations to the stable
+        # namespace before any SessionStore in this process loads them.
+        _carry_over_conversation_keys()
         recovery = inbox.reconcile_orphan_processing(state_db)
         expected_total = inbox.assert_and_record_conservation()
+        # PA-203 round 2: this process, not the gateway watcher, owns the
+        # return path of background work started from its turns.
+        from gateway import pa_background_completions as background
+
+        completion_store, completion_recovery, restore_completion_sink = (
+            background.start_for_consumer(inbox.db_path, state_db)
+        )
         runner: Any | None = None
         continuation_session_db: Any | None = None
         continuation_config: Any | None = None
@@ -5304,10 +7321,24 @@ async def run_consumer(args: argparse.Namespace) -> int:
             terminalize_prior_process_continuations(
                 continuation_session_db, continuation_config
             )
+        # PA-396: one-record question triggers share the session mailbox.  A
+        # row running when the previous process stopped is failed, never
+        # replayed: its model or bridge outcome is unknown.
+        from gateway import management_question_trigger as question_trigger
+        from hermes_state import SessionDB as _TriggerSessionDB
+
+        trigger_session_db = _TriggerSessionDB(db_path=state_db)
+        question_trigger.terminalize_prior_process_triggers(trigger_session_db)
         tasks: dict[str, asyncio.Task[None]] = {}
         lanes: dict[str, str] = {}
         source_projection_holds: dict[str, str] = {}
+        # PA-203: the capture-lane retention pass runs beside batch selection.
+        retention_task: asyncio.Task[dict[str, int]] | None = None
+        retention_cycle: dict[str, int] = {
+            "examined": 0, "retained": 0, "bypassed": 0, "held": 0, "quarantined": 0,
+        }
         cron_stop, cron_thread = _start_cron_ticker()
+        fill_stop, fill_thread = _start_photo_fill_lane(config_path, case_db)
         try:
             while True:
                 # Keep the existing opt-in configuration reload behaviour.
@@ -5349,6 +7380,10 @@ async def run_consumer(args: argparse.Namespace) -> int:
                 gate = processing_gate_state(gate_path)
                 gate_enabled = gate["enabled"] is True
                 projection_enabled = _source_projection_config(config_path) is not None
+                # Keep every finished background result durable, even in standby,
+                # and let workflow runs follow the pause state (review item 8).
+                background.maintain(completion_store)
+                background.set_processing(completion_store, config_enabled and gate_enabled)
 
                 # Capture staging and its Systems projection are independent
                 # from the business/model gate.  A paused Christopher must not
@@ -5427,6 +7462,10 @@ async def run_consumer(args: argparse.Namespace) -> int:
                             "oldest_active_claim": inbox.oldest_processing_updated_at(),
                             "state_total": expected_total,
                             "startup_recovery": recovery,
+                            "background_completions": {
+                                **completion_store.counts(),
+                                "startup_recovery": completion_recovery,
+                            },
                             "inbox": counts,
                         },
                     )
@@ -5536,22 +7575,36 @@ async def run_consumer(args: argparse.Namespace) -> int:
                         "oldest_active_claim": inbox.oldest_processing_updated_at(),
                         "state_total": expected_total,
                         "startup_recovery": recovery,
+                        "background_completions": {
+                            **completion_store.counts(),
+                            "startup_recovery": completion_recovery,
+                        },
                         "inbox": inbox.counts(),
                     },
                 )
 
                 # Retention is a capture-lane concern, not a model/business
-                # concern.  It runs before demo-pause lane selection and never
-                # claims or terminals the business row.
-                retention_cycle = await retain_pending_media(
-                    inbox,
-                    config_path=config_path,
-                    limit=retention_batch_size,
-                )
+                # concern.  It never claims or terminals the business row.
+                # PA-203: one pass at a time runs as a background task, so a
+                # slow Systems never delays batch selection or a turn.  The
+                # status reports the last finished pass; a failure other than
+                # a recorded retention hold stays fatal, as before.
+                if retention_task is not None and retention_task.done():
+                    finished, retention_task = retention_task, None
+                    retention_cycle = finished.result()
+                if retention_task is None:
+                    retention_task = asyncio.create_task(
+                        retain_pending_media(
+                            inbox,
+                            config_path=config_path,
+                            limit=retention_batch_size,
+                        )
+                    )
 
                 try:
                     priority_chats = _priority_selector_chats(config_path)
-                    nightly_chats = _nightly_selector_chats(config_path)
+                    # PA-689: each recheck run is its own session, like a nightly turn.
+                    nightly_chats = _nightly_selector_chats(config_path) | _recheck_brief(config_path)[0]
                 except Exception:
                     priority_chats = frozenset()
                     nightly_chats = frozenset()
@@ -5574,6 +7627,7 @@ async def run_consumer(args: argparse.Namespace) -> int:
                     continuation_candidate = next_pending_continuation(
                         continuation_session_db, continuation_config
                     )
+                question_trigger_row = question_trigger.next_pending_trigger(trigger_session_db)
                 gate_changed_at = str(gate.get("changed_at") or "")
                 active_site = sum(1 for lane in lanes.values() if lane == "site")
                 available_site = max(0, site_concurrency - active_site)
@@ -5586,6 +7640,7 @@ async def run_consumer(args: argparse.Namespace) -> int:
                     or selected_site_batches
                     or document_event_config is not None
                     or continuation_candidate is not None
+                    or question_trigger_row is not None
                 ) and runner is None:
                     runner = _new_gateway_runner(config_path)
 
@@ -5619,7 +7674,7 @@ async def run_consumer(args: argparse.Namespace) -> int:
                             ),
                             allow_active_steering=True,
                             persistent_session=(
-                                _continuous_interval_batch(records, config_path)
+                                _persistent_continuous_interval_batch(records, config_path)
                                 or chat_id not in nightly_chats
                             ),
                         )
@@ -5652,6 +7707,58 @@ async def run_consumer(args: argparse.Namespace) -> int:
                     )
                     lanes[chat_id] = "management"
 
+                # PA-396: a question trigger is one internal turn in its
+                # destination chat's lane, taken only when that lane is free;
+                # an ordinary captured message or continuation wins it.
+                if question_trigger_row is not None and runner is not None:
+                    trigger_chat = question_trigger.trigger_chat_id(question_trigger_row)
+                    if trigger_chat is None:
+                        # Unreadable body: claim and fail it so it never
+                        # blocks the mailbox.
+                        if trigger_session_db.claim_session_mailbox(
+                            str(question_trigger_row.get("id") or ""),
+                            include_body_contract=question_trigger.CONTRACT,
+                        ):
+                            trigger_session_db.fail_session_mailbox(
+                                str(question_trigger_row.get("id") or ""),
+                                "QUESTION_TRIGGER_BODY_INVALID",
+                            )
+                    elif trigger_chat not in tasks:
+                        tasks[trigger_chat] = asyncio.create_task(
+                            _process_claimed_management_question_trigger(
+                                row=question_trigger_row,
+                                session_db=trigger_session_db,
+                                inbox=inbox,
+                                config_path=config_path,
+                                state_db=state_db,
+                                runner=runner,
+                                activity_lock_file=activity_lock_file,
+                            )
+                        )
+                        lanes[trigger_chat] = "management"
+
+                # A finished background result is one ordinary turn in its
+                # conversation, taken only when that chat is otherwise idle.
+                completion_row = completion_store.next_pending(exclude_chats=set(tasks))
+                if completion_row is not None and runner is None:
+                    runner = _new_gateway_runner(config_path)
+                if completion_row is not None and completion_store.claim(
+                    str(completion_row["completion_id"])
+                ):
+                    tasks[completion_row["chat_id"]] = asyncio.create_task(
+                        _process_background_completion(
+                            row=completion_row,
+                            store=completion_store,
+                            inbox=inbox,
+                            config_path=config_path,
+                            state_db=state_db,
+                            gate_changed_at=gate_changed_at,
+                            runner=runner,
+                            activity_lock_file=activity_lock_file,
+                        )
+                    )
+                    lanes[completion_row["chat_id"]] = "management"
+
                 if not demo_management_only:
                     for chat_id, records in selected_site_batches:
                         tasks[chat_id] = asyncio.create_task(
@@ -5670,6 +7777,9 @@ async def run_consumer(args: argparse.Namespace) -> int:
                         lanes[chat_id] = "site"
 
                 if args.once:
+                    if retention_task is not None:
+                        finished, retention_task = retention_task, None
+                        retention_cycle = await finished
                     if tasks:
                         task_items = list(tasks.items())
                         outcomes = await asyncio.gather(
@@ -5694,6 +7804,7 @@ async def run_consumer(args: argparse.Namespace) -> int:
                                 source_projection_holds.pop(chat_id, None)
                         tasks.clear()
                         lanes.clear()
+                    await _drain_background_retention()
                     counts = inbox.counts()
                     if sum(counts.values()) != expected_total:
                         raise ConsumerError(
@@ -5740,6 +7851,10 @@ async def run_consumer(args: argparse.Namespace) -> int:
                             "oldest_active_claim": inbox.oldest_processing_updated_at(),
                             "state_total": expected_total,
                             "startup_recovery": recovery,
+                            "background_completions": {
+                                **completion_store.counts(),
+                                "startup_recovery": completion_recovery,
+                            },
                             "inbox": counts,
                         },
                     )
@@ -5795,6 +7910,10 @@ async def run_consumer(args: argparse.Namespace) -> int:
                         "oldest_active_claim": inbox.oldest_processing_updated_at(),
                         "state_total": expected_total,
                         "startup_recovery": recovery,
+                        "background_completions": {
+                            **completion_store.counts(),
+                            "startup_recovery": completion_recovery,
+                        },
                         "inbox": counts,
                     },
                 )
@@ -5803,13 +7922,32 @@ async def run_consumer(args: argparse.Namespace) -> int:
             for task in tasks.values():
                 task.cancel()
             await asyncio.gather(*tasks.values(), return_exceptions=True)
+            pending_retention = [
+                task for task in (retention_task, *_BACKGROUND_RETENTION) if task is not None
+            ]
+            for task in pending_retention:
+                task.cancel()
+            await asyncio.gather(*pending_retention, return_exceptions=True)
             if inbox.total() != expected_total:
                 raise ConsumerError(
                     "inbox conservation failed during graceful cancellation"
                 )
             raise
         finally:
+            # PA-203: no retention thread may write after run_consumer
+            # returns.  Cancel what is left, then wait for running attempts.
+            leftover = [
+                task for task in (retention_task, *_BACKGROUND_RETENTION)
+                if task is not None and not task.done()
+            ]
+            for task in leftover:
+                task.cancel()
+            if leftover:
+                await asyncio.gather(*leftover, return_exceptions=True)
+            _shutdown_retention_executor()
             _stop_cron_ticker(cron_stop, cron_thread)
+            _stop_photo_fill_lane(fill_stop, fill_thread)
+            restore_completion_sink()
             if continuation_session_db is not None:
                 continuation_session_db.close()
 
@@ -6760,6 +8898,50 @@ def build_parser() -> argparse.ArgumentParser:
         "--activity-lock-file",
         help="shared with release executor while the real GatewayRunner owns the canary",
     )
+
+    question = sub.add_parser(
+        "management-question-send",
+        help=(
+            "Stage one record's photos and hand Christopher a trigger to send the approved "
+            "question himself, in the live consumer; this command posts nothing"
+        ),
+    )
+    question.add_argument("--record-id", required=True, help="human-resolution record id")
+    question.add_argument("--chat-id", required=True, help="management chat JID, e.g. <id>@g.us")
+    question.add_argument("--question-file", required=True, help="approved question text, sent verbatim")
+    question.add_argument("--inbox", required=True)
+    question.add_argument("--config", required=True)
+    question.add_argument(
+        "--systems-url",
+        help="Systems base URL (else TGG_MANAGEMENT_QUESTION_API_URL)",
+    )
+    question.add_argument(
+        "--tenant", help="X-PS-Tenant header value (else TGG_MANAGEMENT_QUESTION_TENANT)",
+    )
+    question.add_argument("--token-env", default="CHRISTOPHER_TGG_PS_SERVICE_TOKEN")
+    question.add_argument(
+        "--media-resolver-command",
+        help="media resolver command (else TGG_MEDIA_RESOLVER_COMMAND)",
+    )
+    question.add_argument(
+        "--state-db", help="Hermes state.db holding the session mailbox (default: beside --config)",
+    )
+    question.add_argument(
+        "--receipt",
+        help="where the live consumer writes this trigger's receipt "
+        "(default: <config dir>/runtime/management-question-receipts/)",
+    )
+    question.add_argument(
+        "--retry-after-failed-trigger", action="store_true",
+        help="allow a new trigger after an earlier one for this record and chat failed",
+    )
+    question.add_argument(
+        "--check", action="store_true",
+        help=(
+            "read the record, resolve its photos and check refusals; write no trigger. "
+            "May stage verified photo copies into the retained-media root"
+        ),
+    )
     return parser
 
 
@@ -6780,6 +8962,8 @@ def main(argv: Iterable[str] | None = None) -> int:
             return asyncio.run(run_bounded_backplay(args))
         if args.command == "management-document-canary":
             return asyncio.run(run_management_document_canary(args))
+        if args.command == "management-question-send":
+            return run_management_question_send(args)
         raise ConsumerError(f"unknown command {args.command}")
     except ConsumerError as exc:
         print(f"consumer error: {exc}", file=sys.stderr)

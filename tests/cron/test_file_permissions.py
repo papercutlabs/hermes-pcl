@@ -118,6 +118,29 @@ class TestConfigFilePermissions(unittest.TestCase):
                 subdir_mode = stat.S_IMODE(os.stat(home / subdir).st_mode)
                 self.assertEqual(subdir_mode, 0o700, f"{subdir} should be 0700")
 
+    def test_configured_reader_home_acl_is_preserved_without_home_chmod(self):
+        home = Path(self.tmpdir) / ".hermes"
+        home.mkdir()
+        (home / "config.yaml").write_text(
+            "python_sandbox:\n  reader_identity: tggcapture\n",
+            encoding="utf-8",
+        )
+        with patch("hermes_cli.config.get_hermes_home", return_value=home), \
+             patch(
+                 "tools.python_sandbox_access.configured_reader_uid",
+                 return_value="999",
+             ), \
+             patch(
+                 "tools.python_sandbox_access.preserve_reader_home_access"
+             ) as preserve, \
+             patch("hermes_cli.config._secure_dir") as secure:
+            from hermes_cli.config import ensure_hermes_home
+
+            ensure_hermes_home()
+
+        preserve.assert_called_once_with(home, "999")
+        self.assertNotIn(home, [call.args[0] for call in secure.call_args_list])
+
 
 class TestSecureHelpers(unittest.TestCase):
     """Test the _secure_file and _secure_dir helpers."""

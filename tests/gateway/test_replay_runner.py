@@ -98,6 +98,13 @@ async def test_gateway_runner_replay_uses_no_connect_build_and_captures_outbound
     assert result.outbound[0]["message_id"] == "replay-1"
     assert result.outbound[0]["replay_run_id"] == "run-1"
     assert result.outbound[0]["headers"]["X-Replay-Attempt-Id"] == "attempt-1"
+    assert result.outbound[0]["workspace_owner"], json.dumps(result.outbound[0])
+    assert result.outbound[0]["workspace_owner"].startswith(
+        "agent:replay:run-1:"
+    )
+    assert "_hermes_replay_workspace_owner" not in json.dumps(
+        result.outbound[0]["kwargs"]
+    )
     assert result.attempt["run_id"] == "run-1"
     assert result.attempt["replay_namespace"] == "agent:replay:run-1"
     assert "WHATSAPP_HOME_CHANNEL" not in os.environ
@@ -600,13 +607,22 @@ async def test_replay_guard_blocks_yuanbao_adapter_send_direct_path():
 
     with replay_context(ReplayPlan(platform="yuanbao", run_id="run-yuanbao")) as ctx:
         runner._install_replay_delivery_guard(adapter, ctx)
-        result = await adapter.send("direct:account", "yuanbao direct send should be captured")
+        result = await adapter.send(
+            "direct:account",
+            "yuanbao direct send should be captured",
+            metadata={
+                "thread_id": "thread-1",
+                "_hermes_replay_workspace_owner": "stable-owner",
+            },
+        )
 
     assert result.success is True
     assert result.message_id == "replay-1"
     assert fake_outbound.calls == []
     assert ctx.outbound[0]["kind"] == "send"
     assert ctx.outbound[0]["args"][1] == "yuanbao direct send should be captured"
+    assert ctx.outbound[0]["workspace_owner"] == "stable-owner"
+    assert ctx.outbound[0]["kwargs"]["metadata"] == {"thread_id": "thread-1"}
 
 
 @pytest.mark.asyncio

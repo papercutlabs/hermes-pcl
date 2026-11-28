@@ -406,6 +406,10 @@ def build_turn_record(
         "model": agent_result.get("model"),
         "provider": agent_result.get("provider"),
     }
+    if agent_result.get("final_response_validation") is not None:
+        raw_envelope["final_response_validation"] = agent_result.get(
+            "final_response_validation"
+        )
     if replay_run_id or replay_attempt_id:
         raw_envelope["execution_mode"] = "replay"
         raw_envelope["replay_run_id"] = replay_run_id

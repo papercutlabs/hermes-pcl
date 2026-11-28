@@ -415,6 +415,22 @@ def _ensure_default_soul_md(home: Path) -> None:
     _secure_file(soul_path)
 
 
+def _configured_sandbox_reader_uid(home: Path) -> str | None:
+    """Read only the optional sandbox reader key without recursive loading."""
+    config_path = home / "config.yaml"
+    try:
+        with config_path.open(encoding="utf-8") as handle:
+            raw = yaml.safe_load(handle) or {}
+    except (FileNotFoundError, OSError, yaml.YAMLError):
+        return None
+    section = raw.get("python_sandbox", {}) if isinstance(raw, dict) else {}
+    if not isinstance(section, dict):
+        section = {}
+    from tools.python_sandbox_access import configured_reader_uid
+
+    return configured_reader_uid(section)
+
+
 def ensure_hermes_home():
     """Ensure ~/.hermes directory structure exists with secure permissions.
 
@@ -431,7 +447,13 @@ def ensure_hermes_home():
             os.umask(old_umask)
     else:
         home.mkdir(parents=True, exist_ok=True)
-        _secure_dir(home)
+        reader_uid = _configured_sandbox_reader_uid(home)
+        if reader_uid is None:
+            _secure_dir(home)
+        else:
+            from tools.python_sandbox_access import preserve_reader_home_access
+
+            preserve_reader_home_access(home, reader_uid)
         for subdir in (
             "cron", "sessions", "logs", "logs/curator", "memories",
             "pairing", "hooks", "image_cache", "audio_cache", "skills",

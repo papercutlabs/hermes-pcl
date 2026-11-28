@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import hashlib
 import importlib.util
 import json
@@ -19,16 +21,27 @@ import sys
 import threading
 import time
 import uuid
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Iterator, Mapping
 
 try:
     import resource
 except ImportError:  # pragma: no cover - Windows availability is fail-closed
     resource = None
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows availability is fail-closed
+    fcntl = None
+
 from hermes_constants import get_hermes_home
 from tools.path_security import validate_within_dir
+from tools.python_sandbox_access import (
+    SandboxReaderPolicyError,
+    configured_reader_uid,
+    grant_reader_work_access,
+)
 from tools.python_sandbox_paths import (
     is_python_sandbox_dataset_name,
     python_sandbox_dataset_path,
@@ -47,6 +60,11 @@ DEFAULTS = {
     "max_processes": 64,
     "max_open_files": 256,
     "max_snapshot_mb": 512,
+    # Size limit of the one agent workspace (``workspace: agent``), which is
+    # mounted directly at /work instead of a tmpfs capped by scratch_mb.
+    "workspace_mb": 2048,
+    # Stop or refuse an agent-mode run when the host disk has less free space.
+    "min_free_mb": 1024,
 }
 STDOUT_CAP = 16 * 1024
 STDERR_CAP = 4 * 1024
@@ -56,7 +74,24 @@ _PROBE: tuple[float, bool, str] | None = None
 _PROBE_TTL = 30.0
 _WORKSPACE_LOCKS: dict[str, threading.Lock] = {}
 _WORKSPACE_LOCKS_GUARD = threading.Lock()
+_WORKSPACE_LOCK_FILE = ".publish.lock"
+# Owner of the one agent-wide workspace (``workspace: agent``).  Constant, so
+# the folder never depends on a conversation, job, provider or model.
+AGENT_WORKSPACE_OWNER = "hermes-agent-workspace"
+# Beside ``work/``: which earlier per-conversation folders were merged in.
+_MERGE_RECORD_FILE = ".merged-workspaces.json"
+# One JSON line per file received, sent or delivered.
+FILES_LOG_NAME = "files-log.jsonl"  # lives in records/, beside work/
+_LEGACY_WORKSPACE_RE = re.compile(r"^s_[0-9a-f]{64}$")
 _EXPORT_COMPLETE = ".hermes-export-complete"
+# A runtime-derived workspace owner bound by trusted scheduler code.  It is
+# never a tool argument, so the model cannot select another conversation.
+_BOUND_PUBLISHED: contextvars.ContextVar[set | None] = contextvars.ContextVar(
+    "HERMES_SANDBOX_PUBLISHED_COLLECTOR", default=None
+)
+_BOUND_WORKSPACE_OWNER: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "HERMES_SANDBOX_WORKSPACE_OWNER", default=""
+)
 
 _SUPERVISOR_SOURCE = r"""\
 import ctypes
@@ -96,7 +131,9 @@ completed = subprocess.run(
 
 # Writable sqlite datasets are run inputs, not output artifacts. Remove the
 # reserved copies after the payload exits so they are not exported or promoted.
-for name in json.loads(sys.argv[3]):
+# In direct mode the copies live on the per-run /scratch tmpfs instead.
+direct = len(sys.argv) >= 5 and sys.argv[4] == "direct"
+for name in [] if direct else json.loads(sys.argv[3]):
     try:
         os.unlink(f"/work/{name}.db")
     except FileNotFoundError:
@@ -115,15 +152,18 @@ for root, dirs, files in os.walk("/work", topdown=True, followlinks=False):
         if not stat.S_ISREG(os.lstat(path).st_mode):
             os.unlink(path)
 
-subprocess.run(["mount", "-o", "remount,bind,rw", "/export"], check=True)
-for name in os.listdir("/export"):
-    path = os.path.join("/export", name)
-    if os.path.isdir(path) and not os.path.islink(path):
-        shutil.rmtree(path)
-    else:
-        os.unlink(path)
-subprocess.run(["cp", "-a", "/work/.", "/export/"], check=True)
-open("/export/.hermes-export-complete", "wb").close()
+# With the agent workspace mounted directly at /work there is nothing to
+# export: the run already worked in the persistent folder.
+if len(sys.argv) < 5 or sys.argv[4] != "direct":
+    subprocess.run(["mount", "-o", "remount,bind,rw", "/export"], check=True)
+    for name in os.listdir("/export"):
+        path = os.path.join("/export", name)
+        if os.path.isdir(path) and not os.path.islink(path):
+            shutil.rmtree(path)
+        else:
+            os.unlink(path)
+    subprocess.run(["cp", "-a", "/work/.", "/export/"], check=True)
+    open("/export/.hermes-export-complete", "wb").close()
 if completed.returncode < 0:
     os._exit(128 - completed.returncode)
 raise SystemExit(completed.returncode)
@@ -333,8 +373,17 @@ def _generate_init_script(
     scratch_mb: int = 64,
     sqlite_datasets: set[str] | None = None,
     seed_work: Path | None = None,
+    strip_seed_metadata: bool = False,
+    *,
+    direct_work: Path | None = None,
+    direct_records: Path | None = None,
 ) -> str:
-    """Generate the mount plan executed as namespace-root."""
+    """Generate the mount plan executed as namespace-root.
+
+    ``direct_work`` (``workspace: agent``) bind-mounts that persistent folder
+    read-write at /work with nosuid, nodev and noexec, instead of a tmpfs
+    seeded from a snapshot and exported afterwards.
+    """
     jail = run_dir / "jail"
     lines = [
         "#!/bin/sh",
@@ -381,19 +430,40 @@ def _generate_init_script(
         lines.append(f"mkdir -p {base_target}")
         lines.append(f"ro_dir {_q(base_prefix)} {base_target}")
     sqlite_datasets = set(sqlite_datasets or ())
-    lines.append(
-        f'mount -t tmpfs -o size={int(scratch_mb)}m,nosuid,nodev,noexec '
-        'tmpfs "$JAIL/work"'
-    )
-    if seed_work is not None:
+    if direct_work is not None:
+        lines.append(f'mount --bind {_q(direct_work)} "$JAIL/work"')
+        lines.append('mount -o remount,bind,nosuid,nodev,noexec "$JAIL/work"')
+        # Records (received, sent, files log) are read-only to sandbox code;
+        # sqlite dataset copies, TMPDIR and HOME live on a per-run tmpfs.
+        lines.append('mkdir -p "$JAIL/records" "$JAIL/scratch"')
+        if direct_records is not None:
+            lines.append(f'ro_dir {_q(direct_records)} "$JAIL/records"')
+        lines.append(
+            f'mount -t tmpfs -o size={int(scratch_mb)}m,nosuid,nodev,noexec '
+            'tmpfs "$JAIL/scratch"'
+        )
+    else:
+        lines.append(
+            f'mount -t tmpfs -o size={int(scratch_mb)}m,nosuid,nodev,noexec '
+            'tmpfs "$JAIL/work"'
+        )
+    if seed_work is not None and direct_work is None:
         lines.append(f'ro_dir {_q(seed_work)} "$JAIL/seed"')
-        lines.append('cp -a "$JAIL/seed/." "$JAIL/work/"')
+        lines.append(
+            'cp -R --no-preserve=all "$JAIL/seed/." "$JAIL/work/"'
+            if strip_seed_metadata
+            else 'cp -a "$JAIL/seed/." "$JAIL/work/"'
+        )
         # result.json is the current invocation's return channel, not user
         # workspace state. A prior result must never be harvested as this run's.
         lines.append('rm -f "$JAIL/work/result.json"')
     for name, source in mounts.items():
         if name in sqlite_datasets:
-            target = f'"$JAIL/work/{name}.db"'
+            target = (
+                f'"$JAIL/scratch/{name}.db"'
+                if direct_work is not None
+                else f'"$JAIL/work/{name}.db"'
+            )
             lines.append(f"cp {_q(source)} {target}")
             lines.append(f"chmod 600 {target}")
             continue
@@ -403,10 +473,15 @@ def _generate_init_script(
             ("ro_dir" if source.is_dir() else "ro_file")
             + f" {_q(source)} {target}"
         )
+    if direct_work is None:
+        lines.extend(
+            [
+                f'mount --bind {_q(run_dir / "work")} "$JAIL/export"',
+                'mount -o remount,bind,ro "$JAIL/export"',
+            ]
+        )
     lines.extend(
         [
-            f'mount --bind {_q(run_dir / "work")} "$JAIL/export"',
-            'mount -o remount,bind,ro "$JAIL/export"',
             'mount -t proc -o nosuid,nodev,noexec proc "$JAIL/proc"',
             # Assembly is complete. Freeze the tmpfs root before pivot;
             # nested /work stays a separate writable bind mount.
@@ -420,7 +495,8 @@ def _generate_init_script(
             # namespace capabilities.
             "exec /venv/bin/python -I /supervisor.py "
             f"{int(cpu_seconds)} {int(max_processes)} "
-            f"{_q(json.dumps(sorted(sqlite_datasets)))}",
+            f"{_q(json.dumps(sorted(sqlite_datasets)))}"
+            + (" direct" if direct_work is not None else ""),
             "",
         ]
     )
@@ -432,8 +508,11 @@ def _build_env(
     source_env: Mapping[str, str] | None = None,
     *,
     sqlite_datasets: set[str] | None = None,
+    direct: bool = False,
 ) -> dict[str, str]:
     source = dict(source_env or os.environ)
+    # Direct mode: scratch files never land in the persistent folder.
+    scratch = "/scratch" if direct else "/work"
     # Do not inherit execute_code's configurable passthrough allowlist here:
     # this boundary is deliberately fixed and credential-blind.
     sqlite_datasets = set(sqlite_datasets or ())
@@ -442,7 +521,7 @@ def _build_env(
         "SANDBOX_INPUTS": json.dumps(
             {
                 name: (
-                    f"/work/{name}.db"
+                    f"{scratch}/{name}.db"
                     if name in sqlite_datasets
                     else str(python_sandbox_dataset_path(name))
                 )
@@ -451,8 +530,8 @@ def _build_env(
             sort_keys=True,
         ),
         "RESULT_PATH": "/work/result.json",
-        "TMPDIR": "/work",
-        "HOME": "/work",
+        "TMPDIR": scratch,
+        "HOME": scratch,
         "TZ": source.get("HERMES_TIMEZONE", "UTC"),
         "LANG": "C.UTF-8",
         "PYTHONIOENCODING": "utf-8",
@@ -638,6 +717,7 @@ def _list_files(
     run_id: str | None = None,
     artifact_url_base: Any = None,
     media_retention: Mapping[str, Any] | None = None,
+    only: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     files = []
     client_url_base = (
@@ -658,7 +738,12 @@ def _list_files(
         and isinstance(media_ref_prefix, str)
         and media_ref_prefix.startswith("/media/")
     )
-    for path in sorted(work.rglob("*")):
+    paths = (
+        sorted(work.rglob("*"))
+        if only is None
+        else [work / relative for relative in sorted(only)]
+    )
+    for path in paths:
         try:
             metadata = path.stat(follow_symlinks=False)
         except OSError:
@@ -780,18 +865,843 @@ def _prune_runs(root: Path, config: Mapping[str, Any]) -> None:
 
 
 def _workspace_mode(config: Mapping[str, Any]) -> str:
-    """Return the configured scratch lifetime, preserving run scope by default."""
-    return "session" if config.get("workspace") == "session" else "run"
+    """Return the configured scratch lifetime, preserving run scope by default.
+
+    ``agent`` (PA-203 round 2) is one persistent folder for the whole agent:
+    every conversation, scheduled job and delegated helper, independent of
+    the provider, model and compaction.  ``session`` is one folder per
+    stable session key; ``run`` is a fresh folder per call.
+    """
+    value = config.get("workspace")
+    if value == "agent":
+        return "agent"
+    return "session" if value == "session" else "run"
 
 
-def _workspace_key(session_id: str) -> str:
+def agent_workspace_enabled(config: Mapping[str, Any] | None = None) -> bool:
+    """True when this deployment keeps one persistent agent-wide workspace."""
+    return _workspace_mode(_load_config() if config is None else config) == "agent"
+
+
+def _workspace_key(session_id: str, config: Mapping[str, Any] | None = None) -> str:
+    """Name of the retained folder for ``session_id``.
+
+    In ``agent`` mode every owner maps to the one agent folder, so each
+    caller that derives a folder from an owner (sandbox runs, delivery,
+    materialized query results, capability file return) lands in the same
+    place whatever conversation, job, helper or model it runs under.
+    """
+    if agent_workspace_enabled(config):
+        session_id = AGENT_WORKSPACE_OWNER
     return "s_" + hashlib.sha256(session_id.encode("utf-8")).hexdigest()
 
 
-def _workspace_lock(session_id: str) -> threading.Lock:
-    key = _workspace_key(session_id)
+def resolve_sandbox_work_path(raw_path: Any, workspace_owner: str) -> Path:
+    """Resolve one sandbox-local ``work/...`` reference for its owner.
+
+    The model sees only the sandbox path.  Host paths stay private and are
+    resolved at the final delivery boundary.  Symlinks are refused even when
+    they point back into the workspace so a captured reference cannot change
+    meaning between validation and use.
+    """
+    text = str(raw_path or "").strip()
+    owner = str(workspace_owner or "").strip()
+    config = _load_config()
+    if agent_workspace_enabled(config):
+        # One folder for everything: bring earlier folders in first so a
+        # file made before the move still resolves at its old path.
+        try:
+            ensure_agent_workspace(config, timeout=5.0)
+        except (OSError, RuntimeError):
+            # Resolution still answers from the agent folder as it stands;
+            # the merge is retried by the next caller.
+            logger.exception("Could not merge earlier sandbox workspaces")
+        from tools.pa_agent_workspace import capture_work_file
+
+        # The owner is the requesting context.  The version is fixed now,
+        # read without following links, and recorded against it.
+        path, _sha = capture_work_file(text, owner)
+        return path
+    if not owner:
+        raise ValueError("sandbox workspace owner is unavailable")
+    if text.startswith("/work/"):
+        relative_text = text[len("/work/"):]
+    elif text.startswith("work/"):
+        relative_text = text[len("work/"):]
+    else:
+        raise ValueError("attachment is not a sandbox work path")
+    relative = Path(relative_text)
+    if (
+        not relative_text
+        or relative.is_absolute()
+        or any(part in {"", ".", ".."} for part in relative.parts)
+    ):
+        raise ValueError("sandbox work path is invalid")
+
+    work_root = (
+        get_hermes_home()
+        / "sandbox_workspaces"
+        / _workspace_key(owner, config)
+        / "work"
+    )
+    candidate = work_root / relative
+    if not candidate.is_relative_to(work_root):
+        raise ValueError("sandbox work path escapes its workspace")
+
+    current = work_root
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            raise ValueError("sandbox work path contains a symlink")
+    try:
+        resolved_root = work_root.resolve(strict=True)
+        resolved = candidate.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError("sandbox work file is unavailable") from exc
+    if not resolved.is_relative_to(resolved_root) or not resolved.is_file():
+        raise ValueError("sandbox work path is not a confined regular file")
+    return resolved
+
+
+def bind_workspace_owner(owner: str | None) -> contextvars.Token:
+    """Bind a runtime-derived sandbox workspace owner for the current task.
+
+    Only trusted runtime code calls this: the PA scheduler binds the
+    originating Management conversation's stable session key so a scheduled
+    job works in that conversation's persistent folder.  The value is never a
+    model-facing argument.
+    """
+    return _BOUND_WORKSPACE_OWNER.set(str(owner or "").strip())
+
+
+def reset_workspace_owner(token: contextvars.Token) -> None:
+    _BOUND_WORKSPACE_OWNER.reset(token)
+
+
+def bind_published_collector(collector: set) -> contextvars.Token:
+    """Collect the ``work/`` paths this task's sandbox runs publish.
+
+    The PA scheduler binds one set per scheduled run, so delivery to a chat
+    other than the job's origin can attach only files the job itself made.
+    """
+    return _BOUND_PUBLISHED.set(collector)
+
+
+def reset_published_collector(token: contextvars.Token) -> None:
+    _BOUND_PUBLISHED.reset(token)
+
+
+def current_workspace_owner(fallback: str | None = None) -> str:
+    """Return the owner of the retained workspace for this task.
+
+    Precedence: a scheduler-bound owner, then the gateway's stable
+    ``HERMES_SESSION_KEY`` (survives compaction), then the caller's fallback.
+    In ``agent`` mode the answer is always the one agent-wide owner.
+    """
+    if agent_workspace_enabled():
+        return AGENT_WORKSPACE_OWNER
+    return current_run_context(fallback)
+
+
+def current_run_context(fallback: str | None = None) -> str:
+    """Which conversation or job this task works for.
+
+    A scheduler-bound owner, then the gateway's stable ``HERMES_SESSION_KEY``,
+    then the caller's fallback.  In agent mode it keys the record of which
+    context produced, captured and may send which version of a file.
+    """
+    bound = _BOUND_WORKSPACE_OWNER.get().strip()
+    if bound:
+        return bound
+    from gateway.session_context import get_session_env
+
+    return (
+        get_session_env("HERMES_SESSION_KEY", "").strip()
+        or str(fallback or "").strip()
+    )
+
+
+@contextmanager
+def _workspace_lock(
+    session_id: str, workspace: Path, timeout: float | None = None
+) -> Iterator[None]:
+    """Hold one workspace's publication lock across threads and processes.
+
+    The lock covers only the short seed snapshot and the per-file publication,
+    never the sandbox run itself, so a scheduled job and a live turn sharing
+    one conversation folder do not wait on each other's execution.  The
+    thread lock orders callers in this process; ``flock`` on a file inside the
+    workspace orders separate processes (scheduler, gateway, maintenance).
+    """
+    key = str(workspace)
     with _WORKSPACE_LOCKS_GUARD:
-        return _WORKSPACE_LOCKS.setdefault(key, threading.Lock())
+        thread_lock = _WORKSPACE_LOCKS.setdefault(key, threading.Lock())
+    deadline = None if timeout is None else time.monotonic() + timeout
+    if not thread_lock.acquire(timeout=-1 if timeout is None else max(0.0, timeout)):
+        raise TimeoutError("the sandbox workspace is busy")
+    try:
+        workspace.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if fcntl is None:  # pragma: no cover - sandbox is Linux-only
+            yield
+            return
+        fd = os.open(
+            workspace / _WORKSPACE_LOCK_FILE,
+            os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        try:
+            if deadline is None:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+            else:
+                while True:
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError("the sandbox workspace is busy") from None
+                        time.sleep(0.2)
+            try:
+                yield
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+    finally:
+        thread_lock.release()
+
+
+def _work_manifest(
+    work: Path, irregular: dict[str, str] | None = None
+) -> dict[str, str]:
+    """Map each regular retained file under ``work`` to its SHA-256.
+
+    ``result.json`` is the per-invocation return channel, never workspace
+    state, and symlinks or special files are never retained.  When
+    ``irregular`` is given, every entry that is present but is not hashed is
+    recorded there: ``"not_regular"`` for a symlink or special file and
+    ``"unreadable"`` for a file that could not be read.  Publication uses it
+    so that such an entry is never mistaken for a deletion.
+    """
+    manifest: dict[str, str] = {}
+    if not work.is_dir() or work.is_symlink():
+        return manifest
+    for current, dirnames, filenames in os.walk(work, topdown=True, followlinks=False):
+        current_path = Path(current)
+        kept_dirs = []
+        for name in dirnames:
+            if (current_path / name).is_symlink():
+                if irregular is not None:
+                    irregular[(current_path / name).relative_to(work).as_posix()] = "not_regular"
+            else:
+                kept_dirs.append(name)
+        dirnames[:] = kept_dirs
+        for name in filenames:
+            if name == "result.json":
+                continue
+            path = current_path / name
+            relative = path.relative_to(work).as_posix()
+            try:
+                if not stat.S_ISREG(path.lstat().st_mode):
+                    if irregular is not None:
+                        irregular[relative] = "not_regular"
+                    continue
+                digest = hashlib.sha256()
+                with path.open("rb") as handle:
+                    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                        digest.update(chunk)
+            except OSError:
+                if irregular is not None:
+                    irregular[relative] = "unreadable"
+                continue
+            manifest[relative] = digest.hexdigest()
+    return manifest
+
+
+def _snapshot_workspace(work: Path, snapshot: Path) -> dict[str, str]:
+    """Copy the retained work tree to a private per-run seed; return its manifest.
+
+    The caller holds the workspace lock, so the manifest is exactly the state
+    this run starts from.  It is the merge base for publication.
+    """
+    snapshot.mkdir(parents=True, exist_ok=True, mode=0o700)
+    manifest = _work_manifest(work)
+    for relative in manifest:
+        source = work / relative
+        target = snapshot / relative
+        target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        # Content and times only: host ownership and reader ACLs stay on the
+        # retained folder and are never copied into the private run tree.
+        shutil.copyfile(source, target, follow_symlinks=False)
+        metadata = source.stat(follow_symlinks=False)
+        os.utime(target, ns=(metadata.st_atime_ns, metadata.st_mtime_ns))
+    # A copied file may have changed between hashing and copying only if a
+    # writer bypassed the lock; hash the snapshot itself so the base is exact.
+    return _work_manifest(snapshot)
+
+
+def _alternate_name(relative: str, run_id: str, taken: set[str]) -> str:
+    path = Path(relative)
+    suffix = "".join(path.suffixes[-1:])
+    stem = path.name[: len(path.name) - len(suffix)] if suffix else path.name
+    for index in range(1000):
+        tag = run_id if index == 0 else f"{run_id}-{index}"
+        candidate = (path.parent / f"{stem}.{tag}{suffix}").as_posix()
+        if candidate not in taken:
+            return candidate
+    raise RuntimeError("could not choose a distinct workspace name")
+
+
+def _free_name(
+    destination: Path, relative: str, run_id: str, taken: set[str]
+) -> str:
+    """A name beside ``relative`` that no file, directory or plan uses yet."""
+    for index in range(1000):
+        candidate = _alternate_name(relative, f"{run_id}-{index}" if index else run_id, set())
+        if candidate not in taken and not os.path.lexists(destination / candidate):
+            return candidate
+    raise RuntimeError("could not choose a distinct workspace name")
+
+
+def _blocked_prefix(root: Path, relative_parent: Path) -> str | None:
+    """First ancestor of a target that exists in ``root`` but is not a real directory."""
+    current = root
+    for index, part in enumerate(relative_parent.parts):
+        current = current / part
+        try:
+            mode = current.lstat().st_mode
+        except FileNotFoundError:
+            return None
+        if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
+            return Path(*relative_parent.parts[: index + 1]).as_posix()
+    return None
+
+
+def _real_directory_chain(root: Path, relative_parent: Path) -> bool:
+    current = root
+    for part in relative_parent.parts:
+        current = current / part
+        try:
+            mode = current.lstat().st_mode
+        except FileNotFoundError:
+            return True
+        if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
+            return False
+    return True
+
+
+def _publish_workspace(
+    source: Path,
+    destination: Path,
+    base: Mapping[str, str],
+    *,
+    run_id: str,
+    hermes_home: Path,
+    reader_uid: str | None = None,
+) -> dict[str, Any]:
+    """Merge one completed run into its retained workspace, file by file.
+
+    The caller holds the workspace lock.  The retained folder is never removed
+    or replaced as a whole, so a file another writer published while this run
+    executed is kept.  Three-way rules against the run's seed ``base``:
+
+    * a file this run did not change is left as the workspace has it now;
+    * a file this run created or changed is installed atomically, unless
+      another writer changed the same path since the seed: then the other
+      writer's file keeps its name and this run's file is installed beside it
+      under a distinct name, reported back as ``renamed``;
+    * a seed file this run deleted is removed only if nobody changed it since,
+      and only if the run's tree really lacks it: a retained file the run
+      replaced with a directory, symlink or special file, or whose run copy
+      could not be read, is kept and reported as ``kept``;
+    * where the run replaced a file with a directory (or a directory with a
+      file), both versions survive: the run's entry is installed under a
+      distinct name and reported as ``renamed``;
+    * a run file that could not be read is reported as ``unpublished``.
+
+    Every installed file receives the configured reader ACL before it becomes
+    visible under its final name.
+    """
+    irregular: dict[str, str] = {}
+    out = _work_manifest(source, irregular)
+    destination.mkdir(parents=True, exist_ok=True, mode=0o700)
+    current = _work_manifest(destination)
+    taken = set(current) | set(out)
+    installs: list[tuple[str, str]] = []  # (source relative, destination relative)
+    produced: list[str] = []  # run-written files already present with equal bytes
+    renamed: dict[str, str] = {}
+    unpublished: list[str] = sorted(
+        relative for relative, reason in irregular.items() if reason == "unreadable"
+    )
+    prefix_moves: dict[str, str] = {}  # blocked destination prefix -> its free name
+    for relative, digest in sorted(out.items()):
+        if base.get(relative) == digest:
+            continue
+        if current.get(relative) == digest:
+            produced.append(relative)
+            continue
+        target = relative
+        occupied_by_directory = (destination / relative).is_dir()
+        if occupied_by_directory or (
+            relative in current and current[relative] != base.get(relative)
+        ):
+            target = _free_name(destination, relative, run_id, taken)
+            taken.add(target)
+            renamed[relative] = target
+        blocked = _blocked_prefix(destination, Path(target).parent)
+        if blocked is not None:
+            # A retained file (or symlink) sits where this run has a directory:
+            # keep it, and move this run's directory beside it under one name.
+            if blocked not in prefix_moves:
+                prefix_moves[blocked] = _free_name(destination, blocked, run_id, taken)
+                taken.add(prefix_moves[blocked])
+            target = prefix_moves[blocked] + target[len(blocked):]
+            taken.add(target)
+            renamed[relative] = target
+        if not _real_directory_chain(destination, Path(target).parent):
+            unpublished.append(relative)
+            renamed.pop(relative, None)
+            continue
+        installs.append((relative, target))
+
+    removals: list[str] = []
+    kept: list[str] = []
+    for relative, digest in base.items():
+        if relative in out or current.get(relative) != digest:
+            continue
+        if os.path.lexists(source / relative) or not _real_directory_chain(
+            source, Path(relative).parent
+        ):
+            # The run still has something at this path (a directory, symlink,
+            # special or unreadable file), or replaced a parent directory with
+            # a file.  That is not a deletion: keep the retained copy.
+            kept.append(relative)
+            continue
+        removals.append(relative)
+
+    parent = destination.parent
+    staged = parent / f".work-{uuid.uuid4().hex}.tmp"
+    try:
+        staged.mkdir(mode=0o700)
+        for relative, target in installs:
+            staged_file = staged / target
+            staged_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            shutil.copy2(source / relative, staged_file, follow_symlinks=False)
+        for directory in sorted(
+            path.relative_to(source)
+            for path in source.rglob("*")
+            if path.is_dir() and not path.is_symlink()
+        ):
+            if _real_directory_chain(destination, directory):
+                (destination / directory).mkdir(
+                    parents=True, exist_ok=True, mode=0o700
+                )
+        for _relative, target in installs:
+            (destination / target).parent.mkdir(
+                parents=True, exist_ok=True, mode=0o700
+            )
+        if reader_uid is not None:
+            # Files are opened in staging; new directories are opened in place
+            # before any file is renamed into them.
+            grant_reader_work_access(hermes_home, staged, reader_uid)
+            grant_reader_work_access(hermes_home, destination, reader_uid)
+        for _relative, target in installs:
+            os.replace(staged / target, destination / target)
+        for relative in removals:
+            try:
+                (destination / relative).unlink()
+            except FileNotFoundError:
+                pass
+        os.utime(parent, None)
+    finally:
+        shutil.rmtree(staged, ignore_errors=True)
+    return {
+        "renamed": renamed,
+        "unpublished": unpublished,
+        "kept": sorted(kept),
+        "produced": sorted(produced + [target for _relative, target in installs]),
+    }
+
+
+def _newest_file_mtime(work: Path) -> float:
+    newest = 0.0
+    for current, _dirs, files in os.walk(work, followlinks=False):
+        for name in files:
+            try:
+                newest = max(newest, (Path(current) / name).lstat().st_mtime)
+            except OSError:
+                continue
+    return newest
+
+
+def _merge_legacy_workspaces_locked(
+    workspace_root: Path,
+    workspace: Path,
+    *,
+    hermes_home: Path,
+    reader_uid: str | None,
+) -> list[dict[str, Any]]:
+    """Merge every earlier per-conversation folder into the agent folder.
+
+    The caller holds the agent workspace lock.  Nothing is deleted: each
+    earlier folder is read under its own lock and left exactly as it was, and
+    the merge uses the publication rules with an empty base, so a file the
+    agent folder lacks is added, an identical file is left alone, and a
+    same-named file with different bytes keeps both versions (the one already
+    here keeps its name; the other is saved beside it with an ``m_<folder>``
+    tag).  Folders are merged newest first, so the most recently used copy
+    of a name keeps the plain name.  A record beside ``work/`` names each
+    merged folder, so a merge never repeats.
+    """
+    record_path = workspace / _MERGE_RECORD_FILE
+    try:
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        record = {}
+    except (OSError, ValueError):
+        logger.exception("Workspace merge record is unreadable; not merging")
+        return []
+    merged = record.get("merged") if isinstance(record, dict) else None
+    if not isinstance(merged, dict):
+        merged = {}
+    if not workspace_root.is_dir():
+        return []
+    candidates = [
+        path
+        for path in workspace_root.iterdir()
+        if path != workspace
+        and _LEGACY_WORKSPACE_RE.fullmatch(path.name)
+        and path.name not in merged
+        and path.is_dir()
+        and not path.is_symlink()
+    ]
+    if not candidates:
+        return []
+    candidates.sort(
+        key=lambda path: (_newest_file_mtime(path / "work"), path.name),
+        reverse=True,
+    )
+    results: list[dict[str, Any]] = []
+    destination = workspace / "work"
+    destination.mkdir(parents=True, exist_ok=True, mode=0o700)
+    for legacy in candidates:
+        legacy_work = legacy / "work"
+        entry: dict[str, Any] = {
+            "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "files": 0,
+            "same_name": [],
+            "renamed": {},
+            "unpublished": [],
+        }
+        if legacy_work.is_dir() and not legacy_work.is_symlink():
+            with _workspace_lock(f"legacy:{legacy.name}", legacy):
+                files = _work_manifest(legacy_work)
+                outcome = _publish_workspace(
+                    legacy_work,
+                    destination,
+                    {},
+                    run_id=f"m_{legacy.name[2:10]}",
+                    hermes_home=hermes_home,
+                    reader_uid=reader_uid,
+                )
+            entry["files"] = len(files)
+            entry["renamed"] = dict(outcome.get("renamed") or {})
+            entry["unpublished"] = list(outcome.get("unpublished") or [])
+            entry["same_name"] = sorted(
+                set(outcome.get("produced") or []) - set(entry["renamed"].values())
+            )
+        merged[legacy.name] = entry
+        results.append({"folder": legacy.name, **entry})
+        record = {"format": "hermes-agent-workspace-merge/v1", "merged": merged}
+        staged = record_path.with_name(f".{record_path.name}.{uuid.uuid4().hex}.tmp")
+        staged.write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
+        os.replace(staged, record_path)
+        logger.info(
+            "Merged sandbox workspace %s into the agent workspace: %d files, %d renamed",
+            legacy.name,
+            entry["files"],
+            len(entry["renamed"]),
+        )
+    return results
+
+
+def ensure_agent_workspace(
+    config: Mapping[str, Any] | None = None,
+    timeout: float | None = None,
+) -> Path | None:
+    """Return the agent workspace ``work/`` folder, merging earlier folders.
+
+    ``None`` when this deployment does not use ``workspace: agent``.
+    """
+    config = _load_config() if config is None else config
+    if not agent_workspace_enabled(config):
+        return None
+    hermes_home = get_hermes_home()
+    workspace_root = hermes_home / "sandbox_workspaces"
+    workspace = workspace_root / _workspace_key(AGENT_WORKSPACE_OWNER, config)
+    if (workspace / "work").is_dir() and not _unmerged_legacy_folders(
+        workspace_root, workspace
+    ):
+        # Nothing to merge: answer without waiting for a run that holds the
+        # folder (runs in agent mode hold the lock for their whole length).
+        return workspace / "work"
+    reader_uid = configured_reader_uid(config)
+    with _workspace_lock(AGENT_WORKSPACE_OWNER, workspace, timeout=timeout):
+        _merge_legacy_workspaces_locked(
+            workspace_root, workspace, hermes_home=hermes_home, reader_uid=reader_uid
+        )
+        (workspace / "work").mkdir(parents=True, exist_ok=True, mode=0o700)
+    return workspace / "work"
+
+
+def _unmerged_legacy_folders(workspace_root: Path, workspace: Path) -> bool:
+    """True when an earlier folder exists that the merge record does not name."""
+    if not workspace_root.is_dir():
+        return False
+    try:
+        record = json.loads((workspace / _MERGE_RECORD_FILE).read_text(encoding="utf-8"))
+        merged = set((record.get("merged") or {}).keys())
+    except (OSError, ValueError, AttributeError):
+        merged = set()
+    return any(
+        path != workspace
+        and _LEGACY_WORKSPACE_RE.fullmatch(path.name)
+        and path.name not in merged
+        for path in workspace_root.iterdir()
+    )
+
+
+def record_workspace_file(
+    source: str | Path,
+    *,
+    direction: str,
+    folder: str,
+    name: str | None = None,
+    details: Mapping[str, Any] | None = None,
+) -> str | None:
+    """Keep one file that came in or went out in the agent workspace records.
+
+    The canonical copy goes to ``records/<folder>/`` beside ``work/``, which
+    sandbox code sees read-only at ``/records``; the files log is there too.
+    Returns the ``records/...`` path, or ``None`` without an agent workspace.
+    Takes only the short records lock, never the sandbox run lock.
+    """
+    if not agent_workspace_enabled():
+        return None
+    from tools.pa_agent_workspace import keep_file
+
+    return keep_file(
+        source, direction=direction, folder=folder, name=name, details=details
+    )
+
+
+def _prepare_agent_run(
+    workspace: Path, config: Mapping[str, Any]
+) -> str | tuple[dict[str, dict[str, Any]], int]:
+    """Check and index the agent folder before a run; the caller holds the lock.
+
+    Returns a refusal message, or the pre-run index and the size the run may
+    grow the folder to.  A folder that cannot be inspected is quarantined.
+    """
+    from tools import pa_agent_workspace as store
+
+    store.ensure_layout(workspace)
+    reason = store.quarantined(workspace)
+    if reason:
+        return (
+            f"the workspace is quarantined ({reason}); an operator must inspect "
+            "it and remove private/.quarantined"
+        )
+    work = workspace / "work"
+    with contextlib.suppress(FileNotFoundError, IsADirectoryError, PermissionError):
+        if not stat.S_ISDIR(os.lstat(work / "result.json").st_mode):
+            os.unlink(work / "result.json")
+    try:
+        files, used, _removed = store.inspect_work(work, strip=True)
+    except store.WorkspaceInspectionError as exc:
+        store.quarantine(workspace, str(exc))
+        return "the workspace could not be inspected and is quarantined"
+    limits = _limits(config)
+    limit = limits["workspace_mb"] * 1024 * 1024
+    if shutil.disk_usage(work).free < limits["min_free_mb"] * 1024 * 1024:
+        return (
+            f"the host disk has less than {limits['min_free_mb']}MB free; "
+            "the run was refused"
+        )
+    before = store.sync_index(workspace, files)
+    # Over the limit, a run may still delete: it must not grow the folder.
+    return before, (limit if used <= limit else used)
+
+
+def _agent_run_over_limit(
+    work: Path, cap: int, limits: Mapping[str, int]
+) -> str | bool:
+    """Why a running run must stop, or False.  Fails closed."""
+    from tools import pa_agent_workspace as store
+
+    try:
+        _files, used, _removed = store.inspect_work(work, strip=False)
+    except store.WorkspaceInspectionError as exc:
+        return f"the workspace could not be inspected ({exc})"
+    if used > cap:
+        return f"workspace size limit ({limits['workspace_mb']}MB) exceeded"
+    if shutil.disk_usage(work).free < limits["min_free_mb"] * 1024 * 1024:
+        return f"host disk free space fell below {limits['min_free_mb']}MB"
+    return False
+
+
+def _finish_agent_run(
+    workspace: Path,
+    run_work: Path,
+    *,
+    run_id: str,
+    context: str,
+    before: Mapping[str, Mapping[str, Any]],
+    killed: bool,
+) -> dict[str, Any]:
+    """Clean, record or roll back a finished run; the caller holds the lock."""
+    from tools import pa_agent_workspace as store
+
+    work = workspace / "work"
+    outcome: dict[str, Any] = {"changed": [], "shas": {}, "removed": []}
+    _take_run_result(work, run_work)
+    try:
+        after, used, removed = store.inspect_work(work, strip=True)
+    except store.WorkspaceInspectionError as exc:
+        store.quarantine(workspace, str(exc))
+        outcome["error"] = (
+            "the workspace could not be inspected after the run and is quarantined"
+        )
+        return outcome
+    outcome["removed"] = removed
+    if killed:
+        # A stopped run may have left a half-written file: undo it.
+        outcome["rolled_back"] = store.roll_back_run(
+            workspace, run_id=run_id, before=before, after=after
+        )
+        return outcome
+    changed, shas = store.record_run_outputs(
+        workspace, run_id=run_id, context=context, before=before, after=after
+    )
+    outcome["changed"], outcome["shas"] = changed, shas
+    limits = _limits(_load_config())
+    if used > limits["workspace_mb"] * 1024 * 1024:
+        outcome["over_limit"] = (
+            f"The workspace now holds {used / 1024**2:.0f}MB, over its "
+            f"{limits['workspace_mb']}MB limit. Until it is under the limit, a "
+            "run may only delete files or keep the folder the same size."
+        )
+    return outcome
+
+
+def _take_run_result(work: Path, run_work: Path) -> None:
+    """Move this run's result.json out of the persistent folder."""
+    result = work / "result.json"
+    try:
+        mode = os.lstat(result).st_mode
+    except FileNotFoundError:
+        return
+    if stat.S_ISREG(mode):
+        run_work.mkdir(parents=True, exist_ok=True, mode=0o700)
+        shutil.move(str(result), str(run_work / "result.json"))
+    elif not stat.S_ISDIR(mode):
+        result.unlink()
+
+
+def workspace_files_for_message(
+    message_id: str, *, chat_id: str | None = None
+) -> list[dict[str, Any]]:
+    """Files-log entries carried by one WhatsApp message.
+
+    An entry matches on the message that carried the file (``message_id``)
+    or on the text message of the same delivery (``text_message_id``).
+    Empty when there is no agent workspace or no record.
+    """
+    wanted = str(message_id or "").strip()
+    if not wanted or not agent_workspace_enabled():
+        return []
+    from tools.pa_agent_workspace import files_log_entries
+
+    found: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for entry in files_log_entries():
+        if wanted not in {
+            str(entry.get("message_id") or ""),
+            str(entry.get("text_message_id") or ""),
+        }:
+            continue
+        if chat_id and entry.get("chat_id") and str(entry["chat_id"]) != str(chat_id):
+            continue
+        if entry.get("path") in seen:
+            continue
+        seen.add(str(entry.get("path")))
+        found.append(entry)
+    return found
+
+
+def _local_time_label(at: str) -> str:
+    from datetime import datetime, timezone
+
+    try:
+        moment = datetime.strptime(at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return ""
+    try:
+        from hermes_time import get_timezone
+
+        zone = get_timezone()
+    except Exception:
+        zone = None
+    local = moment.astimezone(zone) if zone is not None else moment.astimezone()
+    return f"{local:%H:%M} on {local.day} {local:%b}"
+
+
+def describe_quoted_workspace_files(
+    message_id: str, *, chat_id: str | None = None
+) -> str | None:
+    """Plain context for a turn that quotes a message which carried a file.
+
+    Information for the model, not a rule.  ``None`` when the quoted message
+    has no file record.
+    """
+    entries = workspace_files_for_message(message_id, chat_id=chat_id)
+    if not entries:
+        return None
+    first = entries[0]
+    when = _local_time_label(str(first.get("at") or ""))
+    at_text = f" {when}" if when else ""
+    paths = ", ".join(f"/{entry['path']}" for entry in entries if entry.get("path"))
+    direction = str(first.get("direction") or "")
+    # The exact name the chat showed, where one was recorded and it differs
+    # from the saved file's name.
+    shown = ", ".join(
+        f"'{name}'"
+        for name, saved in (
+            (
+                str(entry.get("original_name") or entry.get("display_name") or ""),
+                Path(str(entry.get("path") or "")).name,
+            )
+            for entry in entries
+        )
+        if name and name != saved
+    )
+    if direction == "received":
+        named = f" named {shown}" if shown else ""
+        return (
+            f"[The sender is replying to an earlier{at_text} message in this chat "
+            f"that sent you a file{named}, now saved as {paths}.]"
+        )
+    shown_note = f", shown in the chat as {shown}" if shown else ""
+    if direction == "scheduled_delivery":
+        job = str(first.get("scheduled_job_name") or first.get("scheduled_job_id") or "")
+        by = f" by the scheduled job '{job}'" if job else " by a scheduled job"
+        return (
+            f"[The sender is replying to your{at_text} delivery, sent{by}, "
+            f"which carried {paths}{shown_note}.]"
+        )
+    return (
+        f"[The sender is replying to your{at_text} message, which carried {paths}{shown_note}.]"
+    )
 
 
 def _prune_workspaces(
@@ -807,9 +1717,24 @@ def _prune_workspaces(
     except (TypeError, ValueError):
         ttl, keep = 7 * 86400, 40
     now = time.time()
+    # Never prune the agent workspace, or any earlier folder it merged: they
+    # are what a rollback from agent mode goes back to.
+    agent_name = _workspace_key(AGENT_WORKSPACE_OWNER, {"workspace": "agent"})
+    protected = {agent_name}
+    try:
+        record = json.loads(
+            (root / agent_name / _MERGE_RECORD_FILE).read_text(encoding="utf-8")
+        )
+        protected.update((record.get("merged") or {}).keys())
+    except (OSError, ValueError, AttributeError):
+        pass
     entries = (
         sorted(
-            (path for path in root.iterdir() if path.is_dir()),
+            (
+                path
+                for path in root.iterdir()
+                if path.is_dir() and path.name not in protected
+            ),
             key=lambda path: path.stat().st_mtime,
             reverse=True,
         )
@@ -826,21 +1751,6 @@ def _prune_workspaces(
             shutil.rmtree(path, ignore_errors=True)
         else:
             kept += 1
-
-
-def _replace_workspace(source: Path, destination: Path) -> None:
-    """Mirror one completed run into its retained session workspace."""
-    parent = destination.parent
-    parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    staged = parent / f".work-{uuid.uuid4().hex}.tmp"
-    try:
-        shutil.copytree(source, staged, ignore=shutil.ignore_patterns("result.json"))
-        if destination.exists():
-            shutil.rmtree(destination)
-        os.replace(staged, destination)
-        os.utime(parent, None)
-    finally:
-        shutil.rmtree(staged, ignore_errors=True)
 
 
 def _kill_group(proc: subprocess.Popen, grace: float = 5.0) -> None:
@@ -888,11 +1798,45 @@ def python_sandbox(
     timeout_seconds: Any = None,
     *,
     session_id: str | None = None,
+    run_context: str | None = None,
 ) -> str:
     config = _load_config()
     available, reason = _probe(force=True)
     if not available:
         return _unavailable(reason)
+    if _workspace_mode(config) == "agent":
+        # One folder for every conversation, job and helper (PA-203 round 2),
+        # mounted directly at /work.  Runs on it are serialised: the lock is
+        # held for the whole run, so no two runs write the folder at once.
+        workspace = (
+            get_hermes_home()
+            / "sandbox_workspaces"
+            / _workspace_key(AGENT_WORKSPACE_OWNER, config)
+        )
+        # The wait is bounded by one run's longest possible length.
+        wait = float(_limits(config)["max_wall_seconds"]) + 30.0
+        try:
+            with _workspace_lock(AGENT_WORKSPACE_OWNER, workspace, timeout=wait):
+                return _run_python_sandbox(
+                    code,
+                    datasets,
+                    input_json,
+                    timeout_seconds,
+                    config=config,
+                    session_id=AGENT_WORKSPACE_OWNER,
+                    run_context=run_context or session_id,
+                )
+        except TimeoutError:
+            return json.dumps(
+                {
+                    "status": "error",
+                    "error": (
+                        "another sandbox run kept the workspace busy for too long; "
+                        "try again shortly"
+                    ),
+                    "result": None,
+                }
+            )
     if _workspace_mode(config) == "session":
         if not isinstance(session_id, str) or not session_id.strip():
             return json.dumps(
@@ -902,15 +1846,16 @@ def python_sandbox(
                     "result": None,
                 }
             )
-        with _workspace_lock(session_id):
-            return _run_python_sandbox(
-                code,
-                datasets,
-                input_json,
-                timeout_seconds,
-                config=config,
-                session_id=session_id,
-            )
+        # Runs sharing one workspace execute concurrently; _run_python_sandbox
+        # locks only the seed snapshot and the per-file merge publication.
+        return _run_python_sandbox(
+            code,
+            datasets,
+            input_json,
+            timeout_seconds,
+            config=config,
+            session_id=session_id,
+        )
     return _run_python_sandbox(
         code,
         datasets,
@@ -929,6 +1874,7 @@ def _run_python_sandbox(
     *,
     config: Mapping[str, Any],
     session_id: str | None,
+    run_context: str | None = None,
 ) -> str:
     if not isinstance(code, str) or not code.strip():
         return json.dumps(
@@ -956,6 +1902,11 @@ def _run_python_sandbox(
             {"status": "error", "error": "input_json exceeds 32KB", "result": None}
         )
 
+    try:
+        reader_uid = configured_reader_uid(config)
+    except SandboxReaderPolicyError as exc:
+        return json.dumps({"status": "error", "error": str(exc), "result": None})
+
     run_id = f"r_{uuid.uuid4().hex[:8]}"
     hermes_home = get_hermes_home()
     root = hermes_home / "sandbox_runs"
@@ -964,8 +1915,12 @@ def _run_python_sandbox(
     workspace_root = hermes_home / "sandbox_workspaces"
     workspace = None
     seed_work = None
+    agent_mode = _workspace_mode(config) == "agent"
+    direct_work: Path | None = None
+    direct_before: dict[str, dict[str, Any]] = {}
+    growth_cap = 0
     if session_id is not None:
-        workspace = workspace_root / _workspace_key(session_id)
+        workspace = workspace_root / _workspace_key(session_id, config)
     for path in (root, run, inputs, work):
         path.mkdir(parents=True, exist_ok=True, mode=0o700)
     (run / "script.py").write_text(code, encoding="utf-8")
@@ -979,10 +1934,68 @@ def _run_python_sandbox(
         return json.dumps(
             {"status": status, "error": error, "run_id": run_id, "result": None}
         )
+    seed_base: dict[str, str] = {}
     if workspace is not None:
-        _prune_workspaces(workspace_root, config, exclude=workspace)
-        seed_work = workspace / "work"
-        seed_work.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if not agent_mode:
+            # The agent workspace keeps every earlier folder until an
+            # operator removes it after the merge is verified.
+            _prune_workspaces(workspace_root, config, exclude=workspace)
+        retained_work = workspace / "work"
+        seed_work = None if agent_mode else run / "seed"
+        # In agent mode python_sandbox() already holds this lock for the run.
+        with nullcontext() if agent_mode else _workspace_lock(session_id, workspace):
+            if agent_mode:
+                try:
+                    _merge_legacy_workspaces_locked(
+                        workspace_root,
+                        workspace,
+                        hermes_home=hermes_home,
+                        reader_uid=reader_uid,
+                    )
+                except (OSError, SandboxReaderPolicyError) as exc:
+                    logger.exception("Could not merge earlier sandbox workspaces")
+                    shutil.rmtree(run, ignore_errors=True)
+                    return json.dumps(
+                        {
+                            "status": "error",
+                            "error": f"workspace merge failed: {exc}",
+                            "result": None,
+                        }
+                    )
+            retained_work.mkdir(parents=True, exist_ok=True, mode=0o700)
+            # In agent mode the reader reads only records/sent, never work/.
+            if reader_uid is not None and not agent_mode:
+                try:
+                    grant_reader_work_access(hermes_home, retained_work, reader_uid)
+                except SandboxReaderPolicyError as exc:
+                    logger.exception(
+                        "Could not apply sandbox reader ACL before execution"
+                    )
+                    return json.dumps(
+                        {"status": "error", "error": str(exc), "result": None}
+                    )
+            if agent_mode:
+                refusal = _prepare_agent_run(workspace, config)
+                if isinstance(refusal, str):
+                    shutil.rmtree(run, ignore_errors=True)
+                    return json.dumps(
+                        {"status": "error", "error": refusal, "result": None}
+                    )
+                direct_before, growth_cap = refusal
+                direct_work = retained_work
+            try:
+                if not agent_mode:
+                    seed_base = _snapshot_workspace(retained_work, seed_work)
+            except OSError as exc:
+                logger.exception("Could not snapshot the sandbox workspace")
+                shutil.rmtree(run, ignore_errors=True)
+                return json.dumps(
+                    {
+                        "status": "error",
+                        "error": f"workspace snapshot failed: {exc.strerror or exc}",
+                        "result": None,
+                    }
+                )
 
     limits = _limits(config)
     sqlite_datasets = {
@@ -1005,6 +2018,15 @@ def _run_python_sandbox(
             limits["scratch_mb"],
             sqlite_datasets,
             seed_work,
+            reader_uid is not None,
+            **(
+                {
+                    "direct_work": direct_work,
+                    "direct_records": workspace / "records",
+                }
+                if direct_work is not None
+                else {}
+            ),
         ),
         encoding="utf-8",
     )
@@ -1013,6 +2035,7 @@ def _run_python_sandbox(
     status, stdout, stderr, returncode = "error", "", "", -1
     timed_out = False
     interrupted_requested = False
+    workspace_limit_hit: str | bool = False
     try:
         proc = subprocess.Popen(
             [
@@ -1030,7 +2053,11 @@ def _run_python_sandbox(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             stdin=subprocess.DEVNULL,
-            env=_build_env(mounts, sqlite_datasets=sqlite_datasets),
+            env=_build_env(
+                mounts,
+                sqlite_datasets=sqlite_datasets,
+                direct=direct_work is not None,
+            ),
             preexec_fn=_preexec(limits),
         )
         stdout_head: list[bytes] = []
@@ -1059,7 +2086,19 @@ def _run_python_sandbox(
         stderr_reader.start()
         deadline = time.monotonic() + wall
         activity_state = {"last_touch": started, "start": started}
+        next_size_check = started + 2.0
         while proc.poll() is None:
+            if direct_work is not None and time.monotonic() >= next_size_check:
+                # No tmpfs caps a directly mounted /work; stop a run that
+                # grows the workspace past its limit or eats the disk's free
+                # space.  A folder that cannot be inspected counts as over.
+                next_size_check = time.monotonic() + 2.0
+                workspace_limit_hit = _agent_run_over_limit(
+                    direct_work, growth_cap, limits
+                )
+                if workspace_limit_hit:
+                    _kill_group(proc)
+                    break
             try:
                 from tools.interrupt import is_interrupted
 
@@ -1088,6 +2127,9 @@ def _run_python_sandbox(
         returncode = proc.returncode if proc.returncode is not None else -1
         if timed_out:
             status = "timeout"
+        elif workspace_limit_hit:
+            status = "error"
+            stderr += f"\n{workspace_limit_hit} — the run was stopped and rolled back"
         elif returncode == 0:
             status = "success"
         elif interrupted_requested:
@@ -1111,20 +2153,91 @@ def _run_python_sandbox(
 
     duration = round(time.monotonic() - started, 3)
     export_complete = work / _EXPORT_COMPLETE
-    if export_complete.exists():
+    publication_error: SandboxReaderPolicyError | None = None
+    publication: dict[str, Any] = {"renamed": {}, "unpublished": [], "kept": []}
+    direct_outcome: dict[str, Any] | None = None
+    if direct_work is not None:
+        killed = bool(
+            timed_out
+            or workspace_limit_hit
+            or interrupted_requested
+            or returncode < 0
+            or returncode in (137, 128 + signal.SIGXCPU)
+        )
+        direct_outcome = _finish_agent_run(
+            workspace,
+            work,
+            run_id=run_id,
+            context=run_context or "",
+            before=direct_before,
+            killed=killed,
+        )
+        if direct_outcome.get("error"):
+            status = "error"
+            stderr += f"\n{direct_outcome['error']}"
+        collector = _BOUND_PUBLISHED.get()
+        if collector is not None:
+            collector.update(direct_outcome.get("changed") or [])
+    elif export_complete.exists():
         export_complete.unlink()
         if workspace is not None:
-            _replace_workspace(work, workspace / "work")
-    payload, harvest_error = _harvest(
-        work,
-        stdout,
-        stderr,
-        status,
-        limits,
-        run_id=run_id,
-        artifact_url_base=config.get("artifact_url_base"),
-        media_retention=config.get("media_retention"),
-    )
+            try:
+                with _workspace_lock(session_id, workspace):
+                    publication = _publish_workspace(
+                        work,
+                        workspace / "work",
+                        seed_base,
+                        run_id=run_id,
+                        hermes_home=hermes_home,
+                        reader_uid=reader_uid,
+                    )
+                collector = _BOUND_PUBLISHED.get()
+                if collector is not None:
+                    collector.update(publication.get("produced") or [])
+            except SandboxReaderPolicyError as exc:
+                logger.exception("Could not apply sandbox reader ACL before publication")
+                publication_error = exc
+    if publication_error is None:
+        payload, harvest_error = _harvest(
+            work,
+            stdout,
+            stderr,
+            status,
+            limits,
+            run_id=run_id,
+            artifact_url_base=config.get("artifact_url_base"),
+            media_retention=config.get("media_retention"),
+        )
+        if direct_outcome is not None:
+            # Report what this run created or changed, not the whole folder,
+            # with the exact version recorded for each file.
+            shas = direct_outcome.get("shas") or {}
+            payload["files"] = _list_files(
+                direct_work,
+                run_id=run_id,
+                artifact_url_base=config.get("artifact_url_base"),
+                media_retention=config.get("media_retention"),
+                only=list(direct_outcome.get("changed") or []),
+            )
+            for item in payload["files"]:
+                sha = shas.get(str(item.get("path") or "")[len("work/"):])
+                if sha:
+                    item["sha256"] = sha
+            if direct_outcome.get("removed"):
+                payload["workspace_removed_links"] = [
+                    f"work/{relative}" for relative in direct_outcome["removed"]
+                ]
+            if direct_outcome.get("rolled_back"):
+                payload["workspace_rolled_back"] = direct_outcome["rolled_back"]
+            if direct_outcome.get("over_limit"):
+                payload["workspace_over_limit"] = direct_outcome["over_limit"]
+    else:
+        payload = {
+            "status": "error",
+            "error": str(publication_error),
+            "result": None,
+        }
+        harvest_error = None
     payload.update(
         {
             "datasets_attached": datasets,
@@ -1146,6 +2259,36 @@ def _run_python_sandbox(
         payload["error"] = (
             payload.get("stderr") or "sandbox process failed"
         ).strip().splitlines()[-1]
+    renamed = publication.get("renamed") or {}
+    if renamed:
+        for item in payload.get("files") or []:
+            relative = str(item.get("path") or "")[len("work/"):]
+            if relative in renamed:
+                item["path"] = f"work/{renamed[relative]}"
+        payload["workspace_renamed"] = [
+            {"written": f"work/{written}", "saved_as": f"work/{saved}"}
+            for written, saved in sorted(renamed.items())
+        ]
+        payload["workspace_note"] = (
+            "Another task using this folder changed a file with the same "
+            "name while this run executed, or the folder already holds a "
+            "different kind of entry at that name. The existing entry keeps "
+            "its name; this run's file was saved as saved_as. Use "
+            "files[].path exactly."
+        )
+    if publication.get("unpublished"):
+        payload["workspace_unpublished"] = [
+            f"work/{relative}" for relative in publication["unpublished"]
+        ]
+    if publication.get("kept"):
+        payload["workspace_kept"] = [
+            f"work/{relative}" for relative in publication["kept"]
+        ]
+        payload["workspace_kept_note"] = (
+            "This run replaced these files with a directory, link or special "
+            "file, or its copy could not be read. The retained folder "
+            "keeps the previous file under the same name."
+        )
     payload = _sanitize_value(payload)
     meta = {
         "run_id": run_id,
@@ -1158,8 +2301,9 @@ def _run_python_sandbox(
     (run / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
     shutil.rmtree(inputs, ignore_errors=True)
     shutil.rmtree(run / "jail", ignore_errors=True)
+    shutil.rmtree(run / "seed", ignore_errors=True)
     _prune_runs(root, config)
-    if workspace is not None:
+    if workspace is not None and not agent_mode:
         _prune_workspaces(workspace_root, config, exclude=workspace)
     return json.dumps(payload, ensure_ascii=False)
 
@@ -1173,12 +2317,14 @@ def _handle_python_sandbox(
     available, reason = _probe(force=True)
     if not available:
         return _unavailable(reason)
+    workspace_owner = current_workspace_owner(session_id)
     return python_sandbox(
         args.get("code", ""),
         args.get("datasets"),
         args.get("input_json"),
         args.get("timeout_seconds"),
-        session_id=session_id,
+        session_id=workspace_owner,
+        run_context=current_run_context(session_id),
     )
 
 
@@ -1193,8 +2339,9 @@ _BASE_DESCRIPTION = (
     "~50 items, sums/statistics, and parsing spreadsheets or CSVs. Aggregate "
     "in code. Print only counts, totals, and up to ~20 examples. Write the "
     "structured answer to RESULT_PATH as JSON (8KB cap); keep large detail "
-    "in /work files. A promoted workbook's files[] media_ref is its native "
-    "attachment reference; client_url is its secondary shareable link."
+    "in /work files. files[].path is sandbox-local and may be attached only "
+    "where the active sender supports it. When present, files[].media_ref is "
+    "a retained attachment reference and client_url is its secondary shareable link."
 )
 
 PYTHON_SANDBOX_SCHEMA = {
@@ -1255,9 +2402,27 @@ def _schema_overrides() -> dict[str, str]:
         if importlib.util.find_spec(name) is not None
     ]
     library_text = f" plus {', '.join(libraries)}." if libraries else "."
+    workspace_text = (
+        "\n\n/work in this deployment is one persistent folder shared by all "
+        "your conversations, scheduled jobs and helpers, and it is kept when "
+        "the model changes. Your code works in it directly: what you write, "
+        "change or delete there is the folder's state, and runs take turns. "
+        "To change an existing file, write a new file and then os.replace it "
+        "over the old one; a run stopped by its time or size limit is rolled "
+        "back, and files it had only started are kept as "
+        "<name>.incomplete-<run>. Scratch files, TMPDIR and sqlite datasets "
+        "are under /scratch and are discarded after the run. /records is "
+        "read-only: files people send you (documents and photos) are in "
+        "/records/received/, files that were sent are in /records/sent/ "
+        f"exactly as sent, and /records/{FILES_LOG_NAME} has one line per file "
+        "with its time, direction, chat, WhatsApp message id and exact path. "
+        "Check it for the newest version of a file before reworking an older one."
+        if agent_workspace_enabled(config)
+        else ""
+    )
     return {
         "description": (
-            f"{_BASE_DESCRIPTION}\n\nDatasets (pass names in datasets): "
+            f"{_BASE_DESCRIPTION}{workspace_text}\n\nDatasets (pass names in datasets): "
             f"{listing}. SQLite datasets are point-in-time read-only "
             f"snapshots. Libraries: Python stdlib{library_text}"
         )

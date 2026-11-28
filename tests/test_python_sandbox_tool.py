@@ -117,6 +117,74 @@ def test_handler_forwards_explicit_session_id(monkeypatch):
     assert captured["session_id"] == "chat-a"
 
 
+def test_handler_prefers_stable_runtime_session_key(monkeypatch):
+    from gateway.session_context import clear_session_vars, set_session_vars
+
+    monkeypatch.setattr(sandbox, "_probe", lambda force=False: (True, "ok"))
+    captured = {}
+
+    def fake_python_sandbox(*args, **kwargs):
+        captured.update(kwargs)
+        return json.dumps({"status": "success"})
+
+    monkeypatch.setattr(sandbox, "python_sandbox", fake_python_sandbox)
+    tokens = set_session_vars(
+        session_key="gateway-stable-owner",
+        session_id="compressed-child-session",
+    )
+    try:
+        response = json.loads(
+            sandbox._handle_python_sandbox(
+                {"code": "print(1)"}, session_id="compressed-child-session"
+            )
+        )
+    finally:
+        clear_session_vars(tokens)
+    assert response["status"] == "success"
+    assert captured["session_id"] == "gateway-stable-owner"
+
+
+def test_resolve_sandbox_work_path_confines_regular_files(tmp_path, monkeypatch):
+    monkeypatch.setattr(sandbox, "get_hermes_home", lambda: tmp_path)
+    owner = "runtime-owned-session"
+    work = (
+        tmp_path
+        / "sandbox_workspaces"
+        / sandbox._workspace_key(owner)
+        / "work"
+    )
+    work.mkdir(parents=True)
+    report = work / "report.xlsx"
+    report.write_bytes(b"PK\x03\x04workbook")
+
+    assert sandbox.resolve_sandbox_work_path("work/report.xlsx", owner) == report
+    assert sandbox.resolve_sandbox_work_path("/work/report.xlsx", owner) == report
+
+    (work / "folder").mkdir()
+    outside = tmp_path / "outside.xlsx"
+    outside.write_bytes(b"outside")
+    (work / "linked.xlsx").symlink_to(outside)
+    other = (
+        tmp_path
+        / "sandbox_workspaces"
+        / sandbox._workspace_key("other-owner")
+        / "work"
+    )
+    other.mkdir(parents=True)
+    (other / "report.xlsx").write_bytes(b"other")
+
+    for refused in (
+        "work/",
+        "work/../outside.xlsx",
+        "work/missing.xlsx",
+        "work/folder",
+        "work/linked.xlsx",
+        "/tmp/report.xlsx",
+    ):
+        with pytest.raises(ValueError):
+            sandbox.resolve_sandbox_work_path(refused, owner)
+
+
 def test_unknown_dataset_lists_valid_names(tmp_path):
     db, csv = tmp_path / "records.db", tmp_path / "input.csv"
     _db(db)
@@ -251,6 +319,34 @@ def test_system_base_prefix_needs_no_duplicate_mount(tmp_path):
         run, {}, Path("/opt/runtime"), base_prefix=Path("/usr/local")
     )
     assert 'ro_dir /usr/local "$JAIL/usr/local"' not in script
+
+
+def test_reader_seed_copy_drops_host_acl_xattrs_and_ownership(tmp_path):
+    run = tmp_path / "run"
+    (run / "inputs").mkdir(parents=True)
+    (run / "work").mkdir()
+    (run / "script.py").write_text("", encoding="utf-8")
+    (run / "inputs" / "params.json").write_text("{}", encoding="utf-8")
+    seed = tmp_path / "seed"
+    seed.mkdir()
+
+    default_script = sandbox._generate_init_script(
+        run,
+        {},
+        Path("/opt/runtime"),
+        seed_work=seed,
+    )
+    reader_script = sandbox._generate_init_script(
+        run,
+        {},
+        Path("/opt/runtime"),
+        seed_work=seed,
+        strip_seed_metadata=True,
+    )
+
+    assert 'cp -a "$JAIL/seed/." "$JAIL/work/"' in default_script
+    assert '--no-preserve=all "$JAIL/seed/." "$JAIL/work/"' in reader_script
+    assert "cp -a" not in reader_script
 
 
 def test_child_env_scrubs_secrets_and_exposes_contract_paths(tmp_path):

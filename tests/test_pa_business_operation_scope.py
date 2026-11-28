@@ -180,7 +180,10 @@ def test_large_case_query_becomes_session_sandbox_artifact(
         business_tools, "execute_business_operation",
         lambda *_args, **_kwargs: {"ok": True, "columns": ["n", "value"], "rows": rows},
     )
-    tokens = set_session_vars(session_id="cron-report-session")
+    tokens = set_session_vars(
+        session_key="stable-report-owner",
+        session_id="compressed-report-session",
+    )
     try:
         if entrance == "dedicated":
             raw = business_tools._handle_tgg_case_query({"sql": "SELECT * FROM t"})
@@ -198,10 +201,52 @@ def test_large_case_query_becomes_session_sandbox_artifact(
     assert response["sandbox_artifact"].startswith("/work/pa-query-")
     assert "datasets omitted" in response["sandbox_artifact_usage"]
     assert "do not delegate" in response["sandbox_artifact_usage"]
-    path = tmp_path / "sandbox_workspaces" / _workspace_key("cron-report-session") / "work" / response["sandbox_artifact"].split("/")[-1]
+    path = tmp_path / "sandbox_workspaces" / _workspace_key("stable-report-owner") / "work" / response["sandbox_artifact"].split("/")[-1]
     artifact_bytes = path.read_bytes()
     assert hashlib.sha256(artifact_bytes).hexdigest() == response["sandbox_artifact_sha256"]
     assert json.loads(artifact_bytes)["rows"] == rows
+
+
+def test_large_case_query_applies_configured_reader_policy(tmp_path, monkeypatch):
+    import json
+    import tools.pa_business_tools as business_tools
+    import tools.python_sandbox_access as reader_access
+    import tools.python_sandbox_tool as sandbox_tool
+    import hermes_constants
+    from gateway.session_context import clear_session_vars, set_session_vars
+
+    monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(
+        sandbox_tool, "_load_config", lambda: {"reader_identity": "tggcapture"}
+    )
+    monkeypatch.setattr(reader_access, "configured_reader_uid", lambda _config: "999")
+    granted = []
+    monkeypatch.setattr(
+        reader_access,
+        "grant_reader_work_access",
+        lambda home, work, uid: granted.append((home, work, uid)),
+    )
+    rows = [[index, "x" * 120] for index in range(200)]
+    tokens = set_session_vars(session_key="stable-report-owner")
+    try:
+        result = business_tools._materialize_large_tgg_query_result(
+            "tgg_case_query",
+            {"ok": True, "columns": ["n", "value"], "rows": rows},
+        )
+    finally:
+        clear_session_vars(tokens)
+
+    assert result["sandbox_artifact"].startswith("/work/pa-query-")
+    assert granted == [
+        (
+            tmp_path,
+            tmp_path
+            / "sandbox_workspaces"
+            / sandbox_tool._workspace_key("stable-report-owner")
+            / "work",
+            "999",
+        )
+    ]
 
 
 def test_small_generic_case_query_stays_inline(tmp_path, monkeypatch):

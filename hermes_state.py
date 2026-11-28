@@ -26,7 +26,7 @@ from pathlib import Path
 
 from agent.memory_manager import sanitize_context
 from hermes_constants import get_hermes_home
-from typing import Any, Callable, Dict, Iterable, List, Optional, TypeVar
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, TypeVar
 
 logger = logging.getLogger(__name__)
 
@@ -2807,6 +2807,50 @@ class SessionDB:
                 continue
             messages.append(msg)
         return messages
+
+    def conversation_message_index(self, session_id: str) -> Dict[Tuple[str, str], Dict[str, Any]]:
+        """Where each conversation message of a session's lineage is first stored.
+
+        Covers user-role rows and assistant text replies (assistant rows with
+        no tool calls) of the session and its compaction ancestors.  Maps
+        ``(role, content)``, with content normalised as
+        ``get_messages_as_conversation`` hands it to the agent, to the
+        earliest row holding it: ``{"sent_at", "session_id", "message_id"}``.
+        Compaction rewrites kept messages into the new session with a new
+        timestamp, so the earliest row is the original.  Used to time and
+        cite messages carried through compaction (PA-648).
+        """
+        if not session_id:
+            return {}
+        session_ids = self._session_lineage_root_to_tip(session_id)
+        placeholders = ",".join("?" for _ in session_ids)
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, session_id, role, content, timestamp FROM messages "
+                "INDEXED BY idx_messages_session "
+                f"WHERE session_id IN ({placeholders}) "
+                "AND (role = 'user' OR (role = 'assistant' AND "
+                "(tool_calls IS NULL OR tool_calls = '' OR tool_calls = '[]'))) "
+                "ORDER BY id",
+                tuple(session_ids),
+            ).fetchall()
+        index: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        for row in rows:
+            content = self._decode_content(row["content"])
+            if not isinstance(content, str):
+                continue
+            text = sanitize_context(content).strip()
+            if not text:
+                continue
+            key = (row["role"], text)
+            found = index.get(key)
+            if found is None or row["timestamp"] < found["sent_at"]:
+                index[key] = {
+                    "sent_at": float(row["timestamp"]),
+                    "session_id": row["session_id"],
+                    "message_id": int(row["id"]),
+                }
+        return index
 
     def _session_lineage_root_to_tip(self, session_id: str) -> List[str]:
         if not session_id:

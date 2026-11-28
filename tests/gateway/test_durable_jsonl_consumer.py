@@ -5,7 +5,7 @@ import json
 import os
 import sqlite3
 import zipfile
-from datetime import datetime
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from pathlib import Path
 
@@ -16,6 +16,14 @@ from gateway import durable_jsonl_consumer as consumer
 from gateway.config import GatewayConfig, Platform
 from gateway.replay import replay_context
 from gateway.session import SessionSource, SessionStore
+
+
+@pytest.fixture(autouse=True)
+def _stop_media_retention_threads():
+    """Retention runs on its own pool (PA-203); run_consumer shuts it down,
+    and tests that call the retention paths directly do so here."""
+    yield
+    consumer._shutdown_retention_executor()
 
 
 def _message(message_id: str, chat_id: str = "test-group@g.us") -> dict:
@@ -1429,7 +1437,7 @@ async def test_pending_production_video_bypasses_retention_and_completes(
 
 
 @pytest.mark.asyncio
-async def test_production_normalized_missing_image_stays_pending_and_once_survives(
+async def test_production_normalized_missing_image_is_not_held_and_hold_stays_visible(
     tmp_path, monkeypatch
 ):
     args = _enabled_consumer_args(tmp_path, [])
@@ -1456,8 +1464,13 @@ async def test_production_normalized_missing_image_stays_pending_and_once_surviv
     )
     assert await consumer.run_consumer(args) == 0
     inbox = consumer.DurableInbox(Path(args.inbox))
-    assert inbox.counts() == {"pending": 1}
-    assert inbox.retention_counts()["retention_failures"] == 1
+    # PA-203: retention no longer holds the row.  It takes its normal path
+    # (here the fixture's mention rule skips it); the hold stays visible.
+    # The capture lane and the skip path both reach it; one attempt counts.
+    assert inbox.counts() == {"skipped": 1}
+    counts = inbox.retention_counts()
+    assert counts["retention_failures"] == 1
+    assert counts["retention_held"] == 1
     status = json.loads(Path(args.status_file).read_text())
     assert status["state"] == "held-pending"
     assert "media source is unavailable" in status["retention_hold"]
@@ -1498,13 +1511,15 @@ async def test_one_chat_retention_hold_does_not_kill_other_chat(tmp_path, monkey
     monkeypatch.setattr(consumer, "_new_gateway_runner", lambda *_a, **_k: object())
     assert await consumer.run_consumer(args) == 0
     inbox = consumer.DurableInbox(Path(args.inbox))
-    assert inbox.counts() == {"completed": 1, "pending": 1}
+    assert inbox.counts() == {"completed": 1, "skipped": 1}
     with inbox.connect() as conn:
         states = {
             row["message_id"]: row["status"]
             for row in conn.execute("SELECT message_id,status FROM ingress_events")
         }
-    assert states == {"MISSING": "pending", "HEALTHY": "completed"}
+    # PA-203: the held row is no longer kept pending; the fixture's mention
+    # rule skips it exactly as it would skip the same text without media.
+    assert states == {"MISSING": "skipped", "HEALTHY": "completed"}
     assert "media source is unavailable" in (inbox.retention_last_error() or "")
 
 
@@ -1942,7 +1957,7 @@ def test_retention_last_error_preserves_systems_status_code_and_error(
 
 
 @pytest.mark.asyncio
-async def test_retention_failure_requeues_before_model(tmp_path, monkeypatch):
+async def test_retention_failure_does_not_requeue_or_hold_the_turn(tmp_path, monkeypatch):
     inbox = consumer.DurableInbox(tmp_path / "inbox.db")
     source = tmp_path / "events.jsonl"
     _write_jsonl(source, [_message("retry-media")])
@@ -1960,20 +1975,25 @@ async def test_retention_failure_requeues_before_model(tmp_path, monkeypatch):
     model_called = False
     def fail_retention(*args, **kwargs):
         raise consumer.MediaRetentionError("systems unavailable")
-    async def model(*args, **kwargs):
+    async def model(records, **kwargs):
         nonlocal model_called
         model_called = True
+        return {
+            "submitted_message_ids": ["retry-media"],
+            "handled": [{"message_ids": ["retry-media"], "turn_id": "turn-1"}],
+            "captured_outbound": [],
+        }
     monkeypatch.setattr(consumer, "retain_record_media", fail_retention)
     monkeypatch.setattr(consumer, "process_live_records", model)
-    with pytest.raises(consumer.MediaRetentionError, match="systems unavailable"):
-        await consumer._process_claimed_chat_batch(
-            inbox, records, config_path=config, state_db=tmp_path / "state.db",
-            case_db=_write_case_db(tmp_path / "case.db"),
-            source_before_image_dir=tmp_path / "source-before-images",
-            gate_changed_at="2026-07-21T00:00:00+00:00", runner=object(),
-        )
-    assert model_called is False
-    assert inbox.counts() == {"pending": 1}
+    await consumer._process_claimed_chat_batch(
+        inbox, records, config_path=config, state_db=tmp_path / "state.db",
+        case_db=_write_case_db(tmp_path / "case.db"),
+        source_before_image_dir=tmp_path / "source-before-images",
+        gate_changed_at="2026-07-21T00:00:00+00:00", runner=object(),
+    )
+    # PA-203: the failure is recorded on the row and the turn runs anyway.
+    assert model_called is True
+    assert inbox.counts() == {"completed": 1}
     assert inbox.retention_counts() == {
         "retention_total": 0,
         "retention_failures": 1,
@@ -2630,6 +2650,36 @@ def test_internal_nightly_prose_without_structured_identity_is_rejected(tmp_path
     assert not consumer._priority_direct_trigger(consumer.InboxRecord(3, "wrong-sender", wrong_sender["chatId"], 3, 3, wrong_sender), config)
 
 
+def test_recheck_record_admitted_only_on_its_chat_with_its_job_type(tmp_path):
+    """PA-689: the gate admits a recheck record only on 900000000000000010 with job_type tgg_resolution_recheck."""
+    recheck_chat, nightly_chat = "900000000000000010@g.us", "900000000000000001@g.us"
+    constitution = tmp_path / "constitution.yaml"
+    constitution.write_text(yaml.safe_dump({
+        "job_briefs": {"tgg_resolution_recheck": {"max_documents_per_run": 2}},
+        "selectors": [
+            {"job_type": "tgg_resolution_recheck", "match": {"source.platform": "whatsapp", "source.chat_id": recheck_chat}},
+            {"job_type": "tgg_nightly_whatsapp", "match": {"source.platform": "whatsapp", "source.chat_id": nightly_chat}},
+        ],
+    }), encoding="utf-8")
+    config = tmp_path / "config.yaml"
+    config.write_text(yaml.safe_dump({"pa": {"constitution_path": str(constitution)}}), encoding="utf-8")
+    exact = _message("recheck", recheck_chat)
+    exact.update({"senderId": "system@internal", "metadata": {
+        "job_type": "tgg_resolution_recheck", "recheck_run_id": "reconcile-1795733274011-5518eb50",
+        "master_content_hash": "0" * 64, "document_ids": ["3cc12710-4bf5-416b-b6a9-46b710de78f8"],
+    }})
+
+    def admitted(item: dict) -> bool:
+        return consumer._priority_direct_trigger(consumer.InboxRecord(1, "r", item["chatId"], 1, 1, item), config)
+
+    assert admitted(exact)
+    other_chat = dict(exact, chatId=nightly_chat)
+    other_job = json.loads(json.dumps(exact))
+    other_job["metadata"]["job_type"] = "tgg_nightly_whatsapp"
+    assert not admitted(other_chat)
+    assert not admitted(other_job)
+
+
 def test_seven_session_nightly_trigger_validates_structured_role_assignment_not_body(tmp_path):
     constitution = tmp_path / "constitution.yaml"
     nightly_ids = [f"90000000000000000{index}@g.us" for index in range(1, 8)]
@@ -2878,6 +2928,72 @@ async def test_validated_continuous_interval_reuses_persistent_nightly_chat_sess
     assert observed == [True]
 
 
+@pytest.mark.asyncio
+async def test_continuous_analyzer_retry_runs_in_a_fresh_session(tmp_path, monkeypatch):
+    nightly_chat = "900000000000000001@g.us"
+    batch_id = "nightly:2026-08-27:0123456789ab"
+
+    def retry_event(message_id, retry_metadata):
+        event = _message(message_id, nightly_chat)
+        event.update({
+            "senderId": "system@internal",
+            "metadata": {
+                "job_type": "tgg_nightly_whatsapp",
+                "nightly_batch_id": batch_id,
+                "nightly_role": "amk",
+                "authoritative_chat_id": "120363421424519051@g.us",
+                "continuous_interval": True,
+                "continuous_contract": "tgg-christopher-continuous-interval/v1",
+                **retry_metadata,
+            },
+        })
+        return event
+
+    retry = retry_event("continuous-retry", {
+        "continuous_analyzer_retry": True,
+        "continuous_analyzer_retry_contract": "tgg-continuous-analyzer-retry/v1",
+    })
+    args = _enabled_consumer_args(tmp_path, [retry])
+    constitution = Path(yaml.safe_load(Path(args.config).read_text())["pa"]["constitution_path"])
+    constitution.write_text(yaml.safe_dump({
+        "selectors": [{"job_type": "tgg_nightly_whatsapp", "match": {
+            "source.platform": "whatsapp", "source.chat_id": nightly_chat,
+        }}],
+    }), encoding="utf-8")
+    config = Path(args.config)
+
+    def record_of(event, ordinal):
+        return consumer.InboxRecord(ordinal, event["messageId"], nightly_chat, ordinal, ordinal, event)
+
+    original = record_of(retry_event("continuous-original", {}), 1)
+    retried = record_of(retry, 2)
+    wrong_contract = record_of(retry_event("continuous-bad", {
+        "continuous_analyzer_retry": True,
+        "continuous_analyzer_retry_contract": "untrusted/v1",
+    }), 3)
+    assert consumer._persistent_continuous_interval_batch([original], config)
+    assert not consumer._persistent_continuous_interval_batch([retried], config)
+    assert consumer._persistent_continuous_interval_batch([wrong_contract], config)
+    # The retry is still a validated continuous trigger: it keeps its pa_context.
+    assert consumer._continuous_interval_trigger(retried, config)
+
+    observed = []
+
+    async def fake_process(records, **kwargs):
+        observed.append(kwargs["persistent_session"])
+        return {
+            "processed": len(records),
+            "submitted_message_ids": [item.message_id for item in records],
+            "handled": [{"message_ids": [item.message_id for item in records], "turn_id": "turn-retry"}],
+            "captured_outbound": [],
+        }
+
+    monkeypatch.setattr(consumer, "process_live_records", fake_process)
+    monkeypatch.setattr(consumer, "_new_gateway_runner", lambda *_a, **_k: object())
+    assert await consumer.run_consumer(args) == 0
+    assert observed == [False]
+
+
 def test_continuous_and_full_nightly_triggers_never_steer_into_each_others_session(tmp_path):
     pseudo = "900000000000000001@g.us"
     batch_id = "nightly:2026-08-27:0123456789ab"
@@ -3040,6 +3156,340 @@ async def test_management_brief_admits_unmentioned_messages_without_widening_nig
             "skipped", "PRIORITY_DIRECT_TRIGGER_NOT_RECOGNIZED"
         ),
     }
+
+
+def test_ingress_timestamp_accepts_protobuf_long_dict():
+    # PA-429: WhatsApp history sync serialises messageTimestamp as a Long.
+    expected = datetime(2026, 10, 30, 0, 0, 11, tzinfo=timezone.utc)
+    seconds = int(expected.timestamp())
+    assert consumer._parse_ingress_timestamp(
+        {"high": 0, "low": seconds, "unsigned": True}
+    ) == expected
+    assert consumer._parse_ingress_timestamp({"low": seconds}) == expected
+    # high word carries the bits above 2**32; milliseconds follow the int rule.
+    millis = seconds * 1000
+    assert consumer._parse_ingress_timestamp(
+        {"high": millis >> 32, "low": millis & 0xFFFFFFFF, "unsigned": True}
+    ) == expected
+    # JavaScript Long: low is always an unsigned 32-bit word.
+    assert consumer._parse_ingress_timestamp(
+        {"high": 0, "low": -1294967296, "unsigned": True}
+    ) == datetime.fromtimestamp(3_000_000_000, tz=timezone.utc)
+    assert consumer._parse_ingress_timestamp({"high": 0, "low": -1}) == datetime.fromtimestamp(
+        4294967295, tz=timezone.utc
+    )
+    # A signed Long of 3,000,000,000 is {low: -1294967296, high: 0}.
+    assert consumer._parse_ingress_timestamp(
+        {"low": -1294967296, "high": 0}
+    ) == datetime.fromtimestamp(3_000_000_000, tz=timezone.utc)
+    # high is signed int32 unless the Long is unsigned: {-1, -1} is Long -1.
+    assert consumer._parse_ingress_timestamp({"low": -1, "high": -1}) == datetime(
+        1969, 12, 31, 23, 59, 59, tzinfo=timezone.utc
+    )
+    assert consumer._parse_ingress_timestamp(
+        {"low": 0, "high": 1, "unsigned": True}
+    ) == datetime.fromtimestamp(2**32, tz=timezone.utc)
+
+
+@pytest.mark.parametrize("junk", [
+    {},
+    {"high": 0},
+    {"low": "1792783211"},
+    {"low": 1.5},
+    {"low": True},
+    {"low": None},
+    {"low": 1, "high": "0"},
+    {"low": 1, "high": True},
+    {"low": 1, "high": None},
+    {"low": 2**200, "high": 2**200},
+    {"low": 2**32, "high": 0},
+    {"low": 0, "high": 2**32},
+    {"low": -(2**31) - 1},
+    {"low": 0, "high": 2**31 - 1, "unsigned": True},
+    {"seconds": 1792783211},
+])
+def test_ingress_timestamp_refuses_malformed_long_dict(junk):
+    with pytest.raises(consumer.ConsumerError):
+        consumer._parse_ingress_timestamp(junk)
+
+
+def test_ingress_timestamp_keeps_existing_forms():
+    expected = datetime(2026, 10, 30, 0, 0, 11, tzinfo=timezone.utc)
+    seconds = int(expected.timestamp())
+    assert consumer._parse_ingress_timestamp(seconds) == expected
+    assert consumer._parse_ingress_timestamp(float(seconds)) == expected
+    assert consumer._parse_ingress_timestamp(seconds * 1000) == expected
+    assert consumer._parse_ingress_timestamp(str(seconds)) == expected
+    assert consumer._parse_ingress_timestamp("2026-10-30T08:00:11+08:00") == expected
+    with pytest.raises(consumer.ConsumerError, match="naive"):
+        consumer._parse_ingress_timestamp("2026-10-30T08:00:11")
+    with pytest.raises(consumer.ConsumerError):
+        consumer._parse_ingress_timestamp("")
+
+
+def _management_admits_unmentioned(args: argparse.Namespace) -> None:
+    """Production Management runs with require_mention off (see the brief test)."""
+    constitution = Path(
+        yaml.safe_load(Path(args.config).read_text())["pa"]["constitution_path"]
+    )
+    data = yaml.safe_load(constitution.read_text())
+    data["job_briefs"] = {"tgg_management": {"require_mention": False}}
+    constitution.write_text(yaml.safe_dump(data), encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_management_history_sync_with_long_timestamp_is_skipped_without_turn_or_reply(
+    tmp_path, monkeypatch
+):
+    # PA-429, the 30 Oct shape: history-sync rows with a Long-dict timestamp
+    # sit ahead of a live message.  Evidence is projected, the history rows end
+    # skipped with no turn and no outbound reply, and the live row is answered.
+    chat = "management@g.us"
+    history = []
+    for index in range(3):
+        row = _message(f"history-{index}", chat)
+        row.update({
+            "timestamp": {"high": 0, "low": 1792783211 + index, "unsigned": True},
+            "historySync": True,
+            "historySyncType": "RECENT",
+        })
+        history.append(row)
+    live = _message("live-after-history", chat)
+    live["historySync"] = False
+    args = _enabled_consumer_args(tmp_path, history + [live])
+    _management_admits_unmentioned(args)
+    turns: list[list[str]] = []
+    deliveries: list[list[str]] = []
+
+    async def fake_process(records, **_kwargs):
+        ids = [record.message_id for record in records]
+        turns.append(ids)
+        return {
+            "processed": len(records), "submitted_message_ids": ids,
+            "handled": [{"message_ids": ids, "turn_id": "turn-live"}],
+            "captured_outbound": [],
+        }
+
+    def fake_deliver(inbox, **kwargs):
+        deliveries.append([r.message_id for r in kwargs["batch_records"]])
+        return {}
+
+    monkeypatch.setattr(consumer, "process_live_records", fake_process)
+    monkeypatch.setattr(consumer, "deliver_management_replies", fake_deliver)
+    monkeypatch.setattr(consumer, "_new_gateway_runner", lambda *_a, **_k: object())
+
+    assert await consumer.run_consumer(args) == 0
+    assert turns == [["live-after-history"]]
+    assert deliveries == [["live-after-history"]]
+    inbox = consumer.DurableInbox(Path(args.inbox))
+    with inbox.connect() as conn:
+        rows = {
+            row["message_id"]: (row["status"], row["last_error"])
+            for row in conn.execute(
+                "SELECT message_id,status,last_error FROM ingress_events"
+            )
+        }
+        projected = {
+            row[0] for row in sqlite3.connect(args.case_db).execute(
+                "SELECT source_ref FROM bridge_message_log"
+            )
+        }
+    skipped = ("skipped", "HISTORY_SYNC_REPLAY_NOT_LIVE")
+    assert rows == {
+        "history-0": skipped, "history-1": skipped, "history-2": skipped,
+        "live-after-history": ("completed", None),
+    }
+    assert {"history-0", "history-1", "history-2"} <= projected
+
+
+def _fake_turn(turns):
+    async def fake_process(records, **_kwargs):
+        ids = [record.message_id for record in records]
+        turns.append(ids)
+        return {
+            "processed": len(ids), "submitted_message_ids": ids,
+            "handled": [{"message_ids": ids, "turn_id": "turn"}],
+            "captured_outbound": [],
+        }
+    return fake_process
+
+
+def _status_rows(args):
+    with consumer.DurableInbox(Path(args.inbox)).connect() as conn:
+        return {
+            row["message_id"]: (row["status"], row["last_error"])
+            for row in conn.execute("SELECT message_id,status,last_error FROM ingress_events")
+        }
+
+
+@pytest.mark.asyncio
+async def test_history_row_with_trigger_cannot_admit_unaddressed_live_row(
+    tmp_path, monkeypatch
+):
+    # PA-429 review: the mention gate decides on live rows only.  The history
+    # row below starts with "/", which is a direct trigger, but it is not live.
+    chat = "management@g.us"
+    history = _message("history-cmd", chat)
+    history.update({
+        "body": "/status please", "historySync": True,
+        "timestamp": {"high": 0, "low": 1792783211, "unsigned": True},
+    })
+    live = _message("live-plain", chat)
+    live["body"] = "ok noted thanks"
+    args = _enabled_consumer_args(tmp_path, [history, live])
+    turns: list[list[str]] = []
+    monkeypatch.setattr(consumer, "process_live_records", _fake_turn(turns))
+    monkeypatch.setattr(consumer, "deliver_management_replies", lambda *a, **k: {})
+    monkeypatch.setattr(consumer, "_new_gateway_runner", lambda *_a, **_k: object())
+    assert consumer._management_requires_direct_trigger(Path(args.config), chat) is True
+
+    assert await consumer.run_consumer(args) == 0
+    assert turns == []
+    assert _status_rows(args) == {
+        "history-cmd": ("skipped", "HISTORY_SYNC_REPLAY_NOT_LIVE"),
+        "live-plain": ("skipped", "PRIORITY_DIRECT_TRIGGER_NOT_RECOGNIZED"),
+    }
+    with sqlite3.connect(args.case_db) as conn:
+        projected = {r[0] for r in conn.execute("SELECT source_ref FROM bridge_message_log")}
+    assert "history-cmd" in projected
+
+
+@pytest.mark.asyncio
+async def test_history_only_batch_with_mention_required_is_projected_then_skipped(
+    tmp_path, monkeypatch
+):
+    chat = "management@g.us"
+    history = _message("history-plain", chat)
+    history.update({
+        "historySync": True,
+        "timestamp": {"high": 0, "low": 1792783211, "unsigned": True},
+    })
+    args = _enabled_consumer_args(tmp_path, [history])
+    monkeypatch.setattr(consumer, "process_live_records", _fake_turn([]))
+    monkeypatch.setattr(consumer, "_new_gateway_runner", lambda *_a, **_k: object())
+    assert await consumer.run_consumer(args) == 0
+    assert _status_rows(args) == {
+        "history-plain": ("skipped", "HISTORY_SYNC_REPLAY_NOT_LIVE"),
+    }
+    with sqlite3.connect(args.case_db) as conn:
+        assert [r[0] for r in conn.execute("SELECT source_ref FROM bridge_message_log")] == [
+            "history-plain"
+        ]
+
+
+@pytest.mark.asyncio
+async def test_mixed_batch_history_settle_does_not_wait_for_live_retention(
+    tmp_path, monkeypatch
+):
+    # PA-203: retention never delays a turn.  Live rows' media copy is still
+    # running when the live turn starts; only the history rows' own attempt
+    # was settled before they were finished.
+    chat = "management@g.us"
+    history = _message("history-media", chat)
+    history.update({
+        "historySync": True,
+        "timestamp": {"high": 0, "low": 1792783211, "unsigned": True},
+    })
+    live = _message("live-media", chat)
+    args = _enabled_consumer_args(tmp_path, [history, live])
+    _management_admits_unmentioned(args)
+    turn_started = asyncio.Event()
+    started_for: list[list[str]] = []
+    turns: list[list[str]] = []
+
+    def fake_start(inbox, records, *, config_path):
+        records = list(records)
+        if not records:
+            return None
+        started_for.append([r.message_id for r in records])
+        is_live = not any(r.raw.get("historySync") is True for r in records)
+
+        async def attempt():
+            if is_live:
+                await turn_started.wait()
+
+        task = asyncio.create_task(attempt())
+        return consumer._ClaimPathRetention(task=task, records=records)
+
+    async def fake_process(records, **kwargs):
+        turn_started.set()
+        return await _fake_turn(turns)(records, **kwargs)
+
+    monkeypatch.setattr(consumer, "_start_claim_path_retention", fake_start)
+    monkeypatch.setattr(consumer, "_record_claim_path_not_completed", lambda *a, **k: False)
+    monkeypatch.setattr(consumer, "process_live_records", fake_process)
+    monkeypatch.setattr(consumer, "deliver_management_replies", lambda *a, **k: {})
+    monkeypatch.setattr(consumer, "_new_gateway_runner", lambda *_a, **_k: object())
+
+    # A wait for live retention before the turn would deadlock on turn_started.
+    assert await asyncio.wait_for(consumer.run_consumer(args), timeout=10) == 0
+    assert sorted(started_for) == [["history-media"], ["live-media"]]
+    assert turns == [["live-media"]]
+    assert _status_rows(args) == {
+        "history-media": ("skipped", "HISTORY_SYNC_REPLAY_NOT_LIVE"),
+        "live-media": ("completed", None),
+    }
+
+
+@pytest.mark.asyncio
+async def test_production_wrapped_capture_event_history_row_is_skipped(
+    tmp_path, monkeypatch
+):
+    # Production records are whatsapp_capture_event wrappers with the bridge
+    # item under "normalized"; InboxRecord.raw is that unwrapped item.
+    chat = "management@g.us"
+    item = _message("wrapped-history", chat)
+    item.update({
+        "historySync": True, "historySyncType": "RECENT",
+        "timestamp": {"high": 0, "low": 1792783211, "unsigned": True},
+    })
+    wrapped = {
+        "type": "whatsapp_capture_event",
+        "capturedAt": "2026-10-30T01:00:00+00:00",
+        "normalized": item,
+        "raw": {"messageTimestamp": item["timestamp"]},
+    }
+    args = _enabled_consumer_args(tmp_path, [wrapped])
+    _management_admits_unmentioned(args)
+    turns: list[list[str]] = []
+    monkeypatch.setattr(consumer, "process_live_records", _fake_turn(turns))
+    monkeypatch.setattr(consumer, "_new_gateway_runner", lambda *_a, **_k: object())
+    assert await consumer.run_consumer(args) == 0
+    assert turns == []
+    assert _status_rows(args) == {
+        "wrapped-history": ("skipped", "HISTORY_SYNC_REPLAY_NOT_LIVE"),
+    }
+
+
+@pytest.mark.asyncio
+async def test_all_history_sync_batch_starts_no_turn_and_no_reply(tmp_path, monkeypatch):
+    chat = "management@g.us"
+    row = _message("history-only", chat)
+    row.update({
+        "timestamp": {"high": 0, "low": 1792783211, "unsigned": True},
+        "historySync": True,
+    })
+    args = _enabled_consumer_args(tmp_path, [row])
+    _management_admits_unmentioned(args)
+
+    async def forbidden(*_args, **_kwargs):
+        raise AssertionError("a history-sync record started a turn")
+
+    def forbidden_delivery(*_args, **_kwargs):
+        raise AssertionError("a history-sync record produced an outbound reply")
+
+    monkeypatch.setattr(consumer, "process_live_records", forbidden)
+    monkeypatch.setattr(consumer, "deliver_management_replies", forbidden_delivery)
+    monkeypatch.setattr(consumer, "_new_gateway_runner", lambda *_a, **_k: object())
+
+    assert await consumer.run_consumer(args) == 0
+    inbox = consumer.DurableInbox(Path(args.inbox))
+    assert inbox.counts() == {"skipped": 1}
+    with inbox.connect() as conn:
+        error = conn.execute(
+            "SELECT last_error FROM ingress_events WHERE message_id='history-only'"
+        ).fetchone()[0]
+    assert error == "HISTORY_SYNC_REPLAY_NOT_LIVE"
 
 
 def test_management_direct_trigger_setting_defaults_closed(tmp_path):
@@ -3321,6 +3771,100 @@ def test_addressed_management_burst_includes_followups_and_steers_while_active(
     assert inbox.counts() == {"completed": 2, "skipped": 1}
 
 
+def _steering_scenario(tmp_path, monkeypatch, *, main_fails=False):
+    """A burst is running; a follow-up arrives and the gateway steers it in."""
+    chat_id = "management@g.us"
+    first = _message("mention", chat_id)
+    first.update({
+        "botIds": ["6599999999@s.whatsapp.net"],
+        "mentionedIds": ["6599999999@s.whatsapp.net"],
+    })
+    source = tmp_path / "events.jsonl"
+    _write_jsonl(source, [first])
+    cursor = tmp_path / "cursor.json"
+    inbox = consumer.DurableInbox(tmp_path / "inbox.db")
+    consumer.initialize_cursor(source, cursor, position="start")
+    inbox.stage_from_source(source, cursor)
+    records = inbox.pending(limit=1)
+    config = tmp_path / "config.yaml"
+    config.write_text("pa:\n  enabled: true\n", encoding="utf-8")
+    started = asyncio.Event()
+    steered = asyncio.Event()
+
+    async def fake_process(batch, **kwargs):
+        ids = [record.message_id for record in batch]
+        if ids == ["mention"]:
+            started.set()
+            await asyncio.wait_for(steered.wait(), timeout=2)
+            if main_fails:
+                raise consumer.ConsumerError("turn failed")
+            # The running turn's record lists the steered message too.
+            return {
+                "processed": 1,
+                "submitted_message_ids": ids,
+                "handled": [{"message_ids": ["mention", "followup"], "turn_id": "turn-main"}],
+                "captured_outbound": [],
+            }
+        steered.set()
+        return {
+            "processed": 1,
+            "submitted_message_ids": ids,
+            "handled": [],
+            "steered_message_ids": ["followup"],
+            "captured_outbound": [],
+        }
+
+    monkeypatch.setattr(consumer, "process_live_records", fake_process)
+    monkeypatch.setattr(consumer, "deliver_management_replies", lambda *_a, **_k: {"delivered": 0, "undelivered": 0})
+
+    async def exercise():
+        task = asyncio.create_task(consumer._process_claimed_chat_batch(
+            inbox,
+            records,
+            config_path=config,
+            state_db=tmp_path / "state.db",
+            case_db=_write_case_db(tmp_path / "case.db"),
+            source_before_image_dir=tmp_path / "source-before-images",
+            gate_changed_at="2026-08-11T00:00:00+00:00",
+            runner=object(),
+            direct_trigger_required=True,
+            allow_active_steering=True,
+            steering_poll_seconds=0.01,
+        ))
+        await asyncio.wait_for(started.wait(), timeout=2)
+        with source.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(_message("followup", chat_id)) + "\n")
+        inbox.stage_from_source(source, cursor)
+        try:
+            await asyncio.wait_for(task, timeout=3)
+        except consumer.ConsumerError:
+            pass
+
+    asyncio.run(exercise())
+    return inbox
+
+
+def test_steered_message_is_completed_with_the_running_turn_id_not_skipped(
+    tmp_path, monkeypatch
+):
+    inbox = _steering_scenario(tmp_path, monkeypatch)
+    assert inbox.counts() == {"completed": 2}
+    with inbox.connect() as conn:
+        rows = dict(conn.execute(
+            "SELECT message_id, pa_turn_id FROM ingress_events"
+        ).fetchall())
+    assert rows == {"mention": "turn-main", "followup": "turn-main"}
+
+
+def test_steered_message_returns_to_pending_when_the_running_turn_fails(
+    tmp_path, monkeypatch
+):
+    inbox = _steering_scenario(tmp_path, monkeypatch, main_fails=True)
+    # The turn failed, so the message steered into it was not answered.
+    assert inbox.counts() == {"failed": 1, "pending": 1}
+    assert inbox.pending(limit=1)[0].message_id == "followup"
+
+
 @pytest.mark.asyncio
 async def test_live_drain_reuses_one_session_across_site_chat_turns(tmp_path):
     args = _enabled_consumer_args(tmp_path, [])
@@ -3355,8 +3899,8 @@ async def test_live_drain_reuses_one_session_across_site_chat_turns(tmp_path):
         runner=Runner(),
     )
     assert [plan.replay_namespace for plan in plans] == [
-        "agent:live-drain:persistent-chat:openai-direct-primary:fixture",
-        "agent:live-drain:persistent-chat:openai-direct-primary:fixture",
+        "agent:live-drain:conversation",
+        "agent:live-drain:conversation",
     ]
     assert all({message["chatId"] for message in plan.messages} == {chat_id} for plan in plans)
 
@@ -3390,7 +3934,8 @@ async def test_live_drain_reuses_one_session_across_site_chat_turns(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_live_drain_starts_new_session_namespace_after_provider_switch(tmp_path):
+async def test_live_drain_keeps_session_namespace_across_provider_and_model_switch(tmp_path):
+    """PA-203 round 2: an engine change resumes the same conversation."""
     args = _enabled_consumer_args(tmp_path, [])
     plans = []
 
@@ -3408,18 +3953,15 @@ async def test_live_drain_starts_new_session_namespace_after_provider_switch(tmp
         persistent_session=True, runner=Runner(),
     )
     Path(args.config).write_text(yaml.safe_dump({
-        "model": {"provider": "openai-codex", "default": "fixture"},
+        "model": {"provider": "openai-codex", "default": "gpt-6-sol"},
         "pa": {"enabled": True},
     }))
     await consumer.process_live_records(
         [record], config_path=Path(args.config), state_db=Path(args.state_db),
         persistent_session=True, runner=Runner(),
     )
-    assert plans[0].replay_namespace.endswith(
-        ":openai-direct-primary:fixture"
-    )
-    assert plans[1].replay_namespace.endswith(":openai-codex:fixture")
-    assert plans[0].replay_namespace != plans[1].replay_namespace
+    assert plans[0].replay_namespace == "agent:live-drain:conversation"
+    assert plans[1].replay_namespace == plans[0].replay_namespace
 
 
 @pytest.mark.asyncio

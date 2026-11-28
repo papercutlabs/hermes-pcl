@@ -11,6 +11,7 @@ import hashlib
 import json
 import logging
 import os
+import uuid
 import re
 import subprocess
 import urllib.error
@@ -1200,10 +1201,23 @@ def _materialize_large_tgg_query_result(
     try:
         from gateway.session_context import get_session_env
         from hermes_constants import get_hermes_home
-        from tools.python_sandbox_tool import _workspace_key
+        from tools.python_sandbox_access import (
+            SandboxReaderPolicyError,
+            configured_reader_uid,
+            grant_reader_work_access,
+        )
+        from tools.python_sandbox_tool import (
+            _load_config,
+            _workspace_key,
+            current_workspace_owner,
+        )
 
-        session_id = get_session_env("HERMES_SESSION_ID", "").strip()
-        if not session_id:
+        # Same owner rule as python_sandbox: a scheduler-bound conversation
+        # owner, then the stable gateway session key, then the session ID.
+        workspace_owner = current_workspace_owner(
+            get_session_env("HERMES_SESSION_ID", "")
+        )
+        if not workspace_owner:
             return result
         encoded = json.dumps(result, ensure_ascii=False, sort_keys=True)
         if len(encoded) <= 16_000:
@@ -1212,15 +1226,28 @@ def _materialize_large_tgg_query_result(
         workspace = (
             get_hermes_home()
             / "sandbox_workspaces"
-            / _workspace_key(session_id)
+            / _workspace_key(workspace_owner)
             / "work"
         )
         workspace.mkdir(parents=True, exist_ok=True, mode=0o700)
         path = workspace / f"pa-query-{full_digest[:16]}.json"
         if not path.exists():
-            tmp = path.with_suffix(".tmp")
-            tmp.write_text(encoded, encoding="utf-8")
+            # A fresh, exclusive, no-follow temp name: in the agent workspace
+            # sandbox code may be running in this folder right now.
+            tmp = workspace / f".pa-query-{uuid.uuid4().hex}.tmp"
+            fd = os.open(
+                tmp,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(encoded)
             os.replace(tmp, path)
+        reader_uid = configured_reader_uid(_load_config())
+        from tools.python_sandbox_tool import agent_workspace_enabled
+
+        if reader_uid is not None and not agent_workspace_enabled():
+            grant_reader_work_access(get_hermes_home(), workspace, reader_uid)
         # Put the handle first so inline-preview fallback still tells the
         # model where the complete immutable result is.
         return {
@@ -1234,6 +1261,8 @@ def _materialize_large_tgg_query_result(
             ),
             **dict(result),
         }
+    except SandboxReaderPolicyError:
+        raise
     except Exception:
         logger.debug("Could not materialize large PA query for sandbox", exc_info=True)
         return result
@@ -1246,10 +1275,10 @@ def _handle_tgg_read(operation: str, payload: Mapping[str, Any]) -> str:
             operation=operation,
             payload=payload,
         )
+        _harvest_case_states(result)
+        result = _materialize_large_tgg_query_result(operation, result)
     except Exception as exc:
         return tool_error(exc)
-    _harvest_case_states(result)
-    result = _materialize_large_tgg_query_result(operation, result)
     return tool_result(result)
 
 
@@ -2528,8 +2557,11 @@ def _handle_business_call(args: Mapping[str, Any], *, user_task: Any = None) -> 
         )
     except Exception as exc:
         return tool_error(exc)
-    _harvest_case_states(result)
-    result = _materialize_large_tgg_query_result(effective_operation, result)
+    try:
+        _harvest_case_states(result)
+        result = _materialize_large_tgg_query_result(effective_operation, result)
+    except Exception as exc:
+        return tool_error(exc)
     return tool_result(_shape_attach_unjustified_result(result))
 
 

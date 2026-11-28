@@ -32,6 +32,9 @@ class ContextRecord:
     raw: dict[str, Any]
     retention_state: str | None = None
     retention_quarantined: bool = False
+    # Set by DurableInbox.with_retention_view, as for a claimed row (PA-203).
+    retention_attempts: int = 0
+    retention_file_error: str | None = None
 
 
 def _bridge_item(value: Mapping[str, Any]) -> Mapping[str, Any]:

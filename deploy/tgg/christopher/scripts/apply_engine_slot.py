@@ -26,13 +26,27 @@ SLOT_MODELS = {
     "gpt-5.6-luna-xhigh": "gpt-5.6-luna",
     "gpt-5.6-terra-medium": "gpt-5.6-terra",
     "gpt-5.6-terra-high": "gpt-5.6-terra",
+    "gpt-6-sol-medium": "gpt-6-sol",
+    "gpt-6.1-sol-medium": "gpt-6.1-sol",
+    "gpt-6.1-terra-medium": "gpt-6.1-terra",
 }
 SLOT_REASONING_EFFORT = {
     "gpt-5.6-luna-low": "low",
     "gpt-5.6-luna-xhigh": "xhigh",
     "gpt-5.6-terra-medium": "medium",
     "gpt-5.6-terra-high": "high",
+    "gpt-6-sol-medium": "medium",
+    "gpt-6.1-sol-medium": "medium",
+    "gpt-6.1-terra-medium": "medium",
 }
+# Management-chat engine id -> the pa.management_engine block it writes. The
+# provider is always the gateway's. "none" removes the block, so Management
+# runs on the gateway engine.
+MANAGEMENT_ENGINES = {
+    "gpt-6.2-sol-medium": {"model": "gpt-6.2-sol", "reasoning_effort": "medium"},
+}
+NO_MANAGEMENT_ENGINE = "none"
+ALLOWED_MANAGEMENT_ENGINES = (NO_MANAGEMENT_ENGINE, *MANAGEMENT_ENGINES)
 ALLOWED_SLOTS = tuple(SLOT_MODELS)
 DEFAULT_SLOT = ALLOWED_SLOTS[0]
 CAPABILITY_ID = "christopher-tgg"
@@ -120,6 +134,39 @@ def _select_slot(slot_file: Path, requested: str | None) -> str:
     if selected not in ALLOWED_SLOTS:
         raise RuntimeError(f"invalid engine slot {selected!r}; allowed={ALLOWED_SLOTS}")
     return selected
+
+
+def _select_management_engine(state_file: Path, requested: str | None) -> str:
+    if requested:
+        selected = requested.strip()
+    elif state_file.exists():
+        selected = state_file.read_text(encoding="utf-8").strip()
+    else:
+        selected = NO_MANAGEMENT_ENGINE
+    if selected not in ALLOWED_MANAGEMENT_ENGINES:
+        raise RuntimeError(
+            f"invalid management engine {selected!r}; allowed={ALLOWED_MANAGEMENT_ENGINES}"
+        )
+    return selected
+
+
+def _management_engine_block(selected: str) -> dict[str, str] | None:
+    return dict(MANAGEMENT_ENGINES[selected]) if selected in MANAGEMENT_ENGINES else None
+
+
+def _apply_management_engine(
+    config_path: Path, selected: str, *, uid: int, gid: int
+) -> None:
+    """Make config.pa.management_engine equal the selected management engine."""
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    original = json.loads(json.dumps(config))
+    block = _management_engine_block(selected)
+    if block is None:
+        config["pa"].pop("management_engine", None)
+    else:
+        config["pa"]["management_engine"] = block
+    if config != original:
+        _atomic_write_yaml(config_path, config, mode=0o640, uid=uid, gid=gid)
 
 
 def _atomic_write_json(path: Path, payload: dict, *, mode: int, uid: int, gid: int) -> None:
@@ -216,7 +263,9 @@ def _apply_constitution_runtime(
         _atomic_write_yaml(constitution_path, constitution, mode=0o644, uid=uid, gid=gid)
 
 
-def _validate_live_runtime_config(config_path: Path, slot: str) -> tuple[str, str | None]:
+def _validate_live_runtime_config(
+    config_path: Path, slot: str, management_engine: str = NO_MANAGEMENT_ENGINE
+) -> tuple[str, str | None]:
     config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     model = config.get("model") or {}
     agent = config.get("agent") or {}
@@ -236,6 +285,8 @@ def _validate_live_runtime_config(config_path: Path, slot: str) -> tuple[str, st
     effort = agent.get("reasoning_effort")
     if effort != SLOT_REASONING_EFFORT.get(slot):
         raise RuntimeError("live host reasoning effort does not match selected engine slot")
+    if pa.get("management_engine") != _management_engine_block(management_engine):
+        raise RuntimeError("live host management engine does not match the selected management engine")
     if not isinstance(pa.get("enabled"), bool):
         raise RuntimeError("live host processing state must be boolean")
     if config.get("group_sessions_per_user") is not False:
@@ -270,6 +321,17 @@ def _apply_slot_runtime_contract(
         (slot_root / "christopher_tgg_constitution.yaml").read_text(encoding="utf-8")
     )
     config["model"] = slot_config["model"]
+    # The slot owns every auxiliary task that runs on the main model, so an
+    # engine switch moves compression, session search, titles and vision too.
+    for task, slot_task in (slot_config.get("auxiliary") or {}).items():
+        live_task = (config.get("auxiliary") or {}).get(task)
+        if (
+            isinstance(live_task, dict)
+            and isinstance(slot_task, dict)
+            and live_task.get("provider") == "main"
+            and "model" in slot_task
+        ):
+            live_task["model"] = slot_task["model"]
     config["pa"]["media_retention"] = slot_config["pa"]["media_retention"]
     config["agent"].pop("reasoning_effort", None)
     if "reasoning_effort" in slot_config["agent"]:
@@ -611,6 +673,12 @@ def main() -> int:
     parser.add_argument("--app-root", required=True)
     parser.add_argument("--hermes-home", required=True)
     parser.add_argument("--slot", choices=ALLOWED_SLOTS)
+    parser.add_argument(
+        "--management-engine",
+        choices=ALLOWED_MANAGEMENT_ENGINES,
+        help="engine for the Management chats; 'none' runs them on the gateway engine. "
+        "Omitted: keep the one recorded in runtime/management-engine",
+    )
     parser.add_argument("--provider-profile", choices=sorted(PROVIDER_PROFILES))
     parser.add_argument("--credential-label")
     parser.add_argument(
@@ -625,8 +693,14 @@ def main() -> int:
     slots_root = app_root / "deploy" / "tgg" / "christopher" / "runtime-slots"
     runtime_root = hermes_home / "runtime"
     slot_file = runtime_root / "engine-slot"
+    management_file = runtime_root / "management-engine"
     profile_file = runtime_root / "provider-profile.json"
     selected = _select_slot(slot_file, args.slot)
+    management_selected = _select_management_engine(management_file, args.management_engine)
+    if args.preserve_host_config and args.management_engine:
+        raise RuntimeError(
+            "management engine selection is not allowed while preserving host config"
+        )
     slot_root = slots_root / selected
     _validate_slot(slot_root, selected)
 
@@ -660,6 +734,7 @@ def main() -> int:
         provider, credential_label = _validate_live_runtime_config(
             live_config_path,
             selected,
+            management_selected,
         )
         declared_provider, declared_label = _read_provider_profile(profile_file)
         if (provider, credential_label) != (declared_provider, declared_label):
@@ -699,7 +774,10 @@ def main() -> int:
             uid=0,
             gid=group.gr_gid,
         )
-        if live_processing_enabled:
+        # With an external capability the source is the live config itself,
+        # which already carries its processing state; only a repo slot copy
+        # (processing forced off) needs the live key put back.
+        if live_processing_enabled and config_source != live_config_path:
             config_text = live_config_path.read_text(encoding="utf-8")
             patched, count = re.subn(
                 r"(^pa:\s*(?:#.*)?\n  enabled:)\s*false(\s*(?:#.*)?$)",
@@ -752,6 +830,10 @@ def main() -> int:
             uid=0,
             gid=group.gr_gid,
         )
+    if not args.preserve_host_config:
+        _apply_management_engine(
+            live_config_path, management_selected, uid=0, gid=group.gr_gid
+        )
     if capability:
         for plugin_name, plugin_link in capability["plugin_links"].items():
             if plugin_link.exists() and not plugin_link.is_symlink():
@@ -771,6 +853,11 @@ def main() -> int:
     os.chmod(slot_tmp, 0o640)
     os.chown(slot_tmp, 0, group.gr_gid)
     os.replace(slot_tmp, slot_file)
+    management_tmp = runtime_root / f".management-engine.{os.getpid()}.tmp"
+    management_tmp.write_text(f"{management_selected}\n", encoding="utf-8")
+    os.chmod(management_tmp, 0o640)
+    os.chown(management_tmp, 0, group.gr_gid)
+    os.replace(management_tmp, management_file)
     os.chown(hermes_home, user.pw_uid, group.gr_gid)
     if host_config_before is not None and _file_identity(live_config_path) != host_config_before:
         raise RuntimeError("live host config changed during runtime materialization")
@@ -783,6 +870,7 @@ def main() -> int:
         "credential_label": credential_label,
         "model": SLOT_MODELS[selected],
         "reasoning_effort": SLOT_REASONING_EFFORT.get(selected),
+        "management_engine": management_selected,
         "config_sha256": _sha256(hermes_home / "config.yaml"),
         "constitution_sha256": _sha256(
             hermes_home / "christopher_tgg_constitution.yaml"

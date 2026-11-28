@@ -287,8 +287,8 @@ if systemctl is-enabled --quiet christopher-tgg-report-weekly.timer; then
   echo "weekly report timer must ship disabled" >&2
   exit 35
 fi
-if systemctl is-enabled --quiet christopher-tgg-report-monthly.timer; then
-  echo "monthly report timer must ship disabled" >&2
+if ! systemctl is-enabled --quiet christopher-tgg-report-monthly.timer; then
+  echo "monthly report timer must be enabled" >&2
   exit 35
 fi
 "$APP_ROOT/.venv/bin/python" \
@@ -386,12 +386,13 @@ then
   done
 fi
 
-"$APP_ROOT/.venv/bin/python" - "$APP_ROOT" "$HERMES_HOME" "$DEPLOY_ROOT" <<'PY'
+"$APP_ROOT/.venv/bin/python" - "$APP_ROOT" "$HERMES_HOME" "$DEPLOY_ROOT" "$MODE" <<'PY'
 import datetime, hashlib, importlib.util, json, os, pathlib, sqlite3, stat, subprocess, sys, time, urllib.parse, urllib.request, yaml
 
 app = pathlib.Path(sys.argv[1])
 home = pathlib.Path(sys.argv[2])
 deploy = pathlib.Path(sys.argv[3])
+mode = sys.argv[4]
 runtime = home / "runtime"
 slot = (runtime / "engine-slot").read_text().strip()
 profile_path = runtime / "provider-profile.json"
@@ -414,12 +415,18 @@ SLOT_MODELS = {
     "gpt-5.6-luna-xhigh": "gpt-5.6-luna",
     "gpt-5.6-terra-medium": "gpt-5.6-terra",
     "gpt-5.6-terra-high": "gpt-5.6-terra",
+    "gpt-6-sol-medium": "gpt-6-sol",
+    "gpt-6.1-sol-medium": "gpt-6.1-sol",
+    "gpt-6.1-terra-medium": "gpt-6.1-terra",
 }
 SLOT_REASONING_EFFORT = {
     "gpt-5.6-luna-low": "low",
     "gpt-5.6-luna-xhigh": "xhigh",
     "gpt-5.6-terra-medium": "medium",
     "gpt-5.6-terra-high": "high",
+    "gpt-6-sol-medium": "medium",
+    "gpt-6.1-sol-medium": "medium",
+    "gpt-6.1-terra-medium": "medium",
 }
 assert slot in SLOT_MODELS, slot
 slot_model = SLOT_MODELS[slot]
@@ -471,6 +478,8 @@ if slot_effort is None:
     assert "reasoning_effort" not in config["agent"]
 else:
     assert config["agent"]["reasoning_effort"] == slot_effort
+management_engine = loader._select_management_engine(runtime / "management-engine", None)
+assert config["pa"].get("management_engine") == loader._management_engine_block(management_engine)
 assert constitution["runtime"] == {"provider": provider, "model": slot_model}
 for brief in constitution.get("job_briefs", {}).values():
     if isinstance(brief.get("runtime"), dict):
@@ -497,6 +506,7 @@ if capability:
     receipt = json.loads((runtime / "engine-slot-receipt.json").read_text())
     assert receipt["configuration_source"] == "external-capability"
     assert receipt["host_config_authoritative"] is True
+    assert receipt["management_engine"] == management_engine
     assert receipt["config_sha256"] == sha(home / "config.yaml")
     assert receipt["capability_release_id"] == capability["release_id"]
     assert receipt["capability_manifest_sha256"] == capability["manifest_sha256"]
@@ -524,29 +534,33 @@ if capability:
     assert token
     openai_key = env.get("OPENAI_API_KEY")
     assert openai_key and openai_key.endswith("XK8A")
-    query = urllib.request.Request(
-        base_url + "/api/operator/query?tenant=tgg",
-        method="POST",
-        data=json.dumps({"sql": "SELECT message_id, source_ref, chat_jid, chat_name, sender_id, ts, text, message_kind, has_media, media_refs, reply_to_source_ref, raw_json, in_scope FROM message_ledger ORDER BY ts DESC LIMIT 1"}).encode(),
-        # The Systems edge denies urllib's default Python user agent (403/1010),
-        # even when the service token is valid.  Name this internal verifier so
-        # its authenticated read-only health check is stable and auditable.
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-            "User-Agent": "Christopher-TGG/1.0",
-        },
-    )
-    with urllib.request.urlopen(query, timeout=10) as response:
-        payload = json.load(response)
-    rows = payload["data"]["rows"]
-    assert rows, "live message ledger is empty"
-    required_message_columns = {
-        "message_id", "source_ref", "chat_jid", "chat_name", "sender_id",
-        "ts", "text", "message_kind", "has_media", "media_refs",
-        "reply_to_source_ref", "raw_json", "in_scope",
-    }
-    assert required_message_columns.issubset(rows[0]), rows[0]
+    # PA-675: Systems records every operator query as a ps_audit_log row in the live tenant database, and the
+    # daily Master reconciliation refuses to apply when that database changes between preview and apply. The
+    # 15-minute --quick run therefore does not query; --full still proves the token reads the message ledger.
+    if mode == "--full":
+        query = urllib.request.Request(
+            base_url + "/api/operator/query?tenant=tgg",
+            method="POST",
+            data=json.dumps({"sql": "SELECT message_id, source_ref, chat_jid, chat_name, sender_id, ts, text, message_kind, has_media, media_refs, reply_to_source_ref, raw_json, in_scope FROM message_ledger ORDER BY ts DESC LIMIT 1"}).encode(),
+            # The Systems edge denies urllib's default Python user agent (403/1010),
+            # even when the service token is valid.  Name this internal verifier so
+            # its authenticated read-only health check is stable and auditable.
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+                "User-Agent": "Christopher-TGG/1.0",
+            },
+        )
+        with urllib.request.urlopen(query, timeout=10) as response:
+            payload = json.load(response)
+        rows = payload["data"]["rows"]
+        assert rows, "live message ledger is empty"
+        required_message_columns = {
+            "message_id", "source_ref", "chat_jid", "chat_name", "sender_id",
+            "ts", "text", "message_kind", "has_media", "media_refs",
+            "reply_to_source_ref", "raw_json", "in_scope",
+        }
+        assert required_message_columns.issubset(rows[0]), rows[0]
     retained_root = pathlib.Path(config["pa"]["media_retention"]["media_root"]).resolve(strict=True)
     unreadable = subprocess.run(
         ["runuser", "-u", "tggcapture", "--", "find", str(retained_root), "-type", "f", "!", "-readable", "-print", "-quit"],
@@ -700,6 +714,7 @@ print(json.dumps({
     "provider": provider,
     "model": slot_model,
     "reasoning_effort": slot_effort,
+    "management_engine": management_engine,
     "config_sha256": sha(home / "config.yaml"),
     "constitution_sha256": sha(home / "christopher_tgg_constitution.yaml"),
     "processing_enabled": config_enabled,
@@ -837,12 +852,18 @@ SLOT_MODELS = {
     "gpt-5.6-luna-xhigh": "gpt-5.6-luna",
     "gpt-5.6-terra-medium": "gpt-5.6-terra",
     "gpt-5.6-terra-high": "gpt-5.6-terra",
+    "gpt-6-sol-medium": "gpt-6-sol",
+    "gpt-6.1-sol-medium": "gpt-6.1-sol",
+    "gpt-6.1-terra-medium": "gpt-6.1-terra",
 }
 SLOT_REASONING_EFFORT = {
     "gpt-5.6-luna-low": "low",
     "gpt-5.6-luna-xhigh": "xhigh",
     "gpt-5.6-terra-medium": "medium",
     "gpt-5.6-terra-high": "high",
+    "gpt-6-sol-medium": "medium",
+    "gpt-6.1-sol-medium": "medium",
+    "gpt-6.1-terra-medium": "medium",
 }
 assert slot in SLOT_MODELS, slot
 assert p["ok"] is True

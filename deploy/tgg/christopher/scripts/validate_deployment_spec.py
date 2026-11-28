@@ -40,12 +40,22 @@ SLOT_MODELS = {
     "gpt-5.6-luna-xhigh": "gpt-5.6-luna",
     "gpt-5.6-terra-medium": "gpt-5.6-terra",
     "gpt-5.6-terra-high": "gpt-5.6-terra",
+    "gpt-6-sol-medium": "gpt-6-sol",
+    "gpt-6.1-sol-medium": "gpt-6.1-sol",
+    "gpt-6.1-terra-medium": "gpt-6.1-terra",
 }
 SLOT_REASONING_EFFORT = {
     "gpt-5.6-luna-low": "low",
     "gpt-5.6-luna-xhigh": "xhigh",
     "gpt-5.6-terra-medium": "medium",
     "gpt-5.6-terra-high": "high",
+    "gpt-6-sol-medium": "medium",
+    "gpt-6.1-sol-medium": "medium",
+    "gpt-6.1-terra-medium": "medium",
+}
+# Management-chat engine id -> the pa.management_engine block it writes.
+MANAGEMENT_ENGINES = {
+    "gpt-6.2-sol-medium": {"model": "gpt-6.2-sol", "reasoning_effort": "medium"},
 }
 
 
@@ -234,6 +244,13 @@ def validate(app_root: Path, spec_path: Path) -> dict[str, Any]:
         raise RuntimeError("default engine slot must remain gpt-5.4-mini")
     if allowed_slots != list(SLOT_MODELS):
         raise RuntimeError("engine slot set drifted")
+    if list(engine["allowedManagementEngines"]) != list(MANAGEMENT_ENGINES):
+        raise RuntimeError("management engine set drifted")
+    for management_id, block in MANAGEMENT_ENGINES.items():
+        # The block is written next to the slot's engine and the provider is
+        # the gateway's, so only a known model and effort may ship.
+        if set(block) != {"model", "reasoning_effort"} or not all(block.values()):
+            raise RuntimeError(f"management engine {management_id} is malformed")
 
     slot_manifest_path = _resolve(app_root, engine["slotManifest"])
     checksums = _parse_checksums(slot_manifest_path)

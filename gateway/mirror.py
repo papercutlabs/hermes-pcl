@@ -82,6 +82,47 @@ def mirror_to_session(
         return False
 
 
+def mirror_to_session_key(
+    session_key: str,
+    message_text: str,
+    source_label: str = "cron",
+) -> bool:
+    """Append an assistant message to the session stored under ``session_key``.
+
+    Unlike :func:`mirror_to_session`, the target is one exact session key (for
+    example a namespaced live-drain conversation), never a guess from the
+    chat id.  The key's current session id is read at call time, so a
+    compacted conversation receives the message in its current session.
+    Returns False when the key has no session.  Never raises.
+    """
+    try:
+        sessions_dir = get_hermes_home() / "sessions"
+        index = sessions_dir / "sessions.json"
+        if not index.exists():
+            return False
+        with open(index, encoding="utf-8") as f:
+            data = json.load(f)
+        entry = data.get(str(session_key)) if isinstance(data, dict) else None
+        session_id = entry.get("session_id") if isinstance(entry, dict) else None
+        if not session_id:
+            logger.debug("Mirror: no session for key %s", session_key)
+            return False
+        message = {
+            "role": "assistant",
+            "content": message_text,
+            "timestamp": datetime.now().isoformat(),
+            "mirror": True,
+            "mirror_source": source_label,
+        }
+        with open(sessions_dir / f"{session_id}.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps(message, ensure_ascii=False) + "\n")
+        _append_to_sqlite(session_id, message)
+        return True
+    except Exception as e:
+        logger.warning("Mirror to session key %s failed: %s", session_key, e)
+        return False
+
+
 def _find_session_id(
     platform: str,
     chat_id: str,

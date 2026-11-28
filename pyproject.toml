@@ -60,6 +60,11 @@ dependencies = [
   # (which is a silent killer on Windows — see CONTRIBUTING.md) and
   # `os.killpg` (which doesn't exist on Windows).
   "psutil==7.2.2",
+  # PA-203 round 2: the workflow runner (agent/pa_workflow.py) validates every
+  # helper answer against its schema and imports this at module level.  It was
+  # only a transitive entry before, so a venv could lack it and silently drop
+  # workflow_start and workflow_status.
+  "jsonschema==4.26.0",
 ]
 
 [project.optional-dependencies]

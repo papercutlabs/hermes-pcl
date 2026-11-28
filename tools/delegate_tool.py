@@ -1084,6 +1084,26 @@ def _build_child_agent(
     orchestrator_ok = _get_orchestrator_enabled() and child_depth < max_spawn
     effective_role = role if (role == "orchestrator" and orchestrator_ok) else "leaf"
 
+    # PA-203 round 2: on the scoped TGG Management route the helper kind
+    # (from ``profile``) fixes the child's toolsets.  Model-supplied toolset
+    # names are ignored, the child is always a leaf, and a helper that would
+    # start empty or wider than its parent is refused (HelperScopeError).
+    from agent.pa_delegation import (
+        check_helper_tools, check_not_file_building, fixed_helper_toolsets,
+    )
+
+    pa_fixed_toolsets = fixed_helper_toolsets(parent_agent, profile)
+    if pa_fixed_toolsets is not None:
+        # Helpers check; Christopher builds (Teren, 25 Sep; r2e replay s3).
+        check_not_file_building(goal)
+        if toolsets and list(toolsets) != pa_fixed_toolsets:
+            logger.info(
+                "delegate_task: ignoring model-supplied toolsets %s; the helper kind fixes %s",
+                list(toolsets), pa_fixed_toolsets,
+            )
+        toolsets = list(pa_fixed_toolsets)
+        effective_role = "leaf"
+
     # ── Subagent identity (stable across events, 0-indexed for TUI) ─────
     # subagent_id is generated here so the progress callback, the
     # spawn_requested event, and the _active_subagents registry all share
@@ -1138,6 +1158,20 @@ def _build_child_agent(
     # test_intersection_preserves_delegation_bound test for the design rationale.
     if effective_role == "orchestrator" and "delegation" not in child_toolsets:
         child_toolsets.append("delegation")
+
+    if pa_fixed_toolsets is not None:
+        from toolsets import resolve_toolset
+
+        child_toolsets = [name for name in child_toolsets if name in pa_fixed_toolsets]
+        # Before construction only emptiness is checked: the declared toolset
+        # may list tools that are unavailable here, which the constructed
+        # helper will not have either.  Width is checked on the real helper
+        # after construction (review B5).
+        check_helper_tools(
+            parent_agent,
+            {tool for name in child_toolsets for tool in (resolve_toolset(name) or [])},
+            check_width=False,
+        )
 
     workspace_hint = _resolve_workspace_hint(parent_agent)
     profile_instruction = None
@@ -1315,6 +1349,21 @@ def _build_child_agent(
         tool_progress_callback=child_progress_cb,
         iteration_budget=None,  # fresh budget per subagent
     )
+    if pa_fixed_toolsets is not None:
+        # The constructed child's real tool list is the final word: refuse it
+        # before it is registered or run if it is empty or wider than the parent.
+        constructed = getattr(child, "valid_tool_names", None)
+        if isinstance(constructed, (set, frozenset, list, tuple)):
+            try:
+                check_helper_tools(parent_agent, constructed)
+            except Exception:
+                close = getattr(child, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception:
+                        pass
+                raise
     child._print_fn = getattr(parent_agent, "_print_fn", None)
     # Set delegation depth so children can't spawn grandchildren
     child._delegate_depth = child_depth
@@ -2365,6 +2414,22 @@ def delegate_task(
     # Wrapped in try/finally so the global is always restored even if a
     # child build raises (otherwise _last_resolved_tool_names stays corrupted).
     children = []
+    from agent.pa_delegation import HelperScopeError, is_scoped
+
+    pa_scoped = is_scoped(parent_agent)
+    if pa_scoped:
+        # PA-203 review B2: on the scoped route the helper's transport comes
+        # from configuration only.  A model-supplied ACP command would start
+        # an arbitrary host process as the helper, so it is refused.
+        if acp_command or acp_args or any(
+            isinstance(t, dict) and (t.get("acp_command") or t.get("acp_args"))
+            for t in task_list
+        ):
+            return tool_error(
+                "acp_command and acp_args cannot be set on this route; the helper's "
+                "transport comes from configuration. No helper was started."
+            )
+
     try:
         for i, t in enumerate(task_list):
             task_acp_args = t.get("acp_args") if "acp_args" in t else None
@@ -2393,7 +2458,9 @@ def delegate_task(
                     else (acp_args if acp_args is not None else creds.get("args"))
                 ),
                 role=effective_role,
-                profile=t.get("profile") or t.get("name"),
+                # On the scoped route only ``profile`` selects the helper kind;
+                # a task's display name is not a kind (review B6.1).
+                profile=t.get("profile") if pa_scoped else (t.get("profile") or t.get("name")),
             )
             # Domain profile is intentionally distinct from the delegation
             # topology role (leaf/orchestrator).  Preserve the original task
@@ -2412,6 +2479,19 @@ def delegate_task(
             # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names
             children.append((i, t, child))
+    except HelperScopeError as exc:
+        # No helper of this call starts: release any already built.
+        for _i, _t, built in children:
+            try:
+                _ac_lock = getattr(parent_agent, "_active_children_lock", None)
+                if _ac_lock:
+                    with _ac_lock:
+                        parent_agent._active_children.remove(built)
+                elif hasattr(parent_agent, "_active_children"):
+                    parent_agent._active_children.remove(built)
+            except (ValueError, AttributeError):
+                pass
+        return tool_error(str(exc))
     finally:
         # Authoritative restore: reset global to parent's tool names after all children built
         _model_tools._last_resolved_tool_names = _parent_tool_names
@@ -2472,6 +2552,27 @@ def delegate_task(
                 except Exception:
                     pass
 
+            # Where the completion must return: the chat, the conversation and
+            # the request messages this turn is answering (PA-203 round 2).
+            from gateway.session_context import get_session_env
+
+            try:
+                _source_refs = json.loads(
+                    get_session_env("HERMES_SESSION_SOURCE_MESSAGE_REFS", "") or "[]"
+                )
+            except (TypeError, ValueError):
+                _source_refs = []
+            _origin = {
+                "session_key": _session_key,
+                "platform": get_session_env("HERMES_SESSION_PLATFORM", ""),
+                "chat_id": get_session_env("HERMES_SESSION_CHAT_ID", ""),
+                "source_message_ids": [
+                    str(ref) for ref in (_source_refs or []) if ref
+                ],
+                "pa_job_type": get_session_env("HERMES_SESSION_PA_JOB_TYPE", ""),
+                "profile": _t.get("profile") or _t.get("name") or profile,
+            }
+
             dispatch = dispatch_async_delegation(
                 goal=_t["goal"],
                 context=_t.get("context"),
@@ -2482,6 +2583,10 @@ def delegate_task(
                 runner=_async_runner,
                 interrupt_fn=_async_interrupt,
                 max_async_children=_get_max_async_children(),
+                origin=_origin,
+                # The child's own timeout plus a grace period: past this the
+                # host records a timeout completion even if the child hangs.
+                time_limit_seconds=_get_child_timeout() + 120.0,
             )
 
             if dispatch.get("status") == "dispatched":

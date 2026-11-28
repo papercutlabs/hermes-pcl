@@ -1,0 +1,19 @@
+[Unit]
+Description=Christopher TGG recheck of open human-resolution documents after an applied Master reconcile (PA-689)
+After=systems-papercut-labs-tgg-master-sfc-refresh.service
+
+[Service]
+Type=oneshot
+User=pclaw
+Group=pclaw
+SupplementaryGroups=tggcapture
+WorkingDirectory=/opt/tgg-christopher/runtime/current
+Environment=HOME=/home/pclaw
+ExecStartPre=+/usr/bin/install -d -o pclaw -g pclaw -m 0750 /home/pclaw/.hermes-christopher-tgg/runtime/resolution-recheck
+ExecStartPre=+/usr/bin/chmod 0660 /var/lib/tgg-capture/whatsapp/capture/events.jsonl
+ExecStart=/home/pclaw/apps/hermes-pcl/.venv/bin/python /opt/tgg-christopher/runtime/current/deploy/tgg/christopher/scripts/resolution_recheck_trigger.py --since-unit systems-papercut-labs-tgg-master-sfc-refresh.service
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/tgg-capture/whatsapp/capture /home/pclaw/.hermes-christopher-tgg/runtime/nightly-whatsapp-launcher /home/pclaw/.hermes-christopher-tgg/runtime/resolution-recheck

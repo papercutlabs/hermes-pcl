@@ -89,6 +89,72 @@ _VAR_MAP = {
 }
 
 
+# ---------------------------------------------------------------------------
+# PA-611: source messages steered into a running turn
+# ---------------------------------------------------------------------------
+# A message that arrives while a turn runs and is steered into it becomes part
+# of that turn.  Its source message id is registered here, keyed by session
+# key, so that (1) tools that resolve the "current" message's attachments see
+# it through HERMES_SESSION_SOURCE_MESSAGE_REFS and (2) the turn record lists
+# it among the turn's message refs.  The registry is process-wide because the
+# steering call runs in a different task from the turn it steers into.
+import threading as _threading
+
+_STEERED_SOURCE_REFS: dict = {}
+_STEERED_SOURCE_REFS_LOCK = _threading.Lock()
+
+
+def add_steered_source_refs(session_key: str, message_ids) -> list:
+    """Register steered source message ids for a session; return the new list."""
+    ids = [str(i) for i in (message_ids or []) if i]
+    if not session_key or not ids:
+        return []
+    with _STEERED_SOURCE_REFS_LOCK:
+        current = _STEERED_SOURCE_REFS.setdefault(session_key, [])
+        for item in ids:
+            if item not in current:
+                current.append(item)
+        return list(current)
+
+
+def get_steered_source_refs(session_key: str) -> list:
+    if not session_key:
+        return []
+    with _STEERED_SOURCE_REFS_LOCK:
+        return list(_STEERED_SOURCE_REFS.get(session_key, []))
+
+
+def pop_steered_source_refs(session_key: str) -> list:
+    """Return and forget the steered ids for a session (turn boundary / new turn)."""
+    if not session_key:
+        return []
+    with _STEERED_SOURCE_REFS_LOCK:
+        return list(_STEERED_SOURCE_REFS.pop(session_key, []))
+
+
+def _merge_steered_refs(raw: str) -> str:
+    """Add the session's steered source ids to a JSON list of turn refs."""
+    import json
+
+    session_key = _SESSION_KEY.get()
+    if not isinstance(session_key, str) or not session_key:
+        return raw
+    steered = get_steered_source_refs(session_key)
+    if not steered:
+        return raw
+    try:
+        parsed = json.loads(raw) if raw else []
+    except (TypeError, ValueError):
+        return raw
+    if not isinstance(parsed, list):
+        return raw
+    merged = [str(i) for i in parsed if i]
+    for item in steered:
+        if item not in merged:
+            merged.append(item)
+    return json.dumps(merged)
+
+
 def set_session_vars(
     platform: str = "",
     chat_id: str = "",
@@ -182,6 +248,8 @@ def get_session_env(name: str, default: str = "") -> str:
     if var is not None:
         value = var.get()
         if value is not _UNSET:
+            if var is _SESSION_SOURCE_MESSAGE_REFS and value:
+                return _merge_steered_refs(value)
             return value
     # Fall back to os.environ for CLI, cron, and test compatibility
     return os.getenv(name, default)

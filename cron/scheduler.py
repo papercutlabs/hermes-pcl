@@ -150,6 +150,79 @@ def _merge_cron_pa_toolsets(
     return _dedupe(next_enabled), _dedupe(next_disabled)
 
 
+# How often a running job is checked against its inactivity limit.
+_CRON_POLL_INTERVAL = 5.0
+
+# PA-203 r2e (s7): files a scheduled Management job returns with the
+# capability's file-return tool.  A scheduled job has no live Management turn
+# to capture them in, so they are attached to the job's delivery to its
+# origin chat instead.
+_SCHEDULED_FILE_RETURNS: contextvars.ContextVar[list | None] = contextvars.ContextVar(
+    "HERMES_SCHEDULED_FILE_RETURNS", default=None
+)
+
+
+def record_scheduled_file_return(path: str, display_name: str | None = None) -> bool:
+    """Queue a returned file for this scheduled job's origin delivery.
+
+    ``display_name`` is the exact name WhatsApp shows; the stored copy keeps
+    a safe name.  Returns False outside a scheduled job, so the caller keeps
+    its own path.
+    """
+    collected = _SCHEDULED_FILE_RETURNS.get()
+    if collected is None:
+        return False
+    text = str(path or "").strip()
+    if not text:
+        return False
+    if all(item.get("path") != text for item in collected):
+        collected.append({"path": text, "display_name": display_name})
+    return True
+
+
+def _resolve_cron_pa_workspace_owner(job: dict) -> str | None:
+    """Return the originating Management conversation's workspace owner.
+
+    A scheduled job created from a TGG Management conversation works in that
+    conversation's persistent sandbox folder, so a later turn in the same
+    conversation simply has the files the job produced.  The owner is the
+    runtime-derived stable session key of the job's recorded origin chat,
+    never a model-supplied value.  Any other job keeps its per-run folder.
+    """
+    if str(job.get("pa_job_type") or "").strip() != "tgg_management":
+        return None
+    origin = _resolve_origin(job)
+    if not origin:
+        return None
+    config_path = _get_hermes_home() / "config.yaml"
+    try:
+        import yaml
+
+        raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        pa_config = raw.get("pa") if isinstance(raw, Mapping) else None
+        if not isinstance(pa_config, Mapping) or not is_truthy_value(
+            pa_config.get("enabled"), default=False
+        ):
+            return None
+        from gateway.durable_jsonl_consumer import (
+            management_conversation_session_key,
+        )
+
+        return management_conversation_session_key(
+            config_path,
+            platform=str(origin.get("platform") or ""),
+            chat_id=str(origin.get("chat_id") or ""),
+        )
+    except Exception as exc:
+        logger.warning(
+            "Job '%s': could not resolve its Management conversation workspace; "
+            "using a per-run workspace: %s",
+            job.get("id"),
+            exc,
+        )
+        return None
+
+
 def _render_cron_pa_ephemeral_prompt(pa_context: Any) -> str:
     if pa_context is None:
         return ""
@@ -590,8 +663,17 @@ def _deliver_whatsapp_via_tgg_reply_bridge(
     chat_id: str,
     text: str,
     media_files: list,
+    *,
+    workspace_owner: str | None = None,
+    allowed_work_paths: set[str] | None = None,
+    receipt: dict | None = None,
+    display_names: dict[str, str] | None = None,
 ) -> Optional[str]:
     """Deliver Christopher cron output through the durable consumer bridge.
+
+    ``receipt``, when given, is filled with what was actually delivered:
+    ``text_message_id`` and one ``files`` item per attachment with its
+    WhatsApp message id and its agent-workspace path (PA-203).
 
     Christopher deliberately has Hermes's ordinary WhatsApp adapter disabled:
     inbound capture and outbound policy live in the separate guarded bridge.
@@ -609,6 +691,32 @@ def _deliver_whatsapp_via_tgg_reply_bridge(
 
     def resolve_media_path(value: str) -> Path:
         text = str(value or "")
+        from tools.python_sandbox_tool import agent_workspace_enabled
+
+        if agent_workspace_enabled() and text.startswith(
+            ("work/", "/work/", "records/", "/records/")
+        ):
+            # PA-203: send an immutable, digest-checked copy of the version
+            # this job made or captured, never whatever sits at the path now.
+            from tools.pa_agent_workspace import delivery_snapshot
+
+            path, _sha = delivery_snapshot(
+                text,
+                str(workspace_owner or ""),
+                any_file_allowed=allowed_work_paths is None,
+            )
+            return path
+        if text.startswith(("work/", "/work/")):
+            from tools.python_sandbox_tool import resolve_sandbox_work_path
+
+            if allowed_work_paths is not None:
+                relative = text[len("/work/"):] if text.startswith("/work/") else text[len("work/"):]
+                if relative not in allowed_work_paths:
+                    raise ValueError(
+                        "this scheduled job did not produce that file; outside its "
+                        "origin chat it may attach only files it made"
+                    )
+            return resolve_sandbox_work_path(text, str(workspace_owner or ""))
         candidate = Path(text)
         # Promoted refs are absolute-looking `/media/...` handles; every
         # other absolute local path retains the established cron behaviour.
@@ -630,7 +738,10 @@ def _deliver_whatsapp_via_tgg_reply_bridge(
             raise ValueError("promoted media reference is unavailable")
         return resolved
 
+    last_message_id = {"value": ""}
+
     def post(endpoint: str, payload: dict) -> Optional[str]:
+        last_message_id["value"] = ""
         try:
             request = Request(
                 f"{bridge_url}/{endpoint}",
@@ -642,6 +753,7 @@ def _deliver_whatsapp_via_tgg_reply_bridge(
                 status = int(getattr(response, "status", 0) or 0)
                 body = json.loads(response.read() or b"{}")
             if status == 200 and body.get("success") is True:
+                last_message_id["value"] = str(body.get("messageId") or "")
                 return None
             return f"bridge {endpoint} outcome unconfirmed (http {status})"
         except HTTPError as exc:
@@ -649,15 +761,35 @@ def _deliver_whatsapp_via_tgg_reply_bridge(
         except (URLError, TimeoutError, OSError, ValueError, json.JSONDecodeError) as exc:
             return f"bridge {endpoint} failed: {exc}"
 
+    from tools.pa_agent_workspace import requested_display_name
+
+    resolved_media_files: list[tuple[Path, bool, str]] = []
+    for media_path, is_voice in media_files:
+        try:
+            resolved = resolve_media_path(str(media_path))
+            # WhatsApp shows the exact name the job asked to send, spaces and
+            # parentheses included; the stored copy keeps a safe name.
+            display_name = (
+                (display_names or {}).get(str(media_path))
+                or requested_display_name(media_path)
+                or resolved.name
+            )
+            resolved_media_files.append((resolved, is_voice, display_name))
+        except (OSError, ValueError) as exc:
+            return (
+                "attachment was not delivered; use the exact files[].path returned "
+                f"by the sandbox or an existing /media/... reference ({exc})"
+            )
+
+    delivered = receipt if receipt is not None else {}
+    delivered.setdefault("files", [])
     if text.strip():
         error = post("send", {"chatId": chat_id, "message": text})
         if error:
             return error
-    for media_path, _is_voice in media_files:
-        try:
-            resolved_media = resolve_media_path(str(media_path))
-        except (OSError, ValueError) as exc:
-            return f"bridge media refused: {exc}"
+        delivered["text"] = text
+        delivered["text_message_id"] = last_message_id["value"]
+    for resolved_media, _is_voice, display_name in resolved_media_files:
         suffix = resolved_media.suffix.lower()
         media_type = (
             "image" if suffix in _IMAGE_EXTS else "video" if suffix in _VIDEO_EXTS
@@ -668,16 +800,137 @@ def _deliver_whatsapp_via_tgg_reply_bridge(
             "chatId": chat_id,
             "filePath": str(resolved_media),
             "mediaType": media_type,
-            "fileName": resolved_media.name,
+            "fileName": display_name,
         })
         if error:
             return error
+        delivered["files"].append(
+            {
+                "name": display_name,
+                "message_id": last_message_id["value"],
+                "workspace_path": _keep_delivered_file_in_workspace(
+                    job,
+                    chat_id,
+                    resolved_media,
+                    message_id=last_message_id["value"],
+                    text_message_id=str(delivered.get("text_message_id") or ""),
+                    display_name=display_name,
+                ),
+            }
+        )
     return None
 
 
-def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
+def _keep_delivered_file_in_workspace(
+    job: dict,
+    chat_id: str,
+    path,
+    *,
+    message_id: str = "",
+    text_message_id: str = "",
+    display_name: str = "",
+) -> Optional[str]:
+    """Keep a file a scheduled job delivered in the agent workspace (PA-203).
+
+    A job may attach a file it never built, such as an existing workbook at a
+    retained media path.  A later chat turn must be able to find exactly the
+    file that was delivered, so the file is copied into the agent workspace
+    (unless it is already there) and logged.  A failure here never turns a
+    completed delivery into a failed one.
+    """
+    try:
+        from tools.python_sandbox_tool import record_workspace_file
+
+        return record_workspace_file(
+            path,
+            direction="scheduled_delivery",
+            folder="sent",
+            details={
+                "chat_id": str(chat_id),
+                "message_id": message_id,
+                "text_message_id": text_message_id,
+                "scheduled_job_id": str(job.get("id") or ""),
+                "scheduled_job_name": str(job.get("name") or ""),
+                "display_name": display_name,
+            },
+        )
+    except Exception as exc:
+        logger.warning(
+            "Job '%s': delivered file was not kept in the agent workspace: %s",
+            job.get("id", "?"),
+            exc,
+        )
+        return None
+
+
+def _record_delivery_in_conversation(
+    job: dict, conversation_session_key: str, receipt: dict
+) -> bool:
+    """Append a scheduled delivery to its Management conversation (PA-203).
+
+    The delivery is stored as an assistant message in the originating
+    conversation's history, the same way a normal reply is stored, so a
+    later turn sees what was sent, when, and which workspace file it was.
+    """
+    text = str(receipt.get("text") or "").strip()
+    files = list(receipt.get("files") or [])
+    if not text and not files:
+        return False
+    when = _hermes_now()
+    name = str(job.get("name") or job.get("id") or "scheduled job")
+    lines = [
+        f"[Scheduled job '{name}' delivered this to the chat at "
+        f"{when:%H:%M} on {when.day} {when:%b}.]"
+    ]
+    if text:
+        lines.append(text)
+    for item in files:
+        where = item.get("workspace_path")
+        lines.append(
+            f"[Attached file: /{where}]" if where else f"[Attached file: {item.get('name')}]"
+        )
+    try:
+        from gateway.mirror import mirror_to_session_key
+
+        return mirror_to_session_key(
+            conversation_session_key, "\n".join(lines), source_label="cron"
+        )
+    except Exception as exc:
+        logger.warning(
+            "Job '%s': delivery was not recorded in its conversation: %s",
+            job.get("id", "?"),
+            exc,
+        )
+        return False
+
+
+def _deliver_result(
+    job: dict,
+    content: str,
+    adapters=None,
+    loop=None,
+    *,
+    workspace_owner: str | None = None,
+    published_paths: set[str] | None = None,
+    origin_may_attach_any: bool = True,
+    conversation_session_key: str | None = None,
+    returned_files: list[dict] | None = None,
+) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
+
+    ``returned_files`` (PA-203) are files the job returned with the file-return
+    tool; they are attached only to a delivery to the job's origin chat.
+
+    ``published_paths`` (PA-203) is set when the job works in a folder it
+    shares: its origin conversation's persistent folder, or the agent-wide
+    workspace.  A delivery may attach any file of the folder only to the
+    job's origin chat and only when ``origin_may_attach_any`` (a Management
+    job); every other delivery may attach only the files this run's sandbox
+    calls published.
+
+    ``conversation_session_key`` (PA-203) is the originating Management
+    conversation; a delivery to that origin chat is appended to its history.
 
     When ``adapters`` and ``loop`` are provided (gateway is running), tries to
     use the live adapter first — this supports E2EE rooms (e.g. Matrix) where
@@ -766,9 +1019,42 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         pconfig = config.platforms.get(platform)
         if not pconfig or not pconfig.enabled:
             if platform == Platform.WHATSAPP and os.environ.get("TGG_REPLY_BRIDGE_URL", "").strip():
-                error = _deliver_whatsapp_via_tgg_reply_bridge(
-                    job, chat_id, cleaned_delivery_content, media_files,
+                origin_target = _resolve_origin(job) or {}
+                to_origin = (
+                    str(origin_target.get("platform") or "").lower() == platform_name.lower()
+                    and str(origin_target.get("chat_id") or "") == str(chat_id)
                 )
+                bridge_receipt: dict = {}
+                target_media = list(media_files)
+                display_names: dict[str, str] = {}
+                if to_origin and origin_may_attach_any:
+                    listed = {str(path) for path, _voice in target_media}
+                    for item in returned_files or []:
+                        if item.get("path") and item["path"] not in listed:
+                            target_media.append((item["path"], False))
+                            if item.get("display_name"):
+                                display_names[item["path"]] = item["display_name"]
+                error = _deliver_whatsapp_via_tgg_reply_bridge(
+                    job,
+                    chat_id,
+                    cleaned_delivery_content,
+                    target_media,
+                    display_names=display_names,
+                    receipt=bridge_receipt,
+                    workspace_owner=workspace_owner,
+                    allowed_work_paths=(
+                        None
+                        if published_paths is None
+                        or (to_origin and origin_may_attach_any)
+                        else set(published_paths)
+                    ),
+                )
+                if to_origin and conversation_session_key:
+                    # Whatever reached the chat is recorded, even when a
+                    # later attachment in the same delivery failed.
+                    _record_delivery_in_conversation(
+                        job, conversation_session_key, bridge_receipt
+                    )
                 if error:
                     logger.error("Job '%s': %s", job["id"], error)
                     delivery_errors.append(error)
@@ -1404,7 +1690,9 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         logger.info("Job '%s': script produced no output, skipping AI call.", job_name)
         return True, "", SILENT_MARKER, None
     origin = _resolve_origin(job)
-    _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
+    _cron_session_id = str(job.get("_runtime_session_id") or "") or (
+        f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
+    )
 
     logger.info("Running job '%s' (ID: %s)", job_name, job_id)
     logger.info("Prompt: %s", prompt[:100])
@@ -1445,7 +1733,34 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         platform="",
         chat_id="",
         chat_name="",
+        session_key=_cron_session_id,
         session_id=_cron_session_id,
+    )
+    # Sandbox workspace owner (PA-203): a job created from a Management
+    # conversation works in that conversation's persistent folder.  This binds
+    # only the python_sandbox owner; HERMES_SESSION_KEY stays the cron run's,
+    # so approvals, business-operation provenance and session tools still see
+    # an internal scheduled run.  tick() resolves it once and passes it in so
+    # delivery resolves attachments from the same folder.
+    from tools.python_sandbox_tool import (
+        bind_published_collector,
+        bind_workspace_owner,
+        reset_published_collector,
+        reset_workspace_owner,
+    )
+    _published = job.get("_runtime_published")
+    _published_token = (
+        bind_published_collector(_published) if isinstance(_published, set) else None
+    )
+    _workspace_owner = (
+        str(job.get("_runtime_workspace_owner") or "")
+        or _resolve_cron_pa_workspace_owner(job)
+        or _cron_session_id
+    )
+    _workspace_owner_token = bind_workspace_owner(_workspace_owner)
+    _file_returns = job.get("_runtime_file_returns")
+    _file_returns_token = (
+        _SCHEDULED_FILE_RETURNS.set(_file_returns) if isinstance(_file_returns, list) else None
     )
     _cron_delivery_vars = (
         "HERMES_CRON_AUTO_DELIVER_PLATFORM",
@@ -1689,8 +2004,13 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             skip_memory=True,  # Cron system prompts would corrupt user representations
             platform="cron",
             session_id=_cron_session_id,
+            gateway_session_key=_cron_session_id,
             session_db=_session_db,
         )
+        # A delegated child of a scheduled Management job gets only the
+        # read-only investigation toolset, whatever the parent asks for.
+        from agent.pa_delegation import scope_delegation_children
+        scope_delegation_children(agent, cron_enabled_toolsets, pa_resolved_context)
         
         # Run the agent with an *inactivity*-based timeout: the job can run
         # for hours if it's actively calling tools / receiving stream tokens,
@@ -1713,7 +2033,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         else:
             _cron_timeout = 600.0
         _cron_inactivity_limit = _cron_timeout if _cron_timeout > 0 else None
-        _POLL_INTERVAL = 5.0
+        _POLL_INTERVAL = _CRON_POLL_INTERVAL
         _cron_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         # Preserve scheduler-scoped ContextVar state (for example skill-declared
         # env passthrough registrations) when the cron run hops into the worker
@@ -1774,10 +2094,20 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             )
             if hasattr(agent, "interrupt"):
                 agent.interrupt("Cron job timed out (inactivity)")
+            # PA-203 r2f (s7): work a workflow finished, or is finishing, is
+            # kept in its run store and /work file; the notice says where.
+            _workflow_notice = ""
+            try:
+                from tools.pa_workflow_tool import runs_notice_for_session
+
+                _workflow_notice = runs_notice_for_session(_cron_session_id)
+            except Exception:
+                _workflow_notice = ""
             raise TimeoutError(
                 f"Cron job '{job_name}' idle for "
                 f"{int(_secs_ago)}s (limit {int(_cron_inactivity_limit)}s) "
                 f"— last activity: {_last_desc}"
+                + (f"\n{_workflow_notice}" if _workflow_notice else "")
             )
 
         # Guard against non-dict returns from run_conversation under error conditions
@@ -1860,6 +2190,16 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 os.environ["TERMINAL_CWD"] = _prior_terminal_cwd
         # Clean up ContextVar session/delivery state for this job.
         clear_session_vars(_ctx_tokens)
+        try:
+            reset_workspace_owner(_workspace_owner_token)
+            if _published_token is not None:
+                reset_published_collector(_published_token)
+            if _file_returns_token is not None:
+                _SCHEDULED_FILE_RETURNS.reset(_file_returns_token)
+        except ValueError:
+            # Reset from a different context; the tick's per-job copied
+            # context is discarded after the job anyway.
+            pass
         for _var_name in _cron_delivery_vars:
             _VAR_MAP[_var_name].set("")
         if _session_db:
@@ -1968,7 +2308,32 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
         def _process_job(job: dict) -> bool:
             """Run one due job end-to-end: execute, save, deliver, mark."""
             try:
-                success, output, final_response, error = run_job(job)
+                cron_session_id = (
+                    f"cron_{job['id']}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
+                )
+                run_input = dict(job)
+                run_input["_runtime_session_id"] = cron_session_id
+                # One owner for the whole scheduled run: the job's sandbox
+                # work and its attachment delivery use the same folder.
+                management_owner = _resolve_cron_pa_workspace_owner(job)
+                workspace_owner = management_owner or cron_session_id
+                run_input["_runtime_workspace_owner"] = workspace_owner
+                # With one agent-wide workspace (PA-203 round 2) every job
+                # shares the folder, so every job's delivery is bounded:
+                # only a Management job may attach any folder file, and only
+                # to its origin chat.
+                from tools.python_sandbox_tool import agent_workspace_enabled
+
+                shared_workspace = agent_workspace_enabled()
+                # Files this run's sandbox calls publish.  A delivery to any
+                # chat other than the job's origin may attach only these.
+                published: set[str] = set()
+                run_input["_runtime_published"] = published
+                # Files the job returns for its origin chat (PA-203 r2e, s7).
+                file_returns: list[str] = []
+                if management_owner is not None:
+                    run_input["_runtime_file_returns"] = file_returns
+                success, output, final_response, error = run_job(run_input)
 
                 output_file = save_job_output(job["id"], output)
                 if verbose:
@@ -1986,7 +2351,21 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                 delivery_error = None
                 if should_deliver:
                     try:
-                        delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
+                        delivery_error = _deliver_result(
+                            job,
+                            deliver_content,
+                            adapters=adapters,
+                            loop=loop,
+                            workspace_owner=workspace_owner,
+                            published_paths=(
+                                published
+                                if management_owner or shared_workspace
+                                else None
+                            ),
+                            origin_may_attach_any=management_owner is not None,
+                            conversation_session_key=management_owner,
+                            returned_files=list(file_returns),
+                        )
                     except Exception as de:
                         delivery_error = str(de)
                         logger.error("Delivery failed for job %s: %s", job["id"], de)
@@ -1998,7 +2377,12 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                     success = False
                     error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
-                mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+                mark_job_run(
+                    job["id"],
+                    success and not delivery_error,
+                    error,
+                    delivery_error=delivery_error,
+                )
                 return True
 
             except Exception as e:

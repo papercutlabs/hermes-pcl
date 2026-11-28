@@ -1410,6 +1410,15 @@ class AIAgent:
         self.stream_delta_callback = stream_delta_callback
         self.interim_assistant_callback = interim_assistant_callback
         self.status_callback = status_callback
+        # Optional gateway-owned completion guard.  A non-empty return value
+        # rejects the proposed final answer and is shown to the model as a
+        # private correction observation before one bounded retry.  The
+        # gateway keeps this unset for ordinary conversations.
+        self.final_response_validator = None
+        self.final_response_validation_max_retries = 0
+        self.final_response_validation_failure = (
+            "I couldn't complete the response because its output was invalid."
+        )
         self.tool_gen_callback = tool_gen_callback
 
         
@@ -1435,6 +1444,9 @@ class AIAgent:
         # existing tool message rather than inserting a new user turn).
         self._pending_steer: Optional[str] = None
         self._pending_steer_lock = threading.Lock()
+        # PA-611: gateway messages that arrive mid-turn.  Each entry becomes a
+        # real user message at the next model-call boundary (steer_user_message).
+        self._pending_user_messages: list = []
 
         # Concurrent-tool worker thread tracking.  `_execute_tool_calls_concurrent`
         # runs each tool on its own ThreadPoolExecutor worker — those worker
@@ -5618,6 +5630,77 @@ class AIAgent:
             text = self._pending_steer
             self._pending_steer = None
         return text
+
+    def steer_user_message(
+        self,
+        text: str,
+        *,
+        source_message_ids: Optional[List[str]] = None,
+    ) -> bool:
+        """Queue a mid-turn user message to enter the conversation as a user turn.
+
+        PA-611.  Unlike steer(), the text is not pasted into a tool result.  At
+        the top of the next model-call iteration the loop appends it to the
+        running conversation as its own ``role: "user"`` message, with the
+        source message ids and any attachment lines the caller put in ``text``
+        intact.  If the model would end the turn while one is still pending,
+        the loop makes one more call in the same turn (see the final-response
+        branch of run_conversation).  Thread-safe; callable from gateway threads.
+
+        Returns False when the text is empty.
+        """
+        if not text or not str(text).strip():
+            return False
+        entry = {
+            "text": str(text).strip(),
+            "source_message_ids": [str(i) for i in (source_message_ids or []) if i],
+        }
+        lock = getattr(self, "_pending_steer_lock", None)
+        if lock is None:
+            pending = getattr(self, "_pending_user_messages", None)
+            if pending is None:
+                pending = self._pending_user_messages = []
+            pending.append(entry)
+            return True
+        with lock:
+            pending = getattr(self, "_pending_user_messages", None)
+            if pending is None:
+                pending = self._pending_user_messages = []
+            pending.append(entry)
+        return True
+
+    def _has_pending_user_messages(self) -> bool:
+        lock = getattr(self, "_pending_steer_lock", None)
+        if lock is None:
+            return bool(getattr(self, "_pending_user_messages", None))
+        with lock:
+            return bool(getattr(self, "_pending_user_messages", None))
+
+    def _drain_pending_user_messages(self) -> list:
+        lock = getattr(self, "_pending_steer_lock", None)
+        if lock is None:
+            entries = list(getattr(self, "_pending_user_messages", None) or [])
+            self._pending_user_messages = []
+            return entries
+        with lock:
+            entries = list(getattr(self, "_pending_user_messages", None) or [])
+            self._pending_user_messages = []
+        return entries
+
+    def _inject_pending_user_messages(self, messages: list) -> int:
+        """Append each pending mid-turn message to ``messages`` as a user message.
+
+        Returns the number appended.  Called at the top of every model-call
+        iteration, so a message that arrives during a tool batch or during the
+        previous model call is seen by the very next call.
+        """
+        entries = self._drain_pending_user_messages()
+        for entry in entries:
+            msg = {"role": "user", "content": entry["text"], "_steered_user_message": True}
+            if entry.get("source_message_ids"):
+                msg["_source_message_ids"] = list(entry["source_message_ids"])
+            messages.append(msg)
+        return len(entries)
 
     def _record_file_mutation_result(
         self,
@@ -11035,6 +11118,18 @@ class AIAgent:
         finally:
             self._executing_tools = False
 
+    def _dispatch_pa_workflow(self, function_name: str, function_args: dict) -> str:
+        """PA-203 workflow runner tools need their parent agent, like delegate_task."""
+        from tools.pa_workflow_tool import workflow_start, workflow_status
+        if function_name == "workflow_start":
+            return workflow_start(
+                script=function_args.get("script") or "",
+                title=function_args.get("title"),
+                wait=function_args.get("wait"),
+                parent_agent=self,
+            )
+        return workflow_status(run_id=function_args.get("run_id"), parent_agent=self)
+
     def _dispatch_delegate_task(self, function_args: dict) -> str:
         """Single call site for delegate_task dispatch.
 
@@ -11134,6 +11229,8 @@ class AIAgent:
             )
         elif function_name == "delegate_task":
             return self._dispatch_delegate_task(function_args)
+        elif function_name in ("workflow_start", "workflow_status"):
+            return self._dispatch_pa_workflow(function_name, function_args)
         else:
             call_kwargs = {
                 "tool_call_id": tool_call_id,
@@ -11801,6 +11898,9 @@ class AIAgent:
                         spinner.stop(cute_msg)
                     elif self._should_emit_quiet_tool_messages():
                         self._vprint(f"  {cute_msg}")
+            elif function_name in ("workflow_start", "workflow_status"):
+                function_result = self._dispatch_pa_workflow(function_name, function_args)
+                tool_duration = time.time() - tool_start_time
             elif self._context_engine_tool_names and function_name in self._context_engine_tool_names:
                 # Context engine tools (lcm_grep, lcm_describe, lcm_expand, etc.)
                 spinner = None
@@ -12406,6 +12506,9 @@ class AIAgent:
         self._last_content_tools_all_housekeeping = False
         self._mute_post_response = False
         self._unicode_sanitization_passes = 0
+        final_response_validation_retries = 0
+        final_response_validation_observations: list[str] = []
+        final_response_validation_exhausted = False
         self._tool_guardrails.reset_for_turn()
         self._tool_guardrail_halt_decision = None
         # True until the server rejects an image_url content part with an error
@@ -12819,6 +12922,17 @@ class AIAgent:
                     and "skill_manage" in self.valid_tool_names):
                 self._iters_since_skill += 1
             
+            # PA-611: mid-turn gateway messages enter the conversation as real
+            # user messages at this model-call boundary (not inside a tool result).
+            _injected_user_msgs = self._inject_pending_user_messages(messages)
+            if _injected_user_msgs:
+                logger.info(
+                    "Steered %d mid-turn user message(s) into the conversation before API call #%d",
+                    _injected_user_msgs,
+                    api_call_count,
+                )
+                self._session_messages = messages
+
             # ── Pre-API-call /steer drain ──────────────────────────────────
             # If a /steer arrived during the previous API call (while the model
             # was thinking), drain it now — before we build api_messages — so
@@ -12937,6 +13051,8 @@ class AIAgent:
                     api_msg.pop("finish_reason")
                 # Strip internal thinking-prefill marker
                 api_msg.pop("_thinking_prefill", None)
+                api_msg.pop("_steered_user_message", None)
+                api_msg.pop("_source_message_ids", None)
                 # Strip Codex Responses API fields (call_id, response_item_id) for
                 # strict providers like Mistral, Fireworks, etc. that reject unknown fields.
                 # Uses new dicts so the internal messages list retains the fields
@@ -15909,6 +16025,94 @@ class AIAgent:
                         length_continue_retries = 0
                     
                     final_response = self._strip_think_blocks(final_response).strip()
+
+                    # A bounded gateway-owned guard may reject a complete
+                    # response before it reaches streaming/native delivery.
+                    # Keep the rejected proposal and observation only long
+                    # enough for the real model's correction call; neither is
+                    # persisted as conversation history.
+                    _final_validator = getattr(self, "final_response_validator", None)
+                    if _final_validator is not None:
+                        try:
+                            _validation_feedback = _final_validator(
+                                final_response,
+                                list(messages),
+                            )
+                        except Exception as _validation_exc:
+                            logger.warning(
+                                "Final response validation failed closed: %s",
+                                _validation_exc,
+                            )
+                            _validation_feedback = (
+                                "The proposed response could not be validated. "
+                                "Produce a safe response without the invalid output."
+                            )
+                        if _validation_feedback:
+                            final_response_validation_observations.append(
+                                str(_validation_feedback)
+                            )
+                            _validation_limit = max(
+                                0,
+                                int(
+                                    getattr(
+                                        self,
+                                        "final_response_validation_max_retries",
+                                        0,
+                                    )
+                                    or 0
+                                ),
+                            )
+                            _validation_retry_available = (
+                                final_response_validation_retries < _validation_limit
+                                and (
+                                    (
+                                        api_call_count < self.max_iterations
+                                        and self.iteration_budget.remaining > 0
+                                    )
+                                    or self._budget_grace_call
+                                )
+                            )
+                            if _validation_retry_available:
+                                final_response_validation_retries += 1
+                                rejected_msg = self._build_assistant_message(
+                                    assistant_message,
+                                    finish_reason,
+                                )
+                                rejected_msg["_final_validation_synthetic"] = True
+                                messages.append(rejected_msg)
+                                messages.append(
+                                    {
+                                        "role": "user",
+                                        "content": str(_validation_feedback),
+                                        "_final_validation_synthetic": True,
+                                    }
+                                )
+                                final_response = None
+                                self._session_messages = messages
+                                continue
+
+                            while (
+                                messages
+                                and isinstance(messages[-1], dict)
+                                and messages[-1].get("_final_validation_synthetic")
+                            ):
+                                messages.pop()
+                            final_response = str(
+                                getattr(
+                                    self,
+                                    "final_response_validation_failure",
+                                    "",
+                                )
+                                or "I couldn't complete the response because its output was invalid."
+                            )
+                            final_msg = {
+                                "role": "assistant",
+                                "content": final_response,
+                            }
+                            messages.append(final_msg)
+                            final_response_validation_exhausted = True
+                            _turn_exit_reason = "final_response_validation_exhausted"
+                            break
                     
                     final_msg = self._build_assistant_message(assistant_message, finish_reason)
 
@@ -15923,11 +16127,28 @@ class AIAgent:
                             messages[-1].get("_thinking_prefill")
                             or messages[-1].get("_empty_recovery_synthetic")
                             or messages[-1].get("_empty_terminal_sentinel")
+                            or messages[-1].get("_final_validation_synthetic")
                         )
                     ):
                         messages.pop()
 
                     messages.append(final_msg)
+
+                    # PA-611: a mid-turn user message is still pending, so the
+                    # turn is not over.  Make one more model call in this turn;
+                    # the top of the loop appends the message as a user turn.
+                    if self._has_pending_user_messages() and (
+                        (
+                            api_call_count < self.max_iterations
+                            and self.iteration_budget.remaining > 0
+                        )
+                        or self._budget_grace_call
+                    ):
+                        logger.info(
+                            "Mid-turn user message pending at turn end; making a follow-up call in the same turn"
+                        )
+                        self._session_messages = messages
+                        continue
                     
                     _turn_exit_reason = f"text_response(finish_reason={finish_reason})"
                     if not self.quiet_mode:
@@ -16193,6 +16414,15 @@ class AIAgent:
             "api_calls": api_call_count,
             "completed": completed,
             "turn_exit_reason": _turn_exit_reason,
+            "final_response_validation": (
+                {
+                    "rejections": len(final_response_validation_observations),
+                    "exhausted": final_response_validation_exhausted,
+                    "observations": final_response_validation_observations,
+                }
+                if final_response_validation_observations
+                else None
+            ),
             "partial": False,  # True only when stopped due to invalid tool calls
             "interrupted": interrupted,
             "response_previewed": getattr(self, "_response_was_previewed", False),
@@ -16230,6 +16460,15 @@ class AIAgent:
         # batches to drain into), hand it back to the caller so it can be
         # delivered as the next user turn instead of being silently lost.
         _leftover_steer = self._drain_pending_steer()
+        # PA-611: a mid-turn user message that could not be answered in this
+        # turn (interrupt, budget) goes back to the caller the same way.
+        _leftover_user = [
+            entry["text"] for entry in self._drain_pending_user_messages()
+        ]
+        if _leftover_user:
+            _leftover_steer = "\n".join(
+                part for part in [_leftover_steer, *_leftover_user] if part
+            )
         if _leftover_steer:
             result["pending_steer"] = _leftover_steer
         self._response_was_previewed = False

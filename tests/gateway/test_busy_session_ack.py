@@ -207,7 +207,7 @@ class TestBusySessionAck:
 
     @pytest.mark.asyncio
     async def test_steer_mode_calls_agent_steer_no_interrupt_no_queue(self):
-        """busy_input_mode='steer' injects via agent.steer() and skips queueing."""
+        """busy_input_mode='steer' injects a user message via agent.steer_user_message() and skips queueing."""
         runner, sentinel = _make_runner()
         runner._busy_input_mode = "steer"
         adapter = _make_adapter()
@@ -217,14 +217,16 @@ class TestBusySessionAck:
         runner.adapters[event.source.platform] = adapter
 
         agent = MagicMock()
-        agent.steer = MagicMock(return_value=True)
+        agent.steer_user_message = MagicMock(return_value=True)
         runner._running_agents[sk] = agent
 
         with patch("gateway.run.merge_pending_message_event") as mock_merge:
             await runner._handle_active_session_busy_message(event, sk)
 
         # VERIFY: Agent was steered, NOT interrupted
-        agent.steer.assert_called_once_with("also check the tests")
+        agent.steer_user_message.assert_called_once_with(
+            "also check the tests\n[Message id: msg1]", source_message_ids=["msg1"]
+        )
         agent.interrupt.assert_not_called()
 
         # VERIFY: No queueing — successful steer must NOT replay as next turn
@@ -249,13 +251,13 @@ class TestBusySessionAck:
         runner.adapters[event.source.platform] = adapter
 
         agent = MagicMock()
-        agent.steer = MagicMock(return_value=False)  # rejected
+        agent.steer_user_message = MagicMock(return_value=False)  # rejected
         runner._running_agents[sk] = agent
 
         with patch("gateway.run.merge_pending_message_event") as mock_merge:
             await runner._handle_active_session_busy_message(event, sk)
 
-        agent.steer.assert_called_once()
+        agent.steer_user_message.assert_called_once()
         agent.interrupt.assert_not_called()
         # Fell back to queue semantics: event was merged into pending messages
         mock_merge.assert_called_once()

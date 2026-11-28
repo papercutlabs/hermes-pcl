@@ -115,6 +115,14 @@ _records_lock = threading.Lock()
 # tail after completion so `list_async_delegations()` can show recent results.
 _records: Dict[str, Dict[str, Any]] = {}
 
+# PA-203 round 2: an optional durable sink owned by the host process.  The
+# durable JSONL consumer (Christopher's production entry) never starts the
+# gateway's ``_async_delegation_watcher``, so it registers a sink that records
+# each dispatch durably *before* the child starts and later turns the queued
+# completion into a durable inbox record.  With no sink registered (CLI,
+# ordinary gateway) behaviour is unchanged.
+_durable_sink: Any = None
+
 _DEFAULT_MAX_ASYNC_CHILDREN = 3
 # How many completed records to retain for status queries before pruning.
 _MAX_RETAINED_COMPLETED = 50
@@ -137,6 +145,39 @@ def _get_executor(max_workers: int) -> ThreadPoolExecutor:
             )
             _executor_max_workers = max_workers
         return _executor
+
+
+def set_durable_sink(sink: Any) -> Any:
+    """Register (or clear with ``None``) the host's durable dispatch sink.
+
+    The sink's ``record_dispatch(record)`` is called with the dispatch record
+    (including ``origin`` and ``deadline_at``) before the child starts.  If it
+    raises, the dispatch is refused: a background helper whose completion
+    could not be kept is never started.  Returns the previous sink.
+    """
+    global _durable_sink
+    previous = _durable_sink
+    _durable_sink = sink
+    return previous
+
+
+def get_durable_sink() -> Any:
+    return _durable_sink
+
+
+def interrupt_delegation(delegation_id: str) -> bool:
+    """Signal one running async delegation to stop (used by a time limit)."""
+    with _records_lock:
+        record = _records.get(delegation_id)
+        fn = record.get("interrupt_fn") if record and record.get("status") == "running" else None
+    if not callable(fn):
+        return False
+    try:
+        fn()
+        return True
+    except Exception as exc:  # pragma: no cover
+        logger.debug("interrupt_delegation %s failed: %s", delegation_id, exc)
+        return False
 
 
 def active_count() -> int:
@@ -178,6 +219,8 @@ def dispatch_async_delegation(
     runner: Callable[[], Dict[str, Any]],
     interrupt_fn: Optional[Callable[[], None]] = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
+    origin: Optional[Dict[str, Any]] = None,
+    time_limit_seconds: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Spawn ``runner`` on the daemon executor and return a handle immediately.
 
@@ -222,6 +265,14 @@ def dispatch_async_delegation(
         "dispatched_at": dispatched_at,
         "completed_at": None,
         "interrupt_fn": interrupt_fn,
+        # Where the completion must return (chat, conversation, the request
+        # message IDs) and when a still-running helper counts as timed out.
+        "origin": dict(origin) if origin else None,
+        "deadline_at": (
+            dispatched_at + float(time_limit_seconds)
+            if time_limit_seconds
+            else None
+        ),
     }
     # Capacity check and record insert under ONE lock hold — checking
     # active_count() separately would let two concurrent dispatches (e.g.
@@ -242,6 +293,22 @@ def dispatch_async_delegation(
                 ),
             }
         _records[delegation_id] = record
+
+    sink = _durable_sink
+    if sink is not None:
+        try:
+            sink.record_dispatch({k: v for k, v in record.items() if k != "interrupt_fn"})
+        except Exception as exc:
+            with _records_lock:
+                _records.pop(delegation_id, None)
+            return {
+                "status": "rejected",
+                "error": (
+                    "This background helper was not started because its result "
+                    f"could not be kept for this conversation ({exc}). Run it "
+                    "with background=false instead."
+                ),
+            }
 
     executor = _get_executor(max_async_children)
 
@@ -341,6 +408,7 @@ def _push_completion_event(
         "dispatched_at": dispatched_at,
         "completed_at": completed_at,
         "exit_reason": result.get("exit_reason"),
+        "origin": record.get("origin"),
     }
     try:
         process_registry.completion_queue.put(evt)

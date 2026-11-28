@@ -880,6 +880,71 @@ class TestDeliverResultErrorReturns:
             assert _deliver_whatsapp_via_tgg_reply_bridge({}, "chat@g.us", "", [("/media/tgg/hermes/../secret.xlsx", False)]) is not None
         assert seen == [{"chatId": "chat@g.us", "filePath": str(report), "mediaType": "document", "fileName": "report.xlsx"}]
 
+    def test_christopher_cron_resolves_sandbox_path_before_any_send(
+        self, tmp_path, monkeypatch
+    ):
+        from cron.scheduler import _deliver_whatsapp_via_tgg_reply_bridge
+        from tools.python_sandbox_tool import _workspace_key
+
+        owner = "cron-one-run-owner"
+        work = tmp_path / "sandbox_workspaces" / _workspace_key(owner) / "work"
+        work.mkdir(parents=True)
+        report = work / "report.xlsx"
+        report.write_bytes(b"PK\x03\x04edited")
+        seen = []
+
+        class Response:
+            status = 200
+            def read(self): return b'{"success":true}'
+            def __enter__(self): return self
+            def __exit__(self, *_args): return False
+
+        monkeypatch.setattr(
+            "tools.python_sandbox_tool.get_hermes_home", lambda: tmp_path
+        )
+        monkeypatch.setenv("TGG_REPLY_BRIDGE_URL", "http://bridge.test")
+        with patch(
+            "urllib.request.urlopen",
+            side_effect=lambda req, timeout: seen.append(
+                (req.full_url, json.loads(req.data))
+            ) or Response(),
+        ):
+            assert _deliver_whatsapp_via_tgg_reply_bridge(
+                {},
+                "chat@g.us",
+                "report ready",
+                [("work/report.xlsx", False)],
+                workspace_owner=owner,
+            ) is None
+
+        assert [url.rsplit("/", 1)[-1] for url, _ in seen] == ["send", "send-media"]
+        assert seen[1][1]["filePath"] == str(report)
+
+    def test_christopher_cron_refuses_missing_sandbox_path_before_text_or_media(
+        self, tmp_path, monkeypatch
+    ):
+        from cron.scheduler import _deliver_whatsapp_via_tgg_reply_bridge
+
+        calls = []
+        monkeypatch.setattr(
+            "tools.python_sandbox_tool.get_hermes_home", lambda: tmp_path
+        )
+        monkeypatch.setenv("TGG_REPLY_BRIDGE_URL", "http://bridge.test")
+        with patch(
+            "urllib.request.urlopen",
+            side_effect=lambda *args, **kwargs: calls.append((args, kwargs)),
+        ):
+            error = _deliver_whatsapp_via_tgg_reply_bridge(
+                {},
+                "chat@g.us",
+                "must not send",
+                [("work/missing.xlsx", False)],
+                workspace_owner="cron-one-run-owner",
+            )
+
+        assert "attachment was not delivered" in error
+        assert calls == []
+
     def test_returns_error_for_unresolved_target(self, monkeypatch):
         """Non-local delivery with no resolvable target should return an error."""
         monkeypatch.delenv("TELEGRAM_HOME_CHANNEL", raising=False)
@@ -927,6 +992,7 @@ class TestRunJobSessionPersistence:
         assert kwargs["session_db"] is fake_db
         assert kwargs["platform"] == "cron"
         assert kwargs["session_id"].startswith("cron_test-job_")
+        assert kwargs["gateway_session_key"] == kwargs["session_id"]
         fake_db.end_session.assert_called_once()
         call_args = fake_db.end_session.call_args
         assert call_args[0][0].startswith("cron_test-job_")
@@ -1291,6 +1357,42 @@ class TestRunJobSessionPersistence:
         assert call_args[0][0] == "empty-job"
         assert call_args[0][1] is False  # success should be False
         assert "empty" in call_args[0][2].lower()  # error should mention empty
+
+    def test_tick_marks_delivery_failure_as_error(self, tmp_path):
+        from cron.scheduler import tick
+
+        job = {
+            "id": "delivery-failure-job",
+            "name": "delivery failure",
+            "prompt": "make report",
+            "schedule": "every 1h",
+            "enabled": True,
+            "next_run_at": "2020-01-01T00:00:00",
+            "deliver": "origin",
+            "origin": {"platform": "whatsapp", "chat_id": "mgmt@g.us"},
+        }
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler.get_due_jobs", return_value=[job]), \
+             patch("cron.scheduler.advance_next_run"), \
+             patch("cron.scheduler.mark_job_run") as mock_mark, \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch(
+                 "cron.scheduler.run_job",
+                 return_value=(True, "output", "MEDIA:work/missing.xlsx", None),
+             ) as run_mock, \
+             patch(
+                 "cron.scheduler._deliver_result",
+                 return_value="attachment was not delivered",
+             ) as deliver_mock:
+            tick(verbose=False)
+
+        args = mock_mark.call_args.args
+        kwargs = mock_mark.call_args.kwargs
+        assert args[:3] == ("delivery-failure-job", False, None)
+        assert kwargs["delivery_error"] == "attachment was not delivered"
+        owner = run_mock.call_args.args[0]["_runtime_session_id"]
+        assert owner.startswith("cron_delivery-failure-job_")
+        assert deliver_mock.call_args.kwargs["workspace_owner"] == owner
 
     def test_run_job_sets_auto_delivery_env_from_dotenv_home_channel(self, tmp_path, monkeypatch):
         job = {

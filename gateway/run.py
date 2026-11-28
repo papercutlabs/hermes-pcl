@@ -731,6 +731,7 @@ from gateway.session import (
     is_shared_multi_user_session,
 )
 from gateway.delivery import DeliveryRouter
+from gateway.management_engine import is_management_job, parse_management_engine
 from gateway.platforms.base import (
     BasePlatformAdapter,
     EphemeralReply,
@@ -840,6 +841,13 @@ def _try_resolve_fallback_provider() -> dict | None:
                     "args": list(runtime.get("args") or []),
                     "credential_pool": runtime.get("credential_pool"),
                     "model": entry.get("model"),
+                    # The listed entry this runtime came from.  A PA job brief
+                    # must not relabel it as the primary provider, and the
+                    # turn record then names the engine that served the turn.
+                    "fallback_entry": {
+                        "provider": str(entry.get("provider") or "").strip(),
+                        "model": str(entry.get("model") or "").strip(),
+                    },
                 }
             except Exception as fb_exc:
                 logger.debug("Fallback entry %s failed: %s", entry.get("provider"), fb_exc)
@@ -1143,6 +1151,40 @@ _TGG_NIGHTLY_ANALYZER_JOB_TYPE = "tgg_nightly_whatsapp"
 # fixed turn allowance can stop a healthy large-chat run.  Two hours remains
 # a hard operational ceiling for a genuinely stuck analyzer.
 _TGG_NIGHTLY_MAX_ANALYZER_SECONDS = 2 * 60 * 60
+# The TGG capability plugin (tgg-whatsapp-evidence post_compaction.py,
+# CONTINUOUS_TASK) routes any turn whose text carries this trigger to the
+# controller-owned continuous lane, and there refuses case lookups unless the
+# continuous controller holds an in-flight record for the batch.  The nightly
+# runner writes no such record, so a nightly analyzer's continuation must not
+# carry it (PA-203, 1 Oct AMK).  The continuous lane keeps it.
+_TGG_CONTINUOUS_INTERVAL_TRIGGER = re.compile(
+    r"\bContinuous WhatsApp interval\. batch_id=(nightly:\d{4}-\d{2}-\d{2}:[0-9a-f]{12})\. "
+    r"authoritative_chat_id=(\d+@g\.us)\."
+)
+
+
+def _tgg_nightly_continuation_lead(
+    original_message: Any,
+    batch_id: str,
+    authoritative_chat_id: str,
+) -> str:
+    """Return the lane-identifying opening of a same-session continuation.
+
+    The lane follows the turn being continued: a continuous-interval trigger
+    keeps its continuous wording; a nightly analyzer (or retry) continues as
+    the nightly lane, so the plugin treats its case lookups as plain reads.
+    """
+    if isinstance(original_message, str) and _TGG_CONTINUOUS_INTERVAL_TRIGGER.search(
+        original_message
+    ):
+        return (
+            f"Continuous WhatsApp interval. batch_id={batch_id}. "
+            f"authoritative_chat_id={authoritative_chat_id}. "
+        )
+    return (
+        f"Nightly WhatsApp analyzer continuation. batch_id={batch_id}. "
+        f"authoritative_chat_id={authoritative_chat_id}. "
+    )
 
 
 def _tgg_nightly_analyzer_trigger(
@@ -1164,6 +1206,75 @@ def _tgg_nightly_analyzer_trigger(
     if not isinstance(chat_id, str) or not chat_id:
         return None
     return batch_id, chat_id
+
+
+_TGG_NIGHTLY_ANALYZER_ROLES = frozenset({"amk", "hg", "pg", "sk", "rental", "backend"})
+_TGG_NIGHTLY_ASSIGNMENT_TRIGGER_MAX_CHARS = 4000
+
+
+def _tgg_nightly_assignment_prompt(
+    pa_job_type: str | None,
+    pa_context: Mapping[str, Any] | None,
+    original_message: Any,
+) -> str:
+    """Return the session-instruction block that pins a nightly analyzer's assignment.
+
+    PA compaction (preserve-recent) never keeps the first user message, and a
+    wide parallel tool turn at the cut can leave only the compaction marker, so
+    the trigger carrying the batch identity can vanish from the conversation
+    (PA-203, 1 Oct AMK: messages=110->1).  The agent appends its ephemeral
+    system prompt to the system instructions on every provider call; it never
+    passes through the compressor.  The assignment is carried there.
+
+    Only a nightly analyzer turn (the trigger or a retry; same-session
+    continuations reuse that agent) or a continuous interval turn (PA-430: the
+    batch lost its launch message to compaction mid-interval) gets the block.
+    A continuous recovery, the consolidator and every other job return "", so
+    their instructions stay byte-identical.
+    """
+    trigger = _tgg_nightly_analyzer_trigger(pa_job_type, pa_context)
+    if trigger is None:
+        return ""
+    continuous = pa_context.get("continuous_interval") is True
+    if (
+        not continuous
+        and isinstance(original_message, str)
+        and _TGG_CONTINUOUS_INTERVAL_TRIGGER.search(original_message)
+    ):
+        return ""
+    role = pa_context.get("nightly_role")
+    if not isinstance(role, str) or role not in _TGG_NIGHTLY_ANALYZER_ROLES:
+        return ""
+    batch_id, authoritative_chat_id = trigger
+    lines = [
+        "[PA NIGHTLY ANALYZER ASSIGNMENT]",
+        "This turn is one continuous WhatsApp interval of one chat. The runtime fixes this "
+        "assignment for the turn: it holds after context compaction. If the conversation no "
+        "longer shows the original trigger, this block is the assignment. Do not switch "
+        "batch, chat or role. Work the frozen chat page by page with tgg_nightly_get_chat_page; "
+        "tgg_nightly_get_chat_ledger lists what is still missing; finish by sealing it with "
+        "tgg_nightly_seal_chat, which checks the coverage of the frozen input."
+        if continuous
+        else "This session is one nightly WhatsApp analyzer. The runtime fixes this assignment "
+        "for the whole session: it holds after context compaction, in every same-session "
+        "continuation and in a retry of this analyzer. If the conversation no longer shows "
+        "the original trigger, this block is the assignment. Do not switch batch, chat or role.",
+        f"batch_id: {batch_id}",
+        f"authoritative_chat_id: {authoritative_chat_id}",
+        f"role: {role}",
+        f"frozen evidence: the frozen chat of batch_id={batch_id} for "
+        f"authoritative_chat_id={authoritative_chat_id}; work already saved durably for it is kept.",
+    ]
+    # A continuous trigger carries WhatsApp reply context (untrusted client text),
+    # so only a nightly trigger is ever copied into the system instructions.
+    if (
+        not continuous
+        and isinstance(original_message, str)
+        and f"batch_id={batch_id}." in original_message
+        and len(original_message) <= _TGG_NIGHTLY_ASSIGNMENT_TRIGGER_MAX_CHARS
+    ):
+        lines.append("original trigger (verbatim): " + original_message.strip())
+    return "\n".join(lines)
 
 
 def _tgg_nightly_chat_receipt_snapshot(
@@ -1377,10 +1488,17 @@ def _merge_pa_toolsets(
     return _dedupe(next_enabled), _dedupe(next_disabled)
 
 
+def _load_management_engine(config: Mapping[str, Any] | None = None):
+    """The Management chats' engine from config.yaml, or None when not set."""
+    cfg = config if config is not None else _load_gateway_config()
+    return parse_management_engine(cfg)
+
+
 def _apply_pa_job_runtime(
     model: str,
     runtime_kwargs: Mapping[str, Any] | None,
     pa_context: Any,
+    management_engine: Any = None,
 ) -> tuple[str, dict]:
     """Apply PA job-specific runtime defaults before session overrides.
 
@@ -1389,6 +1507,12 @@ def _apply_pa_job_runtime(
     get duplicated in gateway config.
     """
     next_runtime = dict(runtime_kwargs or {})
+    fallback_entry = next_runtime.get("fallback_entry")
+    if isinstance(fallback_entry, Mapping) and fallback_entry.get("provider") and fallback_entry.get("model"):
+        # The primary login was unavailable at resolution time.  Keep the fallback's own
+        # credentials, endpoint and engine; the job brief names the primary engine only.
+        next_runtime["provider"] = fallback_entry["provider"]
+        return fallback_entry["model"], next_runtime
     job_brief = getattr(pa_context, "job_brief", None) if pa_context is not None else None
     job_runtime = getattr(job_brief, "runtime", None) if job_brief is not None else None
     if not isinstance(job_runtime, Mapping) or not job_runtime:
@@ -1407,7 +1531,28 @@ def _apply_pa_job_runtime(
         args = job_runtime.get("args") or []
         next_runtime["args"] = list(args) if isinstance(args, (list, tuple)) else [str(args)]
 
+    if management_engine is not None and is_management_job(pa_context):
+        # The Management chats' own engine (pa.management_engine); the provider
+        # stays the gateway's.  The fallback path above returned already, so a
+        # fallback engine is never replaced by this model.
+        next_model = management_engine.model
+
     return next_model, next_runtime
+
+
+def _add_message_recall_toolset(enabled_toolsets: Any, pa_context: Any):
+    """Give a conversation-carrying chat read_full_message, so cut notes can be followed.
+
+    PA-648: the ``preserve-recent-and-conversation`` compression policy cuts a
+    long carried message to its start and end and names the stored row; the
+    ``pa-message-recall`` toolset holds the read-only tool that returns it.
+    ``None`` already means every toolset and is returned unchanged.
+    """
+    from agent.pa_carried_conversation import RECALL_TOOLSET, STRATEGY
+
+    if enabled_toolsets is None or _pa_compression_strategy(pa_context) != STRATEGY:
+        return enabled_toolsets
+    return sorted({*enabled_toolsets, RECALL_TOOLSET})
 
 
 def _render_pa_ephemeral_prompt(pa_context: Any) -> str:
@@ -1441,7 +1586,26 @@ def _render_pa_ephemeral_prompt(pa_context: Any) -> str:
     return "\n\n".join(parts).strip()
 
 
-def _apply_pa_compression_policy(agent: Any, pa_context: Any) -> None:
+def _pa_compression_strategy(pa_context: Any) -> str:
+    raw = _pa_response_policy(pa_context).get("compression")
+    return str(raw.get("strategy") or "").strip().lower() if isinstance(raw, Mapping) else ""
+
+
+def _conversation_message_locator(agent: Any, session_db: Any):
+    """Callable for the compressor: (role, content) -> where the message is stored."""
+    if session_db is None or not hasattr(session_db, "conversation_message_index"):
+        return None
+
+    def _locate():
+        from agent.pa_carried_conversation import StoredMessage
+
+        index = session_db.conversation_message_index(getattr(agent, "session_id", None) or "")
+        return {key: StoredMessage(**row) for key, row in index.items()}
+
+    return _locate
+
+
+def _apply_pa_compression_policy(agent: Any, pa_context: Any, session_db: Any = None) -> None:
     """Attach job-brief compression behavior to an agent compressor when supported.
 
     Two distinct knobs live under ``response_policy.compression``:
@@ -1453,6 +1617,11 @@ def _apply_pa_compression_policy(agent: Any, pa_context: Any) -> None:
     * ``compaction_guidance`` — standing guidance string threaded into the
       NATIVE summarizer prompt (auto-trigger compactions; composes with any
       per-call /compress focus). Keeps the native pipeline running.
+
+    For the ``preserve-recent-and-conversation`` strategy (PA-648) the
+    compressor also gets a locator over ``session_db`` (default: the agent's
+    own session store) that gives each carried message its send time and
+    stored row; any other chat has it detached.
     """
     compressor = getattr(agent, "context_compressor", None)
     setter = getattr(compressor, "set_pa_compression_policy", None)
@@ -1474,6 +1643,17 @@ def _apply_pa_compression_policy(agent: Any, pa_context: Any) -> None:
             if isinstance(raw_guidance, str) and raw_guidance.strip():
                 guidance = raw_guidance
     setter(policy)
+    locator_setter = getattr(compressor, "set_pa_message_locator", None)
+    if callable(locator_setter):
+        from agent.pa_carried_conversation import STRATEGY as _CARRY_STRATEGY
+
+        carries = (
+            policy is not None
+            and str(policy.get("strategy") or "").strip().lower() == _CARRY_STRATEGY
+        )
+        if session_db is None:
+            session_db = getattr(agent, "_session_db", None)
+        locator_setter(_conversation_message_locator(agent, session_db) if carries else None)
     guidance_setter = getattr(compressor, "set_pa_compaction_guidance", None)
     if callable(guidance_setter):
         guidance_setter(guidance)
@@ -1914,7 +2094,9 @@ def _drain_gateway_watch_events(completion_queue) -> "list[dict]":
         evt_type = evt.get("type", "completion")
         if evt_type in {"watch_match", "watch_disabled"}:
             watch_events.append(evt)
-        elif evt_type == "async_delegation":
+        elif evt_type in {"async_delegation", "workflow_run"}:
+            # PA-203 round 2: a workflow run's one completion is owned by the
+            # durable consumer's drain (gateway/pa_background_completions.py).
             requeue.append(evt)
         # else: process completion events are handled by the watcher task
     for evt in requeue:
@@ -2840,7 +3022,14 @@ class GatewayRunner:
                 runtime_model,
             )
             model = runtime_model
-        model, runtime_kwargs = _apply_pa_job_runtime(model, runtime_kwargs, pa_context)
+        model, runtime_kwargs = _apply_pa_job_runtime(
+            model,
+            runtime_kwargs,
+            pa_context,
+            management_engine=_load_management_engine(user_config),
+        )
+        # The marker has done its work; no caller builds an agent from it.
+        runtime_kwargs.pop("fallback_entry", None)
         if override and resolved_session_key:
             model, runtime_kwargs = self._apply_session_model_override(
                 resolved_session_key, model, runtime_kwargs
@@ -3330,8 +3519,14 @@ class GatewayRunner:
         *,
         source: Optional[SessionSource] = None,
         session_key: Optional[str] = None,
+        pa_context: Any = None,
     ) -> dict | None:
-        """Resolve reasoning effort for a session, honoring session overrides."""
+        """Resolve reasoning effort for a session, honoring session overrides.
+
+        A Management turn (PA job ``tgg_management``) uses the effort of
+        ``pa.management_engine`` when that block is set; every other turn uses
+        ``agent.reasoning_effort``.
+        """
         resolved_session_key = session_key
         if not resolved_session_key and source is not None:
             try:
@@ -3342,6 +3537,12 @@ class GatewayRunner:
         overrides = getattr(self, "_session_reasoning_overrides", {}) or {}
         if resolved_session_key and resolved_session_key in overrides:
             return overrides[resolved_session_key]
+        if is_management_job(pa_context):
+            management_engine = _load_management_engine()
+            if management_engine is not None:
+                from hermes_constants import parse_reasoning_effort
+
+                return parse_reasoning_effort(management_engine.reasoning_effort)
         return self._load_reasoning_config()
 
     def _set_session_reasoning_override(
@@ -3532,6 +3733,61 @@ class GatewayRunner:
             return
         merge_pending_message_event(adapter._pending_messages, session_key, event)
 
+    def _steer_event_into_running_agent(
+        self,
+        running_agent: Any,
+        event: MessageEvent,
+        session_key: str,
+    ) -> bool:
+        """Steer a mid-turn message into the running turn as a real user message.
+
+        PA-611.  The message enters the running conversation as its own user
+        message at the next model-call boundary (``steer_user_message``), with
+        its text, its attachment lines and its source message ids.  Its source
+        ids are registered for the running turn so the tools that resolve the
+        current message's attachments find them, the turn record lists them,
+        and the durable intake credits them to the running turn instead of
+        marking them skipped.  Returns False (caller queues) when the message
+        has nothing to carry or the agent cannot take it.
+        """
+        text = (event.text or "").strip()
+        media_urls = list(getattr(event, "media_urls", None) or [])
+        if media_urls and not any(str(url) in text for url in media_urls):
+            placeholder = _build_media_placeholder(event)
+            text = f"{text}\n{placeholder}".strip() if text else placeholder
+        if not text or running_agent is None or not hasattr(running_agent, "steer_user_message"):
+            return False
+        source_ids = self._event_source_message_ids(event)
+        if source_ids:
+            text = f"{text}\n[Message id: {', '.join(source_ids)}]"
+        try:
+            accepted = bool(
+                running_agent.steer_user_message(text, source_message_ids=source_ids)
+            )
+        except Exception as exc:
+            logger.warning("Gateway steer failed for session %s: %s", session_key, exc)
+            return False
+        if not accepted:
+            return False
+        if source_ids:
+            try:
+                from gateway.session_context import add_steered_source_refs
+
+                add_steered_source_refs(session_key, source_ids)
+            except Exception as exc:
+                logger.debug("steered source ref registration failed: %s", exc)
+            try:
+                from gateway.replay import current_replay_context
+
+                replay_ctx = current_replay_context()
+                if replay_ctx is not None:
+                    for item in source_ids:
+                        if item not in replay_ctx.steered_message_ids:
+                            replay_ctx.steered_message_ids.append(item)
+            except Exception as exc:
+                logger.debug("steered replay ref registration failed: %s", exc)
+        return True
+
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
         # --- Authorization gate (#17775) ---
         # The cold path (_handle_message) checks _is_user_authorized before
@@ -3597,19 +3853,14 @@ class GatewayRunner:
         effective_mode = self._busy_input_mode
         steered = False
         if effective_mode == "steer":
-            steer_text = (event.text or "").strip()
             can_steer = (
-                steer_text
-                and running_agent is not None
+                running_agent is not None
                 and running_agent is not _AGENT_PENDING_SENTINEL
-                and hasattr(running_agent, "steer")
             )
             if can_steer:
-                try:
-                    steered = bool(running_agent.steer(steer_text))
-                except Exception as exc:
-                    logger.warning("Gateway steer failed for session %s: %s", session_key, exc)
-                    steered = False
+                steered = self._steer_event_into_running_agent(
+                    running_agent, event, session_key
+                )
             if not steered:
                 # Fall back to queue (merge into pending messages, no interrupt)
                 effective_mode = "queue"
@@ -6649,7 +6900,21 @@ class GatewayRunner:
 
         def _make_guard(kind: str):
             async def _guard(*args, **kwargs):
-                message_id = ctx.record_outbound(kind=kind, args=args, kwargs=kwargs)
+                capture_kwargs = dict(kwargs)
+                metadata = capture_kwargs.get("metadata")
+                workspace_owner = None
+                if isinstance(metadata, Mapping):
+                    clean_metadata = dict(metadata)
+                    workspace_owner = clean_metadata.pop(
+                        "_hermes_replay_workspace_owner", None
+                    )
+                    capture_kwargs["metadata"] = clean_metadata or None
+                message_id = ctx.record_outbound(
+                    kind=kind,
+                    args=args,
+                    kwargs=capture_kwargs,
+                    workspace_owner=workspace_owner,
+                )
                 if ctx.delivery_mode == "drop":
                     return SendResult(success=True, message_id=None, raw_response={"replay": "drop"})
                 return SendResult(success=True, message_id=message_id, raw_response={"replay": "capture"})
@@ -6670,6 +6935,7 @@ class GatewayRunner:
         ):
             if hasattr(adapter, name):
                 setattr(adapter, name, _make_guard(name))
+        adapter._hermes_replay_delivery_guard = True
 
     def _replay_home_channel(self, platform: Any, plan: Any) -> str | None:
         """Resolve the replay-only home channel without mutating ``os.environ``.
@@ -8091,14 +8357,9 @@ class GatewayRunner:
                 # Steer mode: inject text into the running agent mid-run via
                 # agent.steer().  Falls back to queue semantics if the payload
                 # is empty, the agent lacks steer(), or steer() rejects.
-                steer_text = (event.text or "").strip()
-                steered = False
-                if steer_text and hasattr(running_agent, "steer"):
-                    try:
-                        steered = bool(running_agent.steer(steer_text))
-                    except Exception as exc:
-                        logger.warning("PRIORITY steer failed for session %s: %s", _quick_key, exc)
-                        steered = False
+                steered = self._steer_event_into_running_agent(
+                    running_agent, event, _quick_key
+                )
                 if steered:
                     logger.debug("PRIORITY steer for session %s", _quick_key)
                     return None
@@ -8741,6 +9002,40 @@ class GatewayRunner:
                     audio_paths.append(path)
 
             if image_paths:
+                # PA-203 round 2: received photos are kept in the agent
+                # workspace like documents, so any later turn can open them.
+                _kept_images: list[str] = []
+                try:
+                    from tools.python_sandbox_tool import record_workspace_file
+
+                    for _image_path in image_paths:
+                        _kept_image = await asyncio.to_thread(
+                            record_workspace_file,
+                            _image_path,
+                            direction="received",
+                            folder="received",
+                            name=os.path.basename(str(_image_path)),
+                            details={
+                                "chat_id": str(getattr(source, "chat_id", "") or ""),
+                                "message_id": str(getattr(event, "message_id", "") or ""),
+                            },
+                        )
+                        if _kept_image:
+                            _kept_images.append(f"/{_kept_image}")
+                except Exception as _keep_exc:
+                    logger.warning(
+                        "Received photo was not kept in the agent workspace: %s",
+                        _keep_exc,
+                    )
+                if _kept_images:
+                    _kept_note = (
+                        "[The image is also saved in your workspace as "
+                        + ", ".join(_kept_images)
+                        + ".]"
+                    )
+                    message_text = (
+                        f"{message_text}\n\n{_kept_note}" if message_text else _kept_note
+                    )
                 # Decide routing: native (attach pixels) vs text (vision_analyze
                 # pre-run + prepend description).  See agent/image_routing.py.
                 _img_mode = self._decide_image_input_mode()
@@ -8832,6 +9127,19 @@ class GatewayRunner:
                 parts = basename.split("_", 2)
                 display_name = parts[2] if len(parts) >= 3 else basename
                 display_name = re.sub(r'[^\w.\- ]', '_', display_name)
+                # The sender's exact file name, when the platform carried it.
+                # The stored file keeps its safe name; this is what they see.
+                _declared_names = getattr(event, "media_file_names", None) or []
+                original_name = ""
+                if i < len(_declared_names) and _declared_names[i]:
+                    try:
+                        from tools.pa_agent_workspace import display_file_name
+
+                        original_name = display_file_name(str(_declared_names[i]))
+                    except ValueError:
+                        original_name = ""
+                if original_name:
+                    display_name = original_name
 
                 # Translate host cache path to in-container path if running under Docker backend.
                 # This ensures the agent receives a path it can open inside its sandbox, as the
@@ -8839,11 +9147,37 @@ class GatewayRunner:
                 agent_path = to_agent_visible_cache_path(path)
                 sandbox_path = host_path_to_python_sandbox_path(path, _sandbox_config)
                 location_note = (
-                    f"Original filename: '{basename}'. "
+                    f"Original filename: '{original_name or basename}'. "
                     f"Sandbox path: {sandbox_path}. Host path: {agent_path}."
                     if sandbox_path is not None
-                    else f"Original filename: '{basename}'. Host path: {agent_path}."
+                    else f"Original filename: '{original_name or basename}'. Host path: {agent_path}."
                 )
+                # PA-203 round 2: with one agent-wide workspace, every file
+                # a person sends is kept in it, so later turns in any
+                # conversation, scheduled jobs and helpers can open it.
+                try:
+                    from tools.python_sandbox_tool import record_workspace_file
+
+                    _kept = await asyncio.to_thread(
+                        record_workspace_file,
+                        path,
+                        direction="received",
+                        folder="received",
+                        name=basename,
+                        details={
+                            "chat_id": str(getattr(source, "chat_id", "") or ""),
+                            "message_id": str(getattr(event, "message_id", "") or ""),
+                            "original_name": original_name,
+                        },
+                    )
+                except Exception as _keep_exc:
+                    _kept = None
+                    logger.warning(
+                        "Received document was not kept in the agent workspace: %s",
+                        _keep_exc,
+                    )
+                if _kept:
+                    location_note = f"{location_note} Saved in your workspace as /{_kept}."
 
                 if mtype.startswith("text/"):
                     context_note = (
@@ -8873,6 +9207,25 @@ class GatewayRunner:
                     )
                 message_text = f"{context_note}\n\n{message_text}"
 
+        # PA-203 round 2: when the quoted message carried a file that the
+        # agent workspace recorded, say which file.  Information, not a rule;
+        # nothing is added when the quoted message has no file record.
+        _quoted_message_id = str(getattr(event, "reply_to_message_id", "") or "").strip()
+        if _quoted_message_id:
+            try:
+                from tools.python_sandbox_tool import describe_quoted_workspace_files
+
+                _quoted_note = await asyncio.to_thread(
+                    describe_quoted_workspace_files,
+                    _quoted_message_id,
+                    chat_id=str(getattr(source, "chat_id", "") or "") or None,
+                )
+            except Exception as _quoted_exc:
+                _quoted_note = None
+                logger.debug("Quoted-file lookup failed: %s", _quoted_exc)
+            if _quoted_note:
+                message_text = f"{_quoted_note}\n\n{message_text}"
+
         if getattr(event, "reply_to_text", None) and event.reply_to_message_id:
             # Always inject the reply-to pointer — even when the quoted text
             # already appears in history. The prefix isn't deduplication, it's
@@ -8880,7 +9233,13 @@ class GatewayRunner:
             # is referencing. History can contain the same or similar text
             # multiple times, and without an explicit pointer the agent has to
             # guess (or answer for both subjects). Token overhead is minimal.
-            reply_snippet = event.reply_to_text[:500]
+            # PA-396: a reply correlated to a human-resolution document keeps
+            # a larger context (record line, question, quoted text); the
+            # WhatsApp adapter fits those parts within it.
+            _correlated = isinstance(getattr(event, "pa_context", None), dict) and isinstance(
+                event.pa_context.get("management_document_correlation"), dict
+            )
+            reply_snippet = event.reply_to_text[: 2000 if _correlated else 500]
             message_text = f'[Replying to: "{reply_snippet}"]\n\n{message_text}'
 
         if "@" in message_text:
@@ -9045,6 +9404,15 @@ class GatewayRunner:
         # Build session context
         context = build_session_context(source, self.config, session_entry)
         
+        # PA-611: steered ids belong to the turn they were steered into; a
+        # new turn starts with none (the sentinel blocks steering until the
+        # agent is registered, which happens after this point).
+        try:
+            from gateway.session_context import pop_steered_source_refs
+
+            pop_steered_source_refs(session_key)
+        except Exception:
+            pass
         # Set session context variables for tools (task-local, concurrency-safe)
         _session_env_tokens = self._set_session_env(context, event=event)
         
@@ -12159,7 +12527,21 @@ class GatewayRunner:
         # pa_turns.message_refs_json is populated at source, never
         # reconstructed from content downstream.
         _src_msg_ids = self._event_source_message_ids(event)
-        if _src_msg_ids and isinstance(_pa_record_result, dict):
+        # PA-611: messages steered into this turn mid-run belong to it.
+        try:
+            from gateway.session_context import pop_steered_source_refs
+
+            _steered_ids = pop_steered_source_refs(str(quick_key or ""))
+        except Exception:
+            _steered_ids = []
+        if _steered_ids and isinstance(_pa_record_result, dict):
+            _own_ids = list(
+                _pa_record_result.get("turn_source_message_ids") or _src_msg_ids
+            )
+            _pa_record_result["turn_source_message_ids"] = _own_ids + [
+                i for i in _steered_ids if i not in _own_ids
+            ]
+        elif _src_msg_ids and isinstance(_pa_record_result, dict):
             _pa_record_result.setdefault("turn_source_message_ids", _src_msg_ids)
         _pa_final_text = ""
         if isinstance(_pa_record_result, dict):
@@ -17244,8 +17626,13 @@ class GatewayRunner:
             disabled_toolsets,
             pa_resolved_context,
         )
+        enabled_toolsets = _add_message_recall_toolset(enabled_toolsets, pa_resolved_context)
         pa_tenant_slug = _pa_tenant_slug(pa_resolved_context)
         pa_max_output_tokens = _pa_max_output_tokens(pa_resolved_context)
+        management_attachment_validation_enabled = (
+            str(getattr(pa_resolved_context, "job_type", "") or "")
+            == "tgg_management"
+        )
 
         # ── PA structured case record (S7) ────────────────────────────────
         # Once per inbound turn: resolve which case this message belongs to
@@ -17831,6 +18218,23 @@ class GatewayRunner:
                     combined_ephemeral = (
                         combined_ephemeral + "\n\n" + _case_prompt
                     ).strip()
+            _nightly_assignment = _tgg_nightly_assignment_prompt(
+                pa_job_type, pa_context, message
+            )
+            if _nightly_assignment:
+                import hashlib as _hashlib
+
+                combined_ephemeral = (
+                    combined_ephemeral + "\n\n" + _nightly_assignment
+                ).strip()
+                logger.info(
+                    "nightly analyzer assignment pinned in session instructions: "
+                    "batch_id=%s authoritative_chat_id=%s role=%s sha256=%s",
+                    pa_context.get("nightly_batch_id"),
+                    pa_context.get("authoritative_chat_id"),
+                    pa_context.get("nightly_role"),
+                    _hashlib.sha256(_nightly_assignment.encode("utf-8")).hexdigest()[:16],
+                )
             if self._ephemeral_system_prompt:
                 combined_ephemeral = (combined_ephemeral + "\n\n" + self._ephemeral_system_prompt).strip()
             _record_pa_behavior_event(
@@ -17880,6 +18284,7 @@ class GatewayRunner:
             reasoning_config = self._resolve_session_reasoning_config(
                 source=source,
                 session_key=session_key,
+                pa_context=pa_resolved_context,
             )
             self._reasoning_config = reasoning_config
             self._service_tier = self._load_service_tier()
@@ -17905,8 +18310,15 @@ class GatewayRunner:
             )
             if suppress_delivery:
                 _streaming_enabled = False
+            if management_attachment_validation_enabled:
+                # The final answer must pass attachment resolution before any
+                # streamed or native response is captured for delivery.
+                _streaming_enabled = False
             _want_stream_deltas = _streaming_enabled
-            _want_interim_messages = interim_assistant_messages_enabled
+            _want_interim_messages = (
+                interim_assistant_messages_enabled
+                and not management_attachment_validation_enabled
+            )
             _want_interim_consumer = _want_interim_messages
             if _want_stream_deltas or _want_interim_consumer:
                 try:
@@ -18077,6 +18489,31 @@ class GatewayRunner:
             agent.request_overrides = turn_route.get("request_overrides") or {}
             agent.max_tokens = pa_max_output_tokens
             agent.tenant_slug = pa_tenant_slug
+            # A delegated child of a Management turn gets only the read-only
+            # investigation toolset, whatever the parent asks for.
+            from agent.pa_delegation import scope_delegation_children
+            scope_delegation_children(agent, enabled_toolsets, pa_resolved_context)
+            if management_attachment_validation_enabled:
+                from gateway.durable_jsonl_consumer import (
+                    build_management_attachment_response_validator,
+                )
+
+                agent.final_response_validator = (
+                    build_management_attachment_response_validator(
+                        config_path=_hermes_home / "config.yaml",
+                        workspace_owner=session_key or "",
+                    )
+                )
+                agent.final_response_validation_max_retries = 1
+                agent.final_response_validation_failure = (
+                    "I couldn't send the attachment because its file reference "
+                    "was invalid. Please ask me to try again."
+                )
+            else:
+                # Cached agents cross job-selector turns.  Never retain a
+                # Management-only guard on an ordinary conversation.
+                agent.final_response_validator = None
+                agent.final_response_validation_max_retries = 0
             _apply_pa_compression_policy(agent, pa_resolved_context)
 
             _bg_review_release = threading.Event()
@@ -18593,9 +19030,10 @@ class GatewayRunner:
                                 f"classified. Start at exact cursor={resume_cursor}."
                             )
                         completion_prompt = (
-                            f"Continuous WhatsApp interval. batch_id={batch_id}. "
-                            f"authoritative_chat_id={authoritative_chat_id}. "
-                            "The immutable nightly chat receipt is still missing for "
+                            _tgg_nightly_continuation_lead(
+                                message, batch_id, authoritative_chat_id
+                            )
+                            + "The immutable nightly chat receipt is still missing for "
                             f"batch_id={batch_id} and authoritative_chat_id={authoritative_chat_id}. "
                             "Previous pages, image inspections and findings are durably saved. "
                             f"{page_instruction} Do not load the full chat ledger and do not revisit "
@@ -18680,6 +19118,9 @@ class GatewayRunner:
                     "system_prompt": _session_meta_system_prompt(_agent),
                     # Turn-scoped telemetry passthrough (PA turn-recording).
                     **_turn_telemetry_fields(result),
+                    "final_response_validation": result.get(
+                        "final_response_validation"
+                    ),
                 }
             
             # Scan tool results for MEDIA:<path> tags that need to be delivered
@@ -18809,6 +19250,9 @@ class GatewayRunner:
                 "system_prompt": _session_meta_system_prompt(_agent),
                 # Turn-scoped telemetry passthrough (PA turn-recording).
                 **_turn_telemetry_fields(result),
+                "final_response_validation": result.get(
+                    "final_response_validation"
+                ),
             }
         
         # Start progress message sender if enabled

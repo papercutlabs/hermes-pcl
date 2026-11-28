@@ -1006,6 +1006,9 @@ class ReplayExecutionContext:
     outbound: list[dict[str, Any]] = field(default_factory=list)
     blocked_commands: list[dict[str, Any]] = field(default_factory=list)
     captured_business_mutations: list[dict[str, Any]] = field(default_factory=list)
+    # PA-611: source message ids this replay steered into an already running
+    # turn.  They belong to that turn, not to a turn of this replay.
+    steered_message_ids: list[str] = field(default_factory=list)
 
     @property
     def execution_mode(self) -> str:
@@ -1096,7 +1099,21 @@ class ReplayExecutionContext:
         self.captured_business_mutations.append(entry)
         return dict(entry)
 
-    def record_outbound(self, *, kind: str, args: tuple[Any, ...], kwargs: Mapping[str, Any]) -> str:
+    def record_outbound(
+        self,
+        *,
+        kind: str,
+        args: tuple[Any, ...],
+        kwargs: Mapping[str, Any],
+        workspace_owner: str | None = None,
+    ) -> str:
+        from gateway.session_context import get_session_env
+
+        owner = str(
+            workspace_owner
+            or get_session_env("HERMES_SESSION_KEY", "")
+            or ""
+        ).strip()
         message_id = f"replay-{len(self.outbound) + 1}"
         self.outbound.append({
             "message_id": message_id,
@@ -1108,6 +1125,7 @@ class ReplayExecutionContext:
             "replay_attempt_id": self.attempt_id,
             "replay_namespace": self.replay_namespace,
             "headers": self.bridge_headers(),
+            "workspace_owner": owner or None,
         })
         return message_id
 
@@ -1205,6 +1223,7 @@ class ReplayResult:
     corpus_report: Optional[dict[str, Any]] = None
     attempt: Optional[dict[str, Any]] = None
     execution_report: Optional[dict[str, Any]] = None
+    steered_message_ids: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -1219,6 +1238,7 @@ class ReplayResult:
             "corpus_report": self.corpus_report,
             "attempt": self.attempt,
             "execution_report": self.execution_report,
+            "steered_message_ids": self.steered_message_ids,
         }
 
     def to_json(self) -> str:

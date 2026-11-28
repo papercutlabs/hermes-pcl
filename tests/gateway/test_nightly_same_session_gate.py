@@ -71,10 +71,48 @@ def _runner():
     return runner
 
 
+_LANE_BATCH_ID = "nightly:2026-08-17:abcdef012345"
+_LANE_CHAT_ID = "120363421153247095@g.us"
+_NIGHTLY = "nightly"
+_CONTINUOUS = "continuous"
+
+
 @pytest.mark.asyncio
-async def test_nightly_analyzer_continues_same_agent_session_until_receipt(monkeypatch, tmp_path):
-    batch_id = "nightly:2026-08-17:abcdef012345"
-    authoritative_chat_id = "120363421153247095@g.us"
+@pytest.mark.parametrize(
+    ("original_message", "lane"),
+    [
+        ("nightly analyzer", _NIGHTLY),
+        (
+            f"[System] Nightly WhatsApp analyzer. batch_id={_LANE_BATCH_ID}. "
+            f"authoritative_chat_id={_LANE_CHAT_ID}. Load the required WhatsApp skill, "
+            "process only that frozen chat into its singular ledger, and seal the immutable chat receipt.",
+            _NIGHTLY,
+        ),
+        (
+            f"[System] Nightly WhatsApp analyzer retry. batch_id={_LANE_BATCH_ID}. "
+            f"authoritative_chat_id={_LANE_CHAT_ID}. attempt_id=amk-ctx-lost-20261002a. "
+            "Resume only this frozen chat, retain its durable work, and seal its immutable chat receipt.",
+            _NIGHTLY,
+        ),
+        (
+            f"[System] Continuous WhatsApp interval. batch_id={_LANE_BATCH_ID}. "
+            f"authoritative_chat_id={_LANE_CHAT_ID}. Load the required WhatsApp skill, "
+            "process only that frozen chat into its singular ledger, and seal the immutable chat receipt.",
+            _CONTINUOUS,
+        ),
+        (
+            f"Continuous WhatsApp interval. batch_id={_LANE_BATCH_ID}. authoritative_chat_id={_LANE_CHAT_ID}. "
+            "This is a recovery of the same frozen interval: do not re-analyse.",
+            _CONTINUOUS,
+        ),
+    ],
+    ids=["bare", "nightly-trigger", "nightly-retry", "continuous-interval", "continuous-recovery"],
+)
+async def test_nightly_analyzer_continues_same_agent_session_until_receipt(
+    monkeypatch, tmp_path, original_message, lane,
+):
+    batch_id = _LANE_BATCH_ID
+    authoritative_chat_id = _LANE_CHAT_ID
     _FakeAgent.instances = []
     fake_run_agent = types.ModuleType("run_agent")
     fake_run_agent.AIAgent = _FakeAgent
@@ -112,7 +150,7 @@ async def test_nightly_analyzer_continues_same_agent_session_until_receipt(monke
 
     runner = _runner()
     result = await runner._run_agent(
-        message="nightly analyzer",
+        message=original_message,
         context_prompt="",
         history=[],
         source=SessionSource(platform=Platform.WHATSAPP, chat_id="synthetic@g.us", chat_type="group"),
@@ -140,10 +178,39 @@ async def test_nightly_analyzer_continues_same_agent_session_until_receipt(monke
         f"batch_id={batch_id} and authoritative_chat_id={authoritative_chat_id}."
     )
     assert receipt_binding.search(prior_continuation) is None
-    assert [receipt_binding.search(call["message"]).groups() for call in calls[1:]] == [
-        (batch_id, authoritative_chat_id),
-        (batch_id, authoritative_chat_id),
-    ]
+    if lane == _CONTINUOUS:
+        # The continuous lane's own re-prompt is byte-for-byte what it was.
+        assert [receipt_binding.search(call["message"]).groups() for call in calls[1:]] == [
+            (batch_id, authoritative_chat_id),
+            (batch_id, authoritative_chat_id),
+        ]
+        assert calls[1]["message"] == (
+            f"Continuous WhatsApp interval. batch_id={batch_id}. "
+            f"authoritative_chat_id={authoritative_chat_id}. "
+            "The immutable nightly chat receipt is still missing for "
+            f"batch_id={batch_id} and authoritative_chat_id={authoritative_chat_id}. "
+            "Previous pages, image inspections and findings are durably saved. "
+            "The compact durable page inventory records all earlier pages as "
+            "classified. Start at exact cursor=100. Do not load the full chat ledger and do not revisit "
+            "earlier pages: their output can exhaust this continuation's context. "
+            "Unless the inventory says every item is already covered, process exactly "
+            "that one page in cursor order, including every required image inspection, "
+            "then commit its ledger decisions and groups. If it is the final page, seal "
+            "the chat receipt after that commit; otherwise end "
+            "the turn immediately. The runner will verify durable progress and start "
+            "the next compact continuation. Do not summarize completion until the "
+            "immutable chat receipt exists, unless a genuine terminal tool failure "
+            "prevents further progress."
+        )
+    else:
+        # PA-203: a nightly analyzer's continuation must not pose as the
+        # continuous lane, or the plugin refuses every case lookup.
+        for call in calls[1:]:
+            assert receipt_binding.search(call["message"]) is None
+            assert call["message"].startswith(
+                f"Nightly WhatsApp analyzer continuation. batch_id={batch_id}. "
+                f"authoritative_chat_id={authoritative_chat_id}. "
+            )
     assert "Start at exact cursor=100" in calls[1]["message"]
     assert "Start at exact cursor=125" in calls[2]["message"]
     assert "Do not load the full chat ledger" in calls[1]["message"]
